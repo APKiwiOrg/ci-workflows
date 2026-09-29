@@ -1,0 +1,30 @@
+#!/bin/sh
+# pre-push: enforce the branch-name convention.
+# Shared via core.hooksPath=.githooks. Bypass with `git push --no-verify`.
+fail=0
+
+refs_file=$(mktemp)
+cat > "$refs_file"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "$local_ref" ] && continue
+  [ "$local_ref" = "(delete)" ] && continue
+  # all-zero local sha => ref deletion; allow it
+  case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+  case "$local_ref" in
+    refs/heads/*)
+      br=${local_ref#refs/heads/}
+      case "$br" in
+        main|feature/*|fix/*|hotfix/*|worktree-*) : ;;
+        *)
+          echo "pre-push: branch '$br' does not match the naming convention." >&2
+          echo "          Allowed: main, feature/*, fix/*, hotfix/*, worktree-*." >&2
+          echo "          Rename before pushing, or 'git push --no-verify' to override." >&2
+          fail=1 ;;
+      esac ;;
+  esac
+done < "$refs_file"
+
+rm -f "$refs_file"
+
+exit $fail

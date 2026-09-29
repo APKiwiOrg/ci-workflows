@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "Wiring git hooks + checking concurrent work",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null; git config core.hooksPath .githooks 2>/dev/null; git fetch --quiet 2>/dev/null; bash scripts/session-context.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; perl \"$root/scripts/hooks/file-change-guard.pl\" pre"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; perl \"$root/scripts/hooks/file-change-guard.pl\" post"
+          }
+        ]
+      }
+    ]
+  }
+}

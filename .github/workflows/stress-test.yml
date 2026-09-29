@@ -1,0 +1,173 @@
+name: stress-test
+
+# THE shared stress workflow for every APKiwiOrg repository. A repository calls it from a small caller of its own
+# (see README.md), so there is one implementation, and every run happens on a GitHub-hosted runner in the
+# CALLER's Actions, checking out the caller's ref. Nothing ever runs on the dev Mac or the self-hosted fleet,
+# which is the dev Mac.
+#
+# A load or stress run needs the owner's explicit permission before it starts (shared rule
+# no-local-stress-load). Ask first, then dispatch the caller:
+#
+#   gh workflow run stress-test.yml --ref <branch> \
+#     -f project=<Tests project>.csproj -f filter="FullyQualifiedName~<Name>" -f iterations=50 -f load=4
+#
+# Inputs reach the scripts only through env, never by expression interpolation into a run line, so a filter
+# holding shell metacharacters cannot inject a command.
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Test project to build and run (path to its .csproj)
+        required: true
+        type: string
+      filter:
+        description: dotnet test --filter expression selecting the tests to repeat
+        required: true
+        type: string
+      iterations:
+        description: How many times to run the selection, 1 to 200
+        required: false
+        default: '20'
+        type: string
+      load:
+        description: Busy-loop processes kept running during every run to add contention, 0 to 16 (0 is none)
+        required: false
+        default: '0'
+        type: string
+      configuration:
+        description: Build configuration, Release or Debug
+        required: false
+        default: Release
+        type: string
+    secrets:
+      packages-token:
+        description: Token for a caller whose nuget.config restores from GitHub Packages (the engine passes GITHUB_TOKEN)
+        required: false
+
+permissions:
+  contents: read
+
+# One stress run per ref at a time. A second dispatch on the same branch queues rather than cancelling the
+# first, because a half-finished proof is worth nothing.
+concurrency:
+  group: stress-test-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    # GitHub-hosted on purpose, never [self-hosted]: the self-hosted fleet is the dev Mac.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    env:
+      GITHUB_PACKAGES_PAT: ${{ secrets.packages-token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-${{ runner.arch }}-nuget-${{ hashFiles('**/*.csproj', '**/*.props', '**/nuget.config') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-nuget-
+
+      # Game repositories vendor the engine and evict stale versions first. The engine instead needs the
+      # local-feed directory its nuget.config names as a source. Each step runs only where it applies.
+      - name: Evict stale vendored engine packages
+        if: hashFiles('scripts/evict-stale-vendored.sh') != ''
+        run: sh scripts/evict-stale-vendored.sh
+
+      - name: Create the local feed nuget.config names
+        if: hashFiles('nuget.config') != ''
+        run: if grep -q 'local-feed' nuget.config; then mkdir -p local-feed; fi
+
+      - name: Check the inputs
+        env:
+          PROJECT: ${{ inputs.project }}
+          ITERATIONS: ${{ inputs.iterations }}
+          LOAD: ${{ inputs.load }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          case "$CONFIGURATION" in Release|Debug) ;; *) echo "::error::configuration must be Release or Debug"; exit 1 ;; esac
+          case "$ITERATIONS" in ''|*[!0-9]*) echo "::error::iterations must be a whole number"; exit 1 ;; esac
+          case "$LOAD" in ''|*[!0-9]*) echo "::error::load must be a whole number"; exit 1 ;; esac
+          if [ "$ITERATIONS" -lt 1 ] || [ "$ITERATIONS" -gt 200 ]; then echo "::error::iterations must be 1 to 200"; exit 1; fi
+          if [ "$LOAD" -gt 16 ]; then echo "::error::load must be 0 to 16"; exit 1; fi
+          if [ ! -f "$PROJECT" ]; then echo "::error::project $PROJECT does not exist on this ref"; exit 1; fi
+
+      - name: Build the test project once
+        env:
+          PROJECT: ${{ inputs.project }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: dotnet build "$PROJECT" -c "$CONFIGURATION"
+
+      # A run passes only when dotnet test exits 0 AND the selection executed at least one test: dotnet test
+      # exits 0 when a filter matches nothing, so a typo would otherwise report a clean sweep.
+      - name: Repeat the selection
+        env:
+          PROJECT: ${{ inputs.project }}
+          FILTER: ${{ inputs.filter }}
+          ITERATIONS: ${{ inputs.iterations }}
+          LOAD: ${{ inputs.load }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          results="$RUNNER_TEMP/stress"
+          mkdir -p "$results"
+          burners=""
+          i=0
+          while [ "$i" -lt "$LOAD" ]; do
+            sh -c 'while :; do :; done' &
+            burners="$burners $!"
+            i=$((i + 1))
+          done
+          trap 'for p in $burners; do kill "$p" 2>/dev/null; done' EXIT
+          passed=0
+          failed=0
+          empty=0
+          n=1
+          while [ "$n" -le "$ITERATIONS" ]; do
+            log="$results/run-$n.log"
+            trx="$results/run-$n.trx"
+            if dotnet test "$PROJECT" -c "$CONFIGURATION" --no-build --filter "$FILTER" \
+                --logger "trx;LogFileName=run-$n.trx" --results-directory "$results" > "$log" 2>&1; then
+              executed=$(grep -o '<Counters [^/]*' "$trx" 2>/dev/null | head -1 | grep -o ' executed="[0-9]*"' | grep -o '[0-9]*')
+              if [ "${executed:-0}" -gt 0 ]; then
+                passed=$((passed + 1))
+                rm -f "$log" "$trx"
+              else
+                empty=$((empty + 1))
+                echo "::error::run $n selected no tests"
+              fi
+            else
+              failed=$((failed + 1))
+              echo "::error::run $n failed"
+              grep -E '\[FAIL\]|Error Message:' -A 3 "$log" | head -40
+            fi
+            n=$((n + 1))
+          done
+          {
+            echo "## stress-test"
+            echo ""
+            echo "- project: \`$PROJECT\` ($CONFIGURATION)"
+            echo "- filter: \`$FILTER\`"
+            echo "- load: $LOAD busy loops"
+            echo "- result: $passed passed, $failed failed, $empty selected nothing, of $ITERATIONS runs"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "stress-test: $passed passed, $failed failed, $empty selected nothing, of $ITERATIONS runs"
+          test "$failed" -eq 0 && test "$empty" -eq 0
+
+      - name: Upload the failing runs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-test-results
+          path: ${{ runner.temp }}/stress
+          retention-days: 7
+          if-no-files-found: ignore

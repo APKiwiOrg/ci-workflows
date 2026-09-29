@@ -1,0 +1,31 @@
+#!/bin/sh
+# commit-msg: enforce conventional-commit subject and ban em/en-dashes in the message.
+# Shared via core.hooksPath=.githooks. Bypass with `git commit --no-verify` when truly needed.
+msg_file="$1"
+
+# Drop the verbose-diff (everything from the scissors line on) and comment lines,
+# so an em-dash in the pasted diff or a comment never triggers a false positive.
+body=$(sed '/^# -* >8 -*$/,$d' "$msg_file" | grep -v '^#')
+subject=$(printf '%s\n' "$body" | sed '/^[[:space:]]*$/d' | head -1)
+
+# Let git-generated subjects through untouched.
+case "$subject" in
+  "Merge "*|"Revert "*|"fixup! "*|"squash! "*|"amend! "*) exit 0 ;;
+esac
+
+fail=0
+
+if printf '%s' "$body" | LC_ALL=C grep -qF -e '—' -e '–'; then
+  echo "commit-msg: message contains an em-dash or en-dash, which are banned in commit messages." >&2
+  echo "            Use a period, comma, colon, or parentheses instead." >&2
+  fail=1
+fi
+
+if ! printf '%s' "$subject" | grep -qE '^[a-z0-9][a-z0-9._-]*(\([^)]+\))?: .+'; then
+  echo "commit-msg: subject must be conventional-commit style 'area(scope): summary' (scope optional)." >&2
+  echo "            e.g. 'audio(9.27.0): MacOsMusicBackend loads built .ogg' or 'docs: fix typo'." >&2
+  echo "            got: $subject" >&2
+  fail=1
+fi
+
+exit $fail

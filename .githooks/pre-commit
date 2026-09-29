@@ -1,0 +1,58 @@
+#!/bin/sh
+# pre-commit: keep root agent instructions under budget, ban em/en-dashes in staged .md/.ts/.tsx
+# additions (scripts/check-dashes.sh), ban prose semicolons in staged .md additions
+# (scripts/check-prose.sh), enforce the version<->changelog coupling, and block re-creating the
+# retired backlog files.
+# Shared via core.hooksPath=.githooks. Bypass with --no-verify.
+fail=0
+
+# Keep always-loaded project instructions below the runtime loading budget.
+if [ -f scripts/check-agent-instructions.sh ]; then
+  if ! sh scripts/check-agent-instructions.sh; then
+    fail=1
+  fi
+fi
+
+# 1) Em/en-dash ban in staged ADDED lines of shipped text (.md, .ts, .tsx). Shared with CI
+#    (scripts/check-dashes.sh) so the rule cannot drift between the hook and the pipeline.
+if [ -f scripts/check-workflows.sh ]; then
+  if ! sh scripts/check-workflows.sh; then
+    fail=1
+  fi
+fi
+if [ -f scripts/check-dashes.sh ]; then
+  if ! sh scripts/check-dashes.sh; then
+    echo "            Fix them, or 'git commit --no-verify' to override." >&2
+    fail=1
+  fi
+fi
+
+# 1b) Prose-semicolon ban in staged ADDED lines of .md (scripts/check-prose.sh). Same staged contract
+#     as the dash check: semicolons already in the file are ignored, only what you are adding counts,
+#     and code (fenced blocks, indented blocks, inline spans) is stripped before looking. The
+#     whole-tree leg is a separate ratchet over .prose-baseline, so THIS hook is what keeps new
+#     prose semicolons out. It never reads the baseline.
+if [ -f scripts/check-prose.sh ]; then
+  if ! sh scripts/check-prose.sh; then
+    echo "            Fix them, or 'git commit --no-verify' to override." >&2
+    fail=1
+  fi
+fi
+
+# 2) version<->changelog coupling: a changed (+/-) "version" line in package.json requires
+#    CHANGELOG.md staged in the same commit.
+
+# 3) Retired backlog files. The backlog is GitHub Issues, so a commit that ADDS docs/TODO.md or
+#    docs/ROADMAP.md (diff-filter=A, repo-root docs/ only) is blocked. An edit to some other TODO.md
+#    elsewhere is not this file and is fine. Override a genuine exception with BACKLOG_FILE_OK=1.
+readded=$(git diff --cached --name-only --diff-filter=A 2>/dev/null | grep -E '^docs/(TODO|ROADMAP)\.md$' || true)
+if [ -n "$readded" ] && [ "${BACKLOG_FILE_OK:-}" != 1 ]; then
+  echo "pre-commit: this commit re-creates a retired backlog file:" >&2
+  for f in $readded; do echo "              $f" >&2; done
+  echo "            The backlog is GitHub Issues, not a file. File it with:" >&2
+  echo "              gh issue create --label kind/backlog --label confidence/lead" >&2
+  echo "            Search prior art first: scripts/ledger.sh search <term>. Deliberate exception: BACKLOG_FILE_OK=1." >&2
+  fail=1
+fi
+
+exit $fail
