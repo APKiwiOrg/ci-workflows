@@ -67,5 +67,9 @@ The summary reports passed, failed and selected-nothing counts. Failing runs upl
 `stress-test-results` for seven days. It bills GitHub-hosted Linux minutes at 1x, so a 50-run proof of a ten
 second test costs about ten minutes.
 
+It builds the caller's single root `.slnx` or `.sln` before the runs, so suites that guard production
+assemblies pass, and falls back to the test project when the root holds no single solution. The optional
+`build-target` input overrides both.
+
 The workflow evicts stale vendored engine packages when the caller has `scripts/evict-stale-vendored.sh`, and
 creates `local-feed` when the caller's `nuget.config` names it.

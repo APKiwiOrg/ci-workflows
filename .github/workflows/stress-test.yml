@@ -35,6 +35,11 @@ on:
         required: false
         default: '0'
         type: string
+      build-target:
+        description: Solution or project to build before the runs. Empty builds the caller's single root .slnx or .sln, else the test project
+        required: false
+        default: ''
+        type: string
       configuration:
         description: Build configuration, Release or Debug
         required: false
@@ -102,11 +107,23 @@ jobs:
           if [ "$LOAD" -gt 16 ]; then echo "::error::load must be 0 to 16"; exit 1; fi
           if [ ! -f "$PROJECT" ]; then echo "::error::project $PROJECT does not exist on this ref"; exit 1; fi
 
-      - name: Build the test project once
+      # The WHOLE solution by default, not just the test project: some suites guard production assemblies the
+      # test project does not reference (a Desktop head, an authority scan over the server), and those tests
+      # fail outright when only the test project was built.
+      - name: Build once
         env:
           PROJECT: ${{ inputs.project }}
+          BUILD_TARGET: ${{ inputs.build-target }}
           CONFIGURATION: ${{ inputs.configuration }}
-        run: dotnet build "$PROJECT" -c "$CONFIGURATION"
+        run: |
+          target="$BUILD_TARGET"
+          if [ -z "$target" ]; then
+            set -- $(ls *.slnx *.sln 2>/dev/null)
+            if [ "$#" -eq 1 ]; then target="$1"; else target="$PROJECT"; fi
+          fi
+          if [ ! -e "$target" ]; then echo "::error::build target $target does not exist on this ref"; exit 1; fi
+          echo "building $target"
+          dotnet build "$target" -c "$CONFIGURATION"
 
       # A run passes only when dotnet test exits 0 AND the selection executed at least one test: dotnet test
       # exits 0 when a filter matches nothing, so a typo would otherwise report a clean sweep.
