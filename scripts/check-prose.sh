@@ -7,7 +7,7 @@
 #
 # Why a baseline and not a mass rewrite: the rule postdates the docs, so the fleet carries a four-figure
 # pile of pre-existing hits (measured for #35: 33 in the template, 73 Hardpoint, 169 SpaceGame, 400
-# Nullwake, 457 Ruinborne, 1634 KhaozEngine). Whole-tree mode used to report all of them and exit 1
+# Nullwake, 1634 KhaozEngine). Whole-tree mode used to report all of them and exit 1
 # everywhere, which is worse than not checking at all: a guard that is red in every repo on every run
 # teaches everyone to scroll past it, and then it also fails to flag the one line that IS new.
 #
