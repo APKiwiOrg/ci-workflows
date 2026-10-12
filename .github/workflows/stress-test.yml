@@ -45,6 +45,11 @@ on:
         required: false
         default: Release
         type: string
+      support-cost:
+        description: Record one fixed-compilation support-cost artifact per iteration, requires Release and no load
+        required: false
+        default: false
+        type: boolean
     secrets:
       packages-token:
         description: Token for a caller whose nuget.config restores from GitHub Packages (the engine passes GITHUB_TOKEN)
@@ -99,6 +104,7 @@ jobs:
           ITERATIONS: ${{ inputs.iterations }}
           LOAD: ${{ inputs.load }}
           CONFIGURATION: ${{ inputs.configuration }}
+          SUPPORT_COST: ${{ inputs.support-cost }}
         run: |
           case "$CONFIGURATION" in Release|Debug) ;; *) echo "::error::configuration must be Release or Debug"; exit 1 ;; esac
           case "$ITERATIONS" in ''|*[!0-9]*) echo "::error::iterations must be a whole number"; exit 1 ;; esac
@@ -106,6 +112,16 @@ jobs:
           if [ "$ITERATIONS" -lt 1 ] || [ "$ITERATIONS" -gt 200 ]; then echo "::error::iterations must be 1 to 200"; exit 1; fi
           if [ "$LOAD" -gt 16 ]; then echo "::error::load must be 0 to 16"; exit 1; fi
           if [ ! -f "$PROJECT" ]; then echo "::error::project $PROJECT does not exist on this ref"; exit 1; fi
+          if [ "$SUPPORT_COST" = true ]; then
+            if [ "$CONFIGURATION" != Release ] || [ "$LOAD" -ne 0 ]; then
+              echo "::error::support-cost requires Release and load=0"
+              exit 1
+            fi
+            if [ ! -f scripts/record-support-cost-exit.py ]; then
+              echo "::error::support-cost requires the caller's scripts/record-support-cost-exit.py"
+              exit 1
+            fi
+          fi
 
       # The WHOLE solution by default, not just the test project: some suites guard production assemblies the
       # test project does not reference (a Desktop head, an authority scan over the server), and those tests
@@ -134,6 +150,7 @@ jobs:
           ITERATIONS: ${{ inputs.iterations }}
           LOAD: ${{ inputs.load }}
           CONFIGURATION: ${{ inputs.configuration }}
+          SUPPORT_COST: ${{ inputs.support-cost }}
         run: |
           results="$RUNNER_TEMP/stress"
           mkdir -p "$results"
@@ -152,8 +169,25 @@ jobs:
           while [ "$n" -le "$ITERATIONS" ]; do
             log="$results/run-$n.log"
             trx="$results/run-$n.trx"
+            if [ "$SUPPORT_COST" = true ]; then
+              export DOTNET_TieredCompilation=0
+              export KHAOZ_SUPPORT_COST_ARTIFACT="$results/support-cost/run-$n.json"
+            fi
+            status=0
             if dotnet test "$PROJECT" -c "$CONFIGURATION" --no-build --filter "$FILTER" \
                 --logger "trx;LogFileName=run-$n.trx" --results-directory "$results" > "$log" 2>&1; then
+              status=0
+            else
+              status=$?
+            fi
+            if [ "$SUPPORT_COST" = true ]; then
+              if [ ! -s "$KHAOZ_SUPPORT_COST_ARTIFACT" ] || \
+                  ! python3 scripts/record-support-cost-exit.py "$KHAOZ_SUPPORT_COST_ARTIFACT" "$status" >> "$log" 2>&1; then
+                echo "::error::run $n did not produce a finalized support-cost artifact"
+                status=1
+              fi
+            fi
+            if [ "$status" -eq 0 ]; then
               executed=$(grep -o '<Counters [^/]*' "$trx" 2>/dev/null | head -1 | grep -o ' executed="[0-9]*"' | grep -o '[0-9]*')
               if [ "${executed:-0}" -gt 0 ]; then
                 passed=$((passed + 1))
@@ -165,7 +199,7 @@ jobs:
             else
               failed=$((failed + 1))
               echo "::error::run $n failed"
-              grep -E '\[FAIL\]|Error Message:' -A 3 "$log" | head -40
+              grep -E '\[FAIL\]|Error Message:' -A 3 "$log" | head -40 || true
             fi
             n=$((n + 1))
           done
@@ -179,6 +213,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "stress-test: $passed passed, $failed failed, $empty selected nothing, of $ITERATIONS runs"
           test "$failed" -eq 0 && test "$empty" -eq 0
+
+      - name: Upload support cost artifacts
+        if: always() && inputs.support-cost
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: support-cost
+          path: ${{ runner.temp }}/stress/support-cost
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Upload the failing runs
         if: failure()

@@ -40,6 +40,10 @@ on:
         default: Release
         type: choice
         options: [Release, Debug]
+      support-cost:
+        description: Record fixed-compilation support cost artifacts, Release and no load only
+        default: false
+        type: boolean
 permissions:
   contents: read
 jobs:
@@ -51,6 +55,7 @@ jobs:
       iterations: ${{ inputs.iterations }}
       load: ${{ inputs.load }}
       configuration: ${{ inputs.configuration }}
+      support-cost: ${{ inputs.support-cost }}
 ```
 
 A caller whose `nuget.config` restores from GitHub Packages also passes
@@ -73,3 +78,16 @@ assemblies pass, and falls back to the test project when the root holds no singl
 
 The workflow evicts stale vendored engine packages when the caller has `scripts/evict-stale-vendored.sh`, and
 creates `local-feed` when the caller's `nuget.config` names it.
+
+The optional `support-cost` boolean defaults to false. When true, configuration must be Release and load
+must be zero. Each iteration sets `DOTNET_TieredCompilation=0` and writes to a separate
+`KHAOZ_SUPPORT_COST_ARTIFACT` path under the runner's temporary `stress/support-cost/run-N.json` directory.
+The caller supplies `scripts/record-support-cost-exit.py` to finalize each JSON file with the actual test
+process exit. Missing artifacts or failed finalization fail the iteration. Successful logs and TRX files
+are still removed, while failing runs keep both. The `support-cost` upload retains all cost files for seven
+days on success or failure. Committed measurement artifacts are never output paths.
+
+The caller owns calibration and normalized verdicts. KhaozEngine uses its committed M2 Max baseline as
+read-only input and the legacy flat-box tick from the same hosted invocation. A reusable-workflow change
+is proven by one caller run with one iteration, no load and Release before keeping the new caller pin.
+Repeated timing still requires the owner's explicit approval.
