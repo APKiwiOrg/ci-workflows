@@ -132,10 +132,14 @@ A cost or measurement run builds only what it needs and keeps its evidence, for 
 ```bash
 gh workflow run stress-test.yml --ref <branch> \
   -f project=<Cost tests>.csproj -f build-target=<Cost tests>.csproj \
-  -f filter='FullyQualifiedName=<Namespace>.<Class>.<Method>&DisplayName~"<unit>"' \
+  -f filter='FullyQualifiedName=<Namespace>.<Class>.<Method>&DisplayName~<unit>' \
   -f iterations=1 -f load=0 -f configuration=Release -f artifact-env=<CALLER_REPORTS_VARIABLE>
 ```
 
 The input only says where output goes. It implies no permission to run a workload, authorizes no manifest,
 and changes no caller's approval rules. Choosing what runs, and getting the owner's permission for any
 timing or load run, stays with the caller.
+
+Quote the whole filter for the shell, without embedded quotes around a simple unit name. Embedded quotes
+can be stripped while dotnet forwards the filter to the test adapter, leaving an invalid condition and no
+selected tests. Check the retained TRX count before treating a run as evidence.
