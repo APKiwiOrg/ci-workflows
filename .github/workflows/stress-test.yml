@@ -50,6 +50,11 @@ on:
         required: false
         default: false
         type: boolean
+      artifact-env:
+        description: Environment variable each run gets naming its own retained directory, empty for none
+        required: false
+        default: ''
+        type: string
     secrets:
       packages-token:
         description: Token for a caller whose nuget.config restores from GitHub Packages (the engine passes GITHUB_TOKEN)
@@ -105,6 +110,7 @@ jobs:
           LOAD: ${{ inputs.load }}
           CONFIGURATION: ${{ inputs.configuration }}
           SUPPORT_COST: ${{ inputs.support-cost }}
+          ARTIFACT_ENV: ${{ inputs.artifact-env }}
         run: |
           case "$CONFIGURATION" in Release|Debug) ;; *) echo "::error::configuration must be Release or Debug"; exit 1 ;; esac
           case "$ITERATIONS" in ''|*[!0-9]*) echo "::error::iterations must be a whole number"; exit 1 ;; esac
@@ -119,6 +125,32 @@ jobs:
             fi
             if [ ! -f scripts/record-support-cost-exit.py ]; then
               echo "::error::support-cost requires the caller's scripts/record-support-cost-exit.py"
+              exit 1
+            fi
+          fi
+          # The name only ever reaches the test process as one quoted env assignment, never eval or export. It
+          # must be a plain identifier, must not be set already, and must not be a shell, process or runner
+          # control name, so it cannot redirect PATH, a loader, the runtime or the runner's own files. The
+          # rejection never echoes a malformed value, which could otherwise carry a workflow command.
+          if [ -n "$ARTIFACT_ENV" ]; then
+            case "$ARTIFACT_ENV" in
+              [!_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]*|*[!_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789]*)
+                echo "::error::artifact-env must be a shell identifier of ASCII letters, digits and underscores, not starting with a digit"
+                exit 1 ;;
+            esac
+            reserved=false
+            case "$(printf '%s' "$ARTIFACT_ENV" | tr abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ)" in
+              PATH|HOME|IFS|CDPATH|ENV|SHELLOPTS|BASHOPTS|SHELL|USER|LOGNAME|PWD|OLDPWD|PS4|GLOBIGNORE|POSIXLY_CORRECT) reserved=true ;;
+              TMPDIR|TMP|TEMP|LANG|LANGUAGE|TZ|CI|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|ALL_PROXY) reserved=true ;;
+              ARTIFACT_ENV|PROJECT|FILTER|ITERATIONS|LOAD|CONFIGURATION|SUPPORT_COST|BUILD_TARGET|KHAOZ_SUPPORT_COST_ARTIFACT) reserved=true ;;
+              BASH_*|GITHUB_*|RUNNER_*|ACTIONS_*|LD_*|DYLD_*|LC_*|DOTNET_*|COMPLUS_*|CORECLR_*|NUGET_*|MSBUILD*|VSTEST*|PYTHON*) reserved=true ;;
+            esac
+            if [ "$reserved" = true ]; then
+              echo "::error::artifact-env $ARTIFACT_ENV is a reserved shell, process or runner name"
+              exit 1
+            fi
+            if declare -p "$ARTIFACT_ENV" > /dev/null 2>&1; then
+              echo "::error::artifact-env $ARTIFACT_ENV is already set in the runner environment"
               exit 1
             fi
           fi
@@ -143,7 +175,14 @@ jobs:
 
       # A run passes only when dotnet test exits 0 AND the selection executed at least one test: dotnet test
       # exits 0 when a filter matches nothing, so a typo would otherwise report a clean sweep.
+      #
+      # With artifact-env, each run's test process gets that variable naming its own artifacts/run-N directory,
+      # and every log and TRX is kept for the stress-artifacts upload. The step limit then drops to 60 minutes
+      # so a timed-out selection still leaves the 90-minute job time to upload what it wrote. That is nominal
+      # headroom, not a guarantee that setup, build and the runs fit. Without artifact-env the step keeps the
+      # job's 90 minutes, which is today's behaviour.
       - name: Repeat the selection
+        timeout-minutes: ${{ inputs.artifact-env != '' && 60 || 90 }}
         env:
           PROJECT: ${{ inputs.project }}
           FILTER: ${{ inputs.filter }}
@@ -151,6 +190,7 @@ jobs:
           LOAD: ${{ inputs.load }}
           CONFIGURATION: ${{ inputs.configuration }}
           SUPPORT_COST: ${{ inputs.support-cost }}
+          ARTIFACT_ENV: ${{ inputs.artifact-env }}
         run: |
           results="$RUNNER_TEMP/stress"
           mkdir -p "$results"
@@ -169,17 +209,25 @@ jobs:
           while [ "$n" -le "$ITERATIONS" ]; do
             log="$results/run-$n.log"
             trx="$results/run-$n.trx"
+            set --
+            if [ -n "$ARTIFACT_ENV" ]; then
+              run_artifacts="$results/artifacts/run-$n"
+              mkdir -p "$run_artifacts"
+              set -- env "$ARTIFACT_ENV=$run_artifacts"
+              echo "stress-test: run $n $ARTIFACT_ENV=$run_artifacts" > "$log"
+            fi
             if [ "$SUPPORT_COST" = true ]; then
               export DOTNET_TieredCompilation=0
               export KHAOZ_SUPPORT_COST_ARTIFACT="$results/support-cost/run-$n.json"
             fi
             status=0
-            if dotnet test "$PROJECT" -c "$CONFIGURATION" --no-build --filter "$FILTER" \
-                --logger "trx;LogFileName=run-$n.trx" --results-directory "$results" > "$log" 2>&1; then
+            if "$@" dotnet test "$PROJECT" -c "$CONFIGURATION" --no-build --filter "$FILTER" \
+                --logger "trx;LogFileName=run-$n.trx" --results-directory "$results" >> "$log" 2>&1; then
               status=0
             else
               status=$?
             fi
+            if [ -n "$ARTIFACT_ENV" ]; then echo "stress-test: run $n dotnet test exit $status" >> "$log"; fi
             if [ "$SUPPORT_COST" = true ]; then
               if [ ! -s "$KHAOZ_SUPPORT_COST_ARTIFACT" ] || \
                   ! python3 scripts/record-support-cost-exit.py "$KHAOZ_SUPPORT_COST_ARTIFACT" "$status" >> "$log" 2>&1; then
@@ -191,7 +239,7 @@ jobs:
               executed=$(grep -o '<Counters [^/]*' "$trx" 2>/dev/null | head -1 | grep -o ' executed="[0-9]*"' | grep -o '[0-9]*')
               if [ "${executed:-0}" -gt 0 ]; then
                 passed=$((passed + 1))
-                rm -f "$log" "$trx"
+                if [ -z "$ARTIFACT_ENV" ]; then rm -f "$log" "$trx"; fi
               else
                 empty=$((empty + 1))
                 echo "::error::run $n selected no tests"
@@ -210,6 +258,9 @@ jobs:
             echo "- filter: \`$FILTER\`"
             echo "- load: $LOAD busy loops"
             echo "- result: $passed passed, $failed failed, $empty selected nothing, of $ITERATIONS runs"
+            if [ -n "$ARTIFACT_ENV" ]; then
+              echo "- artifacts: \`$ARTIFACT_ENV\` named a directory per run, every log and TRX kept as \`stress-artifacts\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo "stress-test: $passed passed, $failed failed, $empty selected nothing, of $ITERATIONS runs"
           test "$failed" -eq 0 && test "$empty" -eq 0
@@ -223,8 +274,19 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      # Artifact mode uploads the whole stress tree whatever the outcome, so the failing-runs upload below
+      # stands down rather than upload the same files twice.
+      - name: Upload the stress artifacts
+        if: always() && inputs.artifact-env != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-artifacts
+          path: ${{ runner.temp }}/stress
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Upload the failing runs
-        if: failure()
+        if: failure() && inputs.artifact-env == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: stress-test-results

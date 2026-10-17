@@ -1,6 +1,7 @@
 name: check
 
-# Keeps every workflow in this public repository hosted and SHA-pinned, and parses them.
+# Keeps every workflow in this public repository hosted and SHA-pinned, parses them, and runs the stress
+# workflow's shell steps against a stub dotnet.
 on:
   push:
   pull_request:
@@ -18,3 +19,5 @@ jobs:
         run: sh scripts/check-workflows.sh
       - name: Every workflow parses
         run: for f in .github/workflows/*.yml; do python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" || exit 1; done
+      - name: Stress workflow shell steps
+        run: sh scripts/tests/stress-test-workflow.test.sh

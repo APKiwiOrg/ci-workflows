@@ -44,6 +44,14 @@ on:
         description: Record fixed-compilation support cost artifacts, Release and no load only
         default: false
         type: boolean
+      build-target:
+        description: Solution or project to build first, empty for the default
+        default: ''
+        type: string
+      artifact-env:
+        description: Environment variable naming each run's retained directory, empty for none
+        default: ''
+        type: string
 permissions:
   contents: read
 jobs:
@@ -56,6 +64,8 @@ jobs:
       load: ${{ inputs.load }}
       configuration: ${{ inputs.configuration }}
       support-cost: ${{ inputs.support-cost }}
+      build-target: ${{ inputs.build-target }}
+      artifact-env: ${{ inputs.artifact-env }}
 ```
 
 A caller whose `nuget.config` restores from GitHub Packages also passes
@@ -91,3 +101,41 @@ The caller owns calibration and normalized verdicts. KhaozEngine uses its commit
 read-only input and the legacy flat-box tick from the same hosted invocation. A reusable-workflow change
 is proven by one caller run with one iteration, no load and Release before keeping the new caller pin.
 Repeated timing still requires the owner's explicit approval.
+
+The optional `artifact-env` string defaults to empty, which changes nothing above. When set, it names an
+environment variable the workflow gives each run's test process, pointing at that run's own directory
+`stress/artifacts/run-N` under the runner's temporary directory. Whatever the tests write there, for example
+one JSON file per finished condition, survives a later failure, crash or timeout in the same run. Every
+run's `run-N.log` and `run-N.trx` are kept, passing runs included. Each log starts with the directory it was
+given and ends with the actual `dotnet test` exit, unless the step was killed first. The whole `stress`
+tree uploads as `stress-artifacts` for seven days on success, failure or cancellation, with a warning
+rather than an error when it holds no files. Empty directories do not upload. The `stress-test-results`
+failure upload stands down in this mode because `stress-artifacts` already holds the same files. A
+`support-cost` run still uploads its own `support-cost` artifact.
+
+The name must be an ASCII shell identifier that is not already set in the runner environment. Shell and
+process control names (`PATH`, `HOME`, `IFS`, `CDPATH`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `TMPDIR`, `LANG`,
+`TZ`, `CI`, the proxy variables and similar), the workflow's own variables, and the `BASH_`, `GITHUB_`,
+`RUNNER_`, `ACTIONS_`, `LD_`, `DYLD_`, `LC_`, `DOTNET_`, `COMPLUS_`, `CORECLR_`, `NUGET_`, `MSBUILD`,
+`VSTEST` and `PYTHON` prefixes are refused in any letter case. The value reaches the test process as one
+quoted assignment, never through `eval` or a shell export.
+
+In artifact mode the repeat step stops after 60 minutes instead of running to the 90-minute job limit, so
+a selection that overruns still leaves job time to upload what it wrote. That is nominal headroom only. It
+does not promise that checkout, restore, the build and the runs fit, and a job cancelled at its 90-minute
+limit may upload nothing. A caller with its own deadline, such as a per-unit budget in a measurement
+manifest, keeps that deadline cooperative and well inside the step limit. The hard limits are the step's 60
+minutes and the job's 90.
+
+A cost or measurement run builds only what it needs and keeps its evidence, for example:
+
+```bash
+gh workflow run stress-test.yml --ref <branch> \
+  -f project=<Cost tests>.csproj -f build-target=<Cost tests>.csproj \
+  -f filter='FullyQualifiedName=<Namespace>.<Class>.<Method>&DisplayName~"<unit>"' \
+  -f iterations=1 -f load=0 -f configuration=Release -f artifact-env=<CALLER_REPORTS_VARIABLE>
+```
+
+The input only says where output goes. It implies no permission to run a workload, authorizes no manifest,
+and changes no caller's approval rules. Choosing what runs, and getting the owner's permission for any
+timing or load run, stays with the caller.
