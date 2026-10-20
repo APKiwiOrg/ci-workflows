@@ -3,9 +3,11 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -54,7 +56,16 @@ class CoverageWorkflowTests(unittest.TestCase):
         path.chmod(0o755)
 
     def run_step(self, name, **overrides):
-        return subprocess.run(["bash", "-eo", "pipefail", "-c", self.steps[name]["run"]],
+        step = self.steps[name]
+        # Match GitHub's Linux shell templates, including the default without pipefail.
+        shells = {None: ["bash", "-e"],
+                  "bash": ["bash", "--noprofile", "--norc", "-eo", "pipefail"],
+                  "sh": ["sh", "-e"]}
+        shell = step.get("shell")
+        self.assertIn(shell, shells, "unmodeled workflow shell")
+        script = self.work / "step.sh"
+        script.write_text(step["run"])
+        return subprocess.run(shells[shell] + [str(script)],
                               cwd=self.work, env={**self.env, **overrides},
                               text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -141,7 +152,7 @@ class CoverageWorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(repr(["build", "Engine.slnx", "-c", "Release"]), result.stdout)
 
-    def test_lavapipe_discovery_exports_and_diagnostics(self):
+    def stub_vulkan_setup(self):
         icd = self.work / "lvp_icd.fixture.json"
         icd.write_text('{"ICD":{"library_path":"fixture.so"}}')
         self.stub("sudo", "import sys\nprint('sudo ' + ' '.join(sys.argv[1:]))\n")
@@ -149,6 +160,10 @@ class CoverageWorkflowTests(unittest.TestCase):
         self.stub("dpkg-query", "print('libvulkan1 1.4.fixture\\nmesa-vulkan-drivers 26.fixture')\n")
         self.stub("vulkaninfo", "import os\nassert os.environ['VK_DRIVER_FILES'] == os.environ['STUB_ICD']\n"
                   "assert os.environ['VK_ICD_FILENAMES'] == os.environ['STUB_ICD']\nprint('deviceName = llvmpipe fixture')\n")
+        return icd
+
+    def test_lavapipe_discovery_exports_and_diagnostics(self):
+        icd = self.stub_vulkan_setup()
         result = self.run_step("Install coverage software Vulkan", STUB_ICD=str(icd))
         self.assertEqual(result.returncode, 0, result.stdout)
         exports = (self.work / "github-env").read_text()
@@ -163,6 +178,44 @@ class CoverageWorkflowTests(unittest.TestCase):
         result = self.run_step("Install coverage software Vulkan", STUB_ICD="/missing/no_icd.json")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("::error::lavapipe ICD", result.stdout)
+
+    def test_failed_vulkan_diagnostic_fails_setup_under_declared_shell(self):
+        icd = self.stub_vulkan_setup()
+        self.stub("vulkaninfo", "import sys\nprint('fixture Vulkan diagnostic failed')\nsys.exit(23)\n")
+        name = "Install coverage software Vulkan"
+        legacy = dict(self.steps[name])
+        legacy.pop("shell", None)
+        with patch.dict(self.steps, {name: legacy}):
+            old_result = self.run_step(name, STUB_ICD=str(icd))
+        self.assertEqual(old_result.returncode, 0, old_result.stdout)
+        self.assertIn("fixture Vulkan diagnostic failed", old_result.stdout)
+        print("Old undeclared shell swallowed vulkaninfo exit 23 (step exit 0)")
+
+        result = self.run_step(name, STUB_ICD=str(icd))
+        self.assertIn("fixture Vulkan diagnostic failed", result.stdout)
+        self.assertIn("fixture Vulkan diagnostic failed", (self.work / "summary").read_text())
+        log = Path(self.env["RUNNER_TEMP"]) / "stress/coverage-vulkan-setup.log"
+        self.assertIn("fixture Vulkan diagnostic failed", log.read_text())
+        self.assertEqual(result.returncode, 23, result.stdout)
+        print("Declared shell propagated vulkaninfo exit 23 (step exit 23)")
+
+    def test_setup_pipeline_failures_are_not_masked(self):
+        real_tee = shutil.which("tee")
+        self.assertIsNotNone(real_tee)
+        for command in ("sudo", "dpkg", "grep", "dpkg-query", "cat", "summary-tee", "log-tee"):
+            with self.subTest(command=command):
+                for stub in self.bin.iterdir():
+                    stub.unlink()
+                icd = self.stub_vulkan_setup()
+                if command.endswith("-tee"):
+                    destination = ("coverage-vulkan-setup.log" if command == "log-tee" else "summary")
+                    self.stub("tee", "import subprocess, sys\n"
+                              "code = subprocess.call([%r] + sys.argv[1:])\n"
+                              "sys.exit(29 if sys.argv[-1].endswith(%r) else code)\n" % (real_tee, destination))
+                else:
+                    self.stub(command, "import sys\nprint('fixture command failed')\nsys.exit(29)\n")
+                result = self.run_step("Install coverage software Vulkan", STUB_ICD=str(icd))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_run_contract_and_unfinalized_evidence(self):
         self.stub("dotnet", """import json, os, pathlib, sys

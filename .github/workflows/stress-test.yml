@@ -235,38 +235,39 @@ jobs:
 
       - name: Install coverage software Vulkan
         if: inputs.coverage-perf-cpu
+        shell: bash
         run: |
           results="$RUNNER_TEMP/stress"
           mkdir -p "$results"
           # Retain installation failures too, before the test step has created its own log.
-          exec > >(tee -a "$results/coverage-vulkan-setup.log") 2>&1
-          sudo apt-get update
-          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
-          manifests=$(dpkg -L mesa-vulkan-drivers)
-          printf '%s\n' "$manifests"
-          icd=$(printf '%s\n' "$manifests" | grep -E '/lvp_icd[^/]*\.json$' | head -1 || true)
-          if [ -z "$icd" ] || [ ! -f "$icd" ]; then
-            echo "::error::lavapipe ICD manifest not found in the mesa-vulkan-drivers file list"
-            exit 1
-          fi
-          export VK_DRIVER_FILES="$icd" VK_ICD_FILENAMES="$icd"
-          { echo "VK_DRIVER_FILES=$icd"; echo "VK_ICD_FILENAMES=$icd"; } >> "$GITHUB_ENV"
           {
-            echo "## Coverage CPU software Vulkan environment"
-            echo ""
-            echo "Backend: vulkan-native, KE_VULKAN_REQUIRED=1, KE_GPU_TESTS=1"
-            echo "Adapter policy: lavapipe software Vulkan, CPU preparation evidence only"
-            echo "Lavapipe ICD: $icd"
-            echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
-            echo '```text'
-            dpkg-query -W -f='${Package} ${Version}\n' libvulkan1 mesa-vulkan-drivers vulkan-tools
-            cat "$icd"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          # A failed native diagnostic is a setup failure, with its output retained in both places.
-          echo '```text' | tee -a "$GITHUB_STEP_SUMMARY"
-          vulkaninfo --summary 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '```' | tee -a "$GITHUB_STEP_SUMMARY"
+            sudo apt-get update
+            sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+            manifests=$(dpkg -L mesa-vulkan-drivers)
+            printf '%s\n' "$manifests"
+            if ! icd=$(grep -m 1 -E '/lvp_icd[^/]*\.json$' <<< "$manifests") || [ ! -f "$icd" ]; then
+              echo "::error::lavapipe ICD manifest not found in the mesa-vulkan-drivers file list"
+              exit 1
+            fi
+            export VK_DRIVER_FILES="$icd" VK_ICD_FILENAMES="$icd"
+            { echo "VK_DRIVER_FILES=$icd"; echo "VK_ICD_FILENAMES=$icd"; } >> "$GITHUB_ENV"
+            {
+              echo "## Coverage CPU software Vulkan environment"
+              echo ""
+              echo "Backend: vulkan-native, KE_VULKAN_REQUIRED=1, KE_GPU_TESTS=1"
+              echo "Adapter policy: lavapipe software Vulkan, CPU preparation evidence only"
+              echo "Lavapipe ICD: $icd"
+              echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+              echo '```text'
+              dpkg-query -W -f='${Package} ${Version}\n' libvulkan1 mesa-vulkan-drivers vulkan-tools
+              cat "$icd"
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            # A failed native diagnostic is a setup failure, with its output retained in both places.
+            echo '```text' | tee -a "$GITHUB_STEP_SUMMARY"
+            vulkaninfo --summary 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+            echo '```' | tee -a "$GITHUB_STEP_SUMMARY"
+          } 2>&1 | tee -a "$results/coverage-vulkan-setup.log"
 
       # The WHOLE solution by default, not just the test project: some suites guard production assemblies the
       # test project does not reference (a Desktop head, an authority scan over the server), and those tests
