@@ -200,10 +200,12 @@ process also gets `KE_GRAPHICS_BACKEND=vulkan-native`, `KE_VULKAN_REQUIRED=1`, `
 `KE_COVERAGE_PERF_REPORTS` naming its retained `stress/artifacts/run-1` directory. There is no general
 environment-injection input.
 
-In coverage mode the checkout fetches two commits. The caller dispatches the authorization commit, which
-adds only the approved manifest on top of its single parent, the measured workload commit named by
-`coverage-perf-workload-sha`. The parent must be present for the engine to verify that difference without
-network access. Every other mode keeps the default depth of one.
+In coverage mode the checkout uses depth two, so the checked-out commit's parents are present. The caller
+dispatches a ref whose tip is the authorization commit, which adds only the approved manifest on top of its
+single parent, the measured workload commit named by `coverage-perf-workload-sha`. The workflow does not pin
+that tip. The engine verifies offline that the checked-out commit has exactly that one parent and that one
+manifest difference, and refuses anything else, including a merge commit or a ref that moved after the
+approval. Every other mode keeps the default depth of one.
 
 Setup installs `libvulkan1`, `mesa-vulkan-drivers` and `vulkan-tools`. It discovers the lavapipe ICD JSON
 from `dpkg -L mesa-vulkan-drivers`, fails if absent, and selects it with both `VK_DRIVER_FILES` and the
