@@ -29,7 +29,8 @@ need(inputs['artifact-env'].get('default') == '', 'artifact-env defaults to empt
 need(inputs['artifact-env'].get('required') is False, 'artifact-env is optional')
 job = workflow['jobs']['stress']
 need(job['runs-on'] == 'ubuntu-26.04', 'job stays on ubuntu-26.04')
-need(job['timeout-minutes'] == 90, 'job timeout stays 90 minutes')
+need(job['timeout-minutes'] == "${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 30) || 90 }}",
+     'job timeout stays 90 outside coverage CPU mode')
 steps = {step.get('name'): step for step in job['steps']}
 for step in job['steps']:
     need('${{' not in step.get('run', ''), 'no expression inside a run line: %s' % step.get('name'))
@@ -37,7 +38,8 @@ check = steps['Check the inputs']
 repeat = steps['Repeat the selection']
 for step in (check, repeat):
     need(step['env'].get('ARTIFACT_ENV') == '${{ inputs.artifact-env }}', 'ARTIFACT_ENV reaches %s through env' % step['name'])
-need(repeat.get('timeout-minutes') == "${{ inputs.artifact-env != '' && 60 || 90 }}", 'repeat step timeout is 60 only in artifact mode')
+need(repeat.get('timeout-minutes') == "${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 30) || (inputs.artifact-env != '' && 60 || 90) }}",
+     'repeat step timeout stays 60 in artifact mode and 90 otherwise outside coverage CPU mode')
 need('timeout-minutes' not in check, 'check step keeps no timeout of its own')
 cost = steps['Upload support cost artifacts']
 artifacts = steps.get('Upload the stress artifacts', {})
@@ -119,7 +121,8 @@ run_step() {
     STUB_PLAN="$work/case/plan" STUB_COUNT="$work/case/count" STUB_SEEN="$work/case/seen" \
     STUB_WATCH=KE_COVERAGE_COST_REPORTS \
     PROJECT=Stub.csproj FILTER='FullyQualifiedName~Stub&Name!=x' ITERATIONS=1 LOAD=0 \
-    CONFIGURATION=Release SUPPORT_COST=false ARTIFACT_ENV='' "$@" \
+    CONFIGURATION=Release SUPPORT_COST=false ARTIFACT_ENV='' COVERAGE_PERF_CPU=false \
+    COVERAGE_PERF_UNIT='' COVERAGE_PERF_MANIFEST_SHA256='' COVERAGE_PERF_WORKLOAD_SHA='' "$@" \
     bash -e "$work/$script") > "$work/case/out" 2>&1 || actual=$?
   [ "$actual" -eq "$expected" ] || fail "$script $* exited $actual, expected $expected"
   pass=$((pass + 1))
@@ -204,3 +207,4 @@ for shell_name in RANDOM PPID UID OPTIND; do
 done
 
 echo "stress-test-workflow tests: $pass passed"
+python3 "$root/scripts/tests/coverage-perf-cpu-workflow.test.py"

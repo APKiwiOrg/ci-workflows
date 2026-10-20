@@ -52,6 +52,26 @@ on:
         description: Environment variable naming each run's retained directory, empty for none
         default: ''
         type: string
+      coverage-perf-cpu:
+        description: One separately approved coverage CPU measurement on software Vulkan
+        default: false
+        type: boolean
+      coverage-perf-unit:
+        description: Exact approved unit ID
+        default: ''
+        type: string
+      coverage-perf-manifest-sha256:
+        description: SHA-256 of the exact approved manifest bytes
+        default: ''
+        type: string
+      coverage-perf-workload-sha:
+        description: Exact approved workload commit SHA
+        default: ''
+        type: string
+      coverage-perf-preset:
+        description: C0 smoke or C1 proof
+        default: ''
+        type: string
 permissions:
   contents: read
 jobs:
@@ -66,6 +86,11 @@ jobs:
       support-cost: ${{ inputs.support-cost }}
       build-target: ${{ inputs.build-target }}
       artifact-env: ${{ inputs.artifact-env }}
+      coverage-perf-cpu: ${{ inputs.coverage-perf-cpu }}
+      coverage-perf-unit: ${{ inputs.coverage-perf-unit }}
+      coverage-perf-manifest-sha256: ${{ inputs.coverage-perf-manifest-sha256 }}
+      coverage-perf-workload-sha: ${{ inputs.coverage-perf-workload-sha }}
+      coverage-perf-preset: ${{ inputs.coverage-perf-preset }}
 ```
 
 A caller whose `nuget.config` restores from GitHub Packages also passes
@@ -143,3 +168,57 @@ timing or load run, stays with the caller.
 Quote the whole filter for the shell, without embedded quotes around a simple unit name. Embedded quotes
 can be stripped while dotnet forwards the filter to the test adapter, leaving an invalid condition and no
 selected tests. Check the retained TRX count before treating a run as evidence.
+
+### Coverage CPU measurement
+
+`coverage-perf-cpu` is an optional boolean, default false. With it false, the existing stress, support-cost
+and artifact routes keep their behavior and limits. All four new string inputs must then be empty. A
+nonempty value is refused before installation or building.
+
+With it true, the workflow accepts only this contract, validated before any install or build:
+
+| Input | Required value |
+| --- | --- |
+| `project` | `tools/EquipmentCoverage.Perf.Tests/EquipmentCoverage.Perf.Tests.csproj` |
+| `build-target` | Empty or that exact project path. Both build the Perf project directly, outside the solution. |
+| `configuration` | `Release` |
+| `load` | `0` |
+| `iterations` | `1` |
+| `support-cost` | `false` |
+| `filter` | Empty. The workflow supplies its fixed filter. |
+| `artifact-env` | `KE_COVERAGE_PERF_REPORTS`, subject to the existing reservation and already-set checks |
+| `coverage-perf-unit` | 1 to 64 lowercase ASCII letters, digits or hyphens, default empty |
+| `coverage-perf-manifest-sha256` | Exactly 64 lowercase hex characters, default empty |
+| `coverage-perf-workload-sha` | Exactly 40 lowercase hex characters, default empty |
+| `coverage-perf-preset` | Exactly `C0` for smoke or `C1` for proof, default empty |
+
+The fixed test filter is
+`FullyQualifiedName=EquipmentCoverage.Perf.Tests.CoveragePerfTests.Measure_authorized_unit&Category=CoveragePerformance`.
+The caller cannot replace or extend it. The workflow forwards the three identity inputs only as
+`KE_COVERAGE_PERF_UNIT`, `KE_COVERAGE_PERF_MANIFEST_SHA256` and `KE_COVERAGE_PERF_WORKLOAD_SHA`. The test
+process also gets `KE_GRAPHICS_BACKEND=vulkan-native`, `KE_VULKAN_REQUIRED=1`, `KE_GPU_TESTS=1` and
+`KE_COVERAGE_PERF_REPORTS` naming its retained `stress/artifacts/run-1` directory. There is no general
+environment-injection input.
+
+Setup installs `libvulkan1`, `mesa-vulkan-drivers` and `vulkan-tools`. It discovers the lavapipe ICD JSON
+from `dpkg -L mesa-vulkan-drivers`, fails if absent, and selects it with both `VK_DRIVER_FILES` and the
+older loader's `VK_ICD_FILENAMES`. The job summary and logs record that path, the package versions, runner
+image, fixed backend and `vulkaninfo --summary`. A diagnostic failure fails setup. This is explicitly a
+software Vulkan route for CPU preparation evidence. It supplies no hardware GPU performance proof.
+
+Both the job and run step have fixed limits of 20 minutes for C0 and 30 minutes for C1. These expressions
+use only the validated preset, with no caller-supplied timeout. The engine's cooperative unit deadline
+must leave time for setup, building and artifact uploads within the job cap. An `always()` upload cannot
+guarantee retention after the hard job limit.
+
+The engine atomically publishes `<unit>.json` with schema `khaozengine.coverage-perf-report/1` and writes
+`<unit>.md` in the reports directory. The workflow requires parseable, nonempty JSON with the matching
+top-level `schema` and `report.identity.unitId`, and a nonempty Markdown file. Missing or mismatched files
+fail the run as unfinalized. TRX must parse and contain exactly one executed, passed test, with no skipped
+or failed tests. A failed test process also fails the run. The existing `stress-artifacts` upload uses
+`always()` to retain JSON, Markdown, TRX, test logs and the Vulkan setup log on success or failure.
+
+Every invocation is a separately approved measurement. C0 approval does not authorize C1, and a rerun
+requires fresh approval even with identical source. The caller owns the exact approval reference,
+manifest bytes and workload binding. Adding these inputs or finishing the harness authorizes no run.
+Callers move their full-SHA workflow pin only after review and an approved one-iteration caller proof.
