@@ -19,6 +19,7 @@ FILTER = ("FullyQualifiedName=EquipmentCoverage.Perf.Tests.CoveragePerfTests."
 JOB_LIMIT = "${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 30) || 90 }}"
 RUN_LIMIT = ("${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 30) || "
              "(inputs.artifact-env != '' && 60 || 90) }}")
+FETCH_DEPTH = "${{ inputs.coverage-perf-cpu && 2 || 1 }}"
 
 
 class CoverageWorkflowTests(unittest.TestCase):
@@ -78,6 +79,9 @@ class CoverageWorkflowTests(unittest.TestCase):
             self.assertEqual(inputs["coverage-perf-" + key]["default"], "")
         self.assertEqual(self.job["timeout-minutes"], JOB_LIMIT)
         self.assertEqual(self.steps["Repeat the selection"]["timeout-minutes"], RUN_LIMIT)
+        checkouts = [step for step in self.job["steps"] if step.get("uses", "").startswith("actions/checkout@")]
+        self.assertEqual(len(checkouts), 1)
+        self.assertEqual(checkouts[0]["with"], {"fetch-depth": FETCH_DEPTH})
         names = [step.get("name") for step in self.job["steps"]]
         check = names.index("Check coverage performance inputs")
         self.assertLess(check, names.index("Setup .NET"))

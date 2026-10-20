@@ -102,7 +102,11 @@ jobs:
     env:
       GITHUB_PACKAGES_PAT: ${{ secrets.packages-token }}
     steps:
+      # Coverage mode checks out the authorization commit, whose single parent is the measured workload commit.
+      # Depth 2 makes that parent present so the engine can verify the one-manifest difference offline.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.coverage-perf-cpu && 2 || 1 }}
 
       # Keep the existing route's setup order. Coverage requests, including stray structured inputs when
       # the switch is off, are refused before any install or build. No caller filter reaches this mode.

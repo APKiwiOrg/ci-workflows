@@ -200,6 +200,11 @@ process also gets `KE_GRAPHICS_BACKEND=vulkan-native`, `KE_VULKAN_REQUIRED=1`, `
 `KE_COVERAGE_PERF_REPORTS` naming its retained `stress/artifacts/run-1` directory. There is no general
 environment-injection input.
 
+In coverage mode the checkout fetches two commits. The caller dispatches the authorization commit, which
+adds only the approved manifest on top of its single parent, the measured workload commit named by
+`coverage-perf-workload-sha`. The parent must be present for the engine to verify that difference without
+network access. Every other mode keeps the default depth of one.
+
 Setup installs `libvulkan1`, `mesa-vulkan-drivers` and `vulkan-tools`. It discovers the lavapipe ICD JSON
 from `dpkg -L mesa-vulkan-drivers`, fails if absent, and selects it with both `VK_DRIVER_FILES` and the
 older loader's `VK_ICD_FILENAMES`. The job summary and logs record that path, the package versions, runner
