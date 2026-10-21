@@ -216,7 +216,7 @@ older loader's `VK_ICD_FILENAMES`. The job summary and logs record that path, th
 image, fixed backend and `vulkaninfo --summary`. A diagnostic failure fails setup. This is explicitly a
 software Vulkan route for CPU preparation evidence. It supplies no hardware GPU performance proof.
 
-Both the job and run step have fixed limits of 20 minutes for C0 and 30 minutes for C1. These expressions
+Both the job and run step have fixed limits of 20 minutes for C0 and 120 minutes for C1. These expressions
 use only the validated preset, with no caller-supplied timeout. The engine's cooperative unit deadline
 must leave time for setup, building and artifact uploads within the job cap. An `always()` upload cannot
 guarantee retention after the hard job limit.

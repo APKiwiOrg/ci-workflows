@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 PROJECT = "tools/EquipmentCoverage.Perf.Tests/EquipmentCoverage.Perf.Tests.csproj"
 FILTER = ("FullyQualifiedName=EquipmentCoverage.Perf.Tests.CoveragePerfTests."
           "Measure_authorized_unit&Category=CoveragePerformance")
-JOB_LIMIT = "${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 30) || 90 }}"
-RUN_LIMIT = ("${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 30) || "
+JOB_LIMIT = "${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 120) || 90 }}"
+RUN_LIMIT = ("${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 120) || "
              "(inputs.artifact-env != '' && 60 || 90) }}")
 FETCH_DEPTH = "${{ inputs.coverage-perf-cpu && 2 || 1 }}"
 
