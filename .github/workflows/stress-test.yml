@@ -172,6 +172,21 @@ jobs:
             echo "::error::coverage-perf-workload-sha must be exactly 40 lowercase hex characters"; exit 1
           fi
           case "$COVERAGE_PERF_PRESET" in C0|C1) ;; *) echo "::error::coverage-perf-preset must be C0 or C1"; exit 1 ;; esac
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          path = Path("tools/EquipmentCoverage.Perf.Tests/authorized") / (os.environ["COVERAGE_PERF_UNIT"] + ".json")
+          try:
+              with path.open(encoding="utf-8") as source:
+                  manifest = json.load(source)
+          except (OSError, ValueError):
+              sys.exit("::error::coverage-perf-preset requires a readable selected manifest JSON")
+          if not isinstance(manifest, dict) or manifest.get("preset") != os.environ["COVERAGE_PERF_PRESET"]:
+              sys.exit("::error::coverage-perf-preset differs from the selected manifest preset")
+          PY
 
       - name: Setup .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
@@ -329,6 +344,7 @@ jobs:
           COVERAGE_PERF_UNIT: ${{ inputs.coverage-perf-unit }}
           COVERAGE_PERF_MANIFEST_SHA256: ${{ inputs.coverage-perf-manifest-sha256 }}
           COVERAGE_PERF_WORKLOAD_SHA: ${{ inputs.coverage-perf-workload-sha }}
+          COVERAGE_PERF_PRESET: ${{ inputs.coverage-perf-preset }}
         run: |
           results="$RUNNER_TEMP/stress"
           mkdir -p "$results"
@@ -359,6 +375,7 @@ jobs:
               set -- "$@" "KE_COVERAGE_PERF_UNIT=$COVERAGE_PERF_UNIT" \
                 "KE_COVERAGE_PERF_MANIFEST_SHA256=$COVERAGE_PERF_MANIFEST_SHA256" \
                 "KE_COVERAGE_PERF_WORKLOAD_SHA=$COVERAGE_PERF_WORKLOAD_SHA" \
+                "KE_COVERAGE_PERF_PRESET=$COVERAGE_PERF_PRESET" \
                 KE_GRAPHICS_BACKEND=vulkan-native KE_VULKAN_REQUIRED=1 KE_GPU_TESTS=1
             fi
             if [ "$SUPPORT_COST" = true ]; then

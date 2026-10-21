@@ -36,6 +36,8 @@ for step in job['steps']:
     need('${{' not in step.get('run', ''), 'no expression inside a run line: %s' % step.get('name'))
 check = steps['Check the inputs']
 repeat = steps['Repeat the selection']
+need(repeat['env'].get('COVERAGE_PERF_PRESET') == '${{ inputs.coverage-perf-preset }}',
+     'coverage timeout preset reaches the fixed test environment through env')
 for step in (check, repeat):
     need(step['env'].get('ARTIFACT_ENV') == '${{ inputs.artifact-env }}', 'ARTIFACT_ENV reaches %s through env' % step['name'])
 need(repeat.get('timeout-minutes') == "${{ inputs.coverage-perf-cpu && (inputs.coverage-perf-preset == 'C0' && 20 || 120) || (inputs.artifact-env != '' && 60 || 90) }}",
@@ -122,7 +124,7 @@ run_step() {
     STUB_WATCH=KE_COVERAGE_COST_REPORTS \
     PROJECT=Stub.csproj FILTER='FullyQualifiedName~Stub&Name!=x' ITERATIONS=1 LOAD=0 \
     CONFIGURATION=Release SUPPORT_COST=false ARTIFACT_ENV='' COVERAGE_PERF_CPU=false \
-    COVERAGE_PERF_UNIT='' COVERAGE_PERF_MANIFEST_SHA256='' COVERAGE_PERF_WORKLOAD_SHA='' "$@" \
+    COVERAGE_PERF_UNIT='' COVERAGE_PERF_MANIFEST_SHA256='' COVERAGE_PERF_WORKLOAD_SHA='' COVERAGE_PERF_PRESET='' "$@" \
     bash -e "$work/$script") > "$work/case/out" 2>&1 || actual=$?
   [ "$actual" -eq "$expected" ] || fail "$script $* exited $actual, expected $expected"
   pass=$((pass + 1))

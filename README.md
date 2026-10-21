@@ -195,11 +195,16 @@ With it true, the workflow accepts only this contract, validated before any inst
 | `coverage-perf-workload-sha` | Exactly 40 lowercase hex characters, default empty |
 | `coverage-perf-preset` | Exactly `C0` for smoke or `C1` for proof, default empty |
 
+After checkout and before installation, preflight reads the selected
+`tools/EquipmentCoverage.Perf.Tests/authorized/<unit>.json` with Python's JSON parser and refuses unless
+its `preset` matches `coverage-perf-preset`. Both timeout limits therefore bind to the approved manifest.
+
 The fixed test filter is
 `FullyQualifiedName=EquipmentCoverage.Perf.Tests.CoveragePerfTests.Measure_authorized_unit&Category=CoveragePerformance`.
 The caller cannot replace or extend it. The workflow forwards the three identity inputs only as
-`KE_COVERAGE_PERF_UNIT`, `KE_COVERAGE_PERF_MANIFEST_SHA256` and `KE_COVERAGE_PERF_WORKLOAD_SHA`. The test
-process also gets `KE_GRAPHICS_BACKEND=vulkan-native`, `KE_VULKAN_REQUIRED=1`, `KE_GPU_TESTS=1` and
+`KE_COVERAGE_PERF_UNIT`, `KE_COVERAGE_PERF_MANIFEST_SHA256` and `KE_COVERAGE_PERF_WORKLOAD_SHA`.
+It also forwards the validated timeout preset as `KE_COVERAGE_PERF_PRESET` for the entrypoint's own comparison.
+The test process also gets `KE_GRAPHICS_BACKEND=vulkan-native`, `KE_VULKAN_REQUIRED=1`, `KE_GPU_TESTS=1` and
 `KE_COVERAGE_PERF_REPORTS` naming its retained `stress/artifacts/run-1` directory. There is no general
 environment-injection input.
 

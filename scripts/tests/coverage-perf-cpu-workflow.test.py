@@ -50,6 +50,9 @@ class CoverageWorkflowTests(unittest.TestCase):
             "COVERAGE_PERF_WORKLOAD_SHA": "b" * 40, "COVERAGE_PERF_PRESET": "C0",
             "ImageOS": "ubuntu26", "ImageVersion": "20261021.1",
         }
+        self.manifest = self.work / "tools/EquipmentCoverage.Perf.Tests/authorized/coverage-c0.json"
+        self.manifest.parent.mkdir()
+        self.manifest.write_text(json.dumps({"preset": "C0"}))
 
     def stub(self, name, body):
         path = self.bin / name
@@ -92,6 +95,8 @@ class CoverageWorkflowTests(unittest.TestCase):
         self.assertEqual(self.steps["Check stress filter"]["env"], {"FILTER": "${{ inputs.filter }}"})
         self.assertLess(check, names.index("Setup .NET"))
         self.assertLess(check, names.index("Install coverage software Vulkan"))
+        self.assertGreater(check, next(i for i, step in enumerate(self.job["steps"])
+                                       if step.get("uses", "").startswith("actions/checkout@")))
         gate = self.steps["Check coverage performance inputs"]
         self.assertEqual(gate["if"], "inputs.coverage-perf-cpu || inputs.coverage-perf-unit != '' || "
                          "inputs.coverage-perf-manifest-sha256 != '' || inputs.coverage-perf-workload-sha != '' || "
@@ -99,9 +104,8 @@ class CoverageWorkflowTests(unittest.TestCase):
         for key in ("cpu", "unit", "manifest-sha256", "workload-sha", "preset"):
             variable = "COVERAGE_PERF_" + key.upper().replace("-", "_")
             self.assertEqual(gate["env"][variable], "${{ inputs.coverage-perf-" + key + " }}")
-            if key != "preset":
-                self.assertEqual(self.steps["Repeat the selection"]["env"][variable],
-                                 "${{ inputs.coverage-perf-" + key + " }}")
+            self.assertEqual(self.steps["Repeat the selection"]["env"].get(variable),
+                             "${{ inputs.coverage-perf-" + key + " }}")
         for step in self.job["steps"]:
             self.assertNotIn("${{", step.get("run", ""))
         self.assertEqual(self.steps["Install coverage software Vulkan"]["if"], "inputs.coverage-perf-cpu")
@@ -118,8 +122,30 @@ class CoverageWorkflowTests(unittest.TestCase):
         for overrides in ({}, {"BUILD_TARGET": PROJECT, "COVERAGE_PERF_PRESET": "C1"},
                           {"COVERAGE_PERF_UNIT": "a"}, {"COVERAGE_PERF_UNIT": "a" * 64}):
             with self.subTest(overrides=overrides):
+                manifest = self.manifest.with_name(overrides.get("COVERAGE_PERF_UNIT", "coverage-c0") + ".json")
+                manifest.write_text(json.dumps({"preset": overrides.get("COVERAGE_PERF_PRESET", "C0")}))
                 result = self.run_step("Check coverage performance inputs", **overrides)
                 self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_manifest_preset_binds_both_timeout_directions_and_matching_cases(self):
+        for approved, selected in (("C0", "C1"), ("C1", "C0"), ("C0", "C0"), ("C1", "C1")):
+            with self.subTest(approved=approved, selected=selected):
+                self.manifest.write_text(json.dumps({"preset": approved}))
+                result = self.run_step("Check coverage performance inputs", COVERAGE_PERF_PRESET=selected)
+                self.assertEqual(result.returncode, 0 if approved == selected else 1, result.stdout)
+                if approved != selected:
+                    self.assertIn("::error::coverage-perf-preset", result.stdout)
+
+    def test_missing_malformed_or_unresolved_manifest_refuses_preflight(self):
+        for document in (None, "{", "[]", "null", '{}', '{"preset": true}', '{"preset": "G1"}'):
+            with self.subTest(document=document):
+                if document is None:
+                    self.manifest.unlink()
+                else:
+                    self.manifest.write_text(document)
+                result = self.run_step("Check coverage performance inputs")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("::error::coverage-perf-preset", result.stdout)
 
     def test_each_invalid_input_is_refused_with_its_name(self):
         cases = [("PROJECT", "other.csproj", "project"), ("BUILD_TARGET", "Engine.slnx", "build-target"),
@@ -241,7 +267,8 @@ args = sys.argv[1:]
 assert args[:5] == ['test', e['PROJECT'], '-c', 'Release', '--no-build']
 assert args[args.index('--filter') + 1] == %r
 for key, value in {'KE_COVERAGE_PERF_UNIT': 'coverage-c0', 'KE_COVERAGE_PERF_MANIFEST_SHA256': 'a' * 64,
-                   'KE_COVERAGE_PERF_WORKLOAD_SHA': 'b' * 40, 'KE_GRAPHICS_BACKEND': 'vulkan-native',
+                   'KE_COVERAGE_PERF_WORKLOAD_SHA': 'b' * 40, 'KE_COVERAGE_PERF_PRESET': e['COVERAGE_PERF_PRESET'],
+                   'KE_GRAPHICS_BACKEND': 'vulkan-native',
                    'KE_VULKAN_REQUIRED': '1', 'KE_GPU_TESTS': '1'}.items():
     assert e[key] == value, (key, e.get(key))
 assert e['VK_DRIVER_FILES'] == e['VK_ICD_FILENAMES'] == '/fixture/lvp_icd.json'
@@ -262,19 +289,20 @@ if mode != 'missing-trx': (pathlib.Path(e['RUNNER_TEMP']) / 'stress/run-1.trx').
 print('fixture test output')
 sys.exit(3 if mode == 'exit' else 0)
 """ % FILTER)
-        for mode in ("valid", "zero", "multiple", "skipped", "failed", "missing-trx", "malformed-trx",
+        for mode in ("valid", "valid-c1", "zero", "multiple", "skipped", "failed", "missing-trx", "malformed-trx",
                      "missing-json", "empty-json", "malformed-json", "schema", "unit", "missing-md", "empty-md", "exit"):
             with self.subTest(mode=mode):
                 # Each fixture gets an empty retained tree so missing files cannot inherit a prior pass.
                 self.env["RUNNER_TEMP"] = str(self.work / mode)
                 result = self.run_step("Repeat the selection", STUB_EVIDENCE=mode,
+                                       COVERAGE_PERF_PRESET="C1" if mode == "valid-c1" else "C0",
                                        VK_DRIVER_FILES="/fixture/lvp_icd.json", VK_ICD_FILENAMES="/fixture/lvp_icd.json")
-                self.assertEqual(result.returncode, 0 if mode == "valid" else 1, result.stdout)
+                self.assertEqual(result.returncode, 0 if mode in ("valid", "valid-c1") else 1, result.stdout)
                 stress = Path(self.env["RUNNER_TEMP"]) / "stress"
                 log = (stress / "run-1.log").read_text()
                 self.assertIn("fixture test output", log)
                 self.assertIn("dotnet test exit " + ("3" if mode == "exit" else "0"), log)
-                if mode != "valid":
+                if mode not in ("valid", "valid-c1"):
                     self.assertIn("::error::", result.stdout)
                 if mode not in ("missing-json", "empty-json", "malformed-json"):
                     self.assertTrue((stress / "artifacts/run-1/coverage-c0.json").is_file())
