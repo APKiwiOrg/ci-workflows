@@ -173,7 +173,10 @@ selected tests. Check the retained TRX count before treating a run as evidence.
 
 `coverage-perf-cpu` is an optional boolean, default false. With it false, the existing stress, support-cost
 and artifact routes keep their behavior and limits. All four new string inputs must then be empty. A
-nonempty value is refused before installation or building.
+nonempty value is refused before installation or building. `filter` is optional so that coverage mode can
+leave it empty. Every other route refuses an empty filter before installation, because it would repeat the
+whole test project. A caller that offers coverage mode must declare its own `filter` input as optional too,
+since GitHub refuses an empty value for a required dispatch input.
 
 With it true, the workflow accepts only this contract, validated before any install or build:
 

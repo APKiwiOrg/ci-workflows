@@ -22,8 +22,9 @@ on:
         required: true
         type: string
       filter:
-        description: dotnet test --filter expression selecting the tests to repeat
-        required: true
+        description: dotnet test --filter expression selecting the tests to repeat, empty only in coverage mode
+        required: false
+        default: ''
         type: string
       iterations:
         description: How many times to run the selection, 1 to 200
@@ -107,6 +108,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: ${{ inputs.coverage-perf-cpu && 2 || 1 }}
+
+      # The filter is optional only so coverage mode can leave it empty. Every other route still needs one,
+      # because an empty filter would repeat the whole test project.
+      - name: Check stress filter
+        if: ${{ !inputs.coverage-perf-cpu }}
+        env:
+          FILTER: ${{ inputs.filter }}
+        run: |
+          if [ -z "$FILTER" ]; then
+            echo "::error::filter is required unless coverage-perf-cpu is true"; exit 1
+          fi
 
       # Keep the existing route's setup order. Coverage requests, including stray structured inputs when
       # the switch is off, are refused before any install or build. No caller filter reaches this mode.

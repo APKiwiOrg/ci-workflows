@@ -77,6 +77,8 @@ class CoverageWorkflowTests(unittest.TestCase):
         for key in ("unit", "manifest-sha256", "workload-sha", "preset"):
             self.assertEqual(inputs["coverage-perf-" + key]["type"], "string")
             self.assertEqual(inputs["coverage-perf-" + key]["default"], "")
+        self.assertIs(inputs["filter"]["required"], False)
+        self.assertEqual(inputs["filter"]["default"], "")
         self.assertEqual(self.job["timeout-minutes"], JOB_LIMIT)
         self.assertEqual(self.steps["Repeat the selection"]["timeout-minutes"], RUN_LIMIT)
         checkouts = [step for step in self.job["steps"] if step.get("uses", "").startswith("actions/checkout@")]
@@ -84,6 +86,10 @@ class CoverageWorkflowTests(unittest.TestCase):
         self.assertEqual(checkouts[0]["with"], {"fetch-depth": FETCH_DEPTH})
         names = [step.get("name") for step in self.job["steps"]]
         check = names.index("Check coverage performance inputs")
+        stress_filter = names.index("Check stress filter")
+        self.assertLess(stress_filter, names.index("Setup .NET"))
+        self.assertEqual(self.steps["Check stress filter"]["if"], "${{ !inputs.coverage-perf-cpu }}")
+        self.assertEqual(self.steps["Check stress filter"]["env"], {"FILTER": "${{ inputs.filter }}"})
         self.assertLess(check, names.index("Setup .NET"))
         self.assertLess(check, names.index("Install coverage software Vulkan"))
         gate = self.steps["Check coverage performance inputs"]
@@ -100,6 +106,13 @@ class CoverageWorkflowTests(unittest.TestCase):
             self.assertNotIn("${{", step.get("run", ""))
         self.assertEqual(self.steps["Install coverage software Vulkan"]["if"], "inputs.coverage-perf-cpu")
         self.assertEqual(self.steps["Upload the stress artifacts"]["if"], "always() && inputs.artifact-env != ''")
+
+    def test_non_coverage_routes_still_require_a_filter(self):
+        empty = self.run_step("Check stress filter", FILTER="")
+        self.assertEqual(empty.returncode, 1, empty.stdout)
+        self.assertIn("filter is required unless coverage-perf-cpu is true", empty.stdout)
+        given = self.run_step("Check stress filter", FILTER="FullyQualifiedName~Stub")
+        self.assertEqual(given.returncode, 0, given.stdout)
 
     def test_valid_inputs_and_unit_boundaries(self):
         for overrides in ({}, {"BUILD_TARGET": PROJECT, "COVERAGE_PERF_PRESET": "C1"},
