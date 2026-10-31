@@ -48,10 +48,12 @@ on:
         required: false
         default: ''
         type: string
+    # Named like the production environment secret, which wins over the passed value in the deploy job
+    # because that job declares the environment. Not required, the deploy job refuses an empty token itself.
     secrets:
-      deploy-token:
+      AZURE_STATIC_WEB_APPS_API_TOKEN:
         description: Static Web Apps deployment token, read only by the deploy job
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -176,6 +178,17 @@ jobs:
     permissions:
       contents: read
     steps:
+      # A token neither the environment nor the caller supplies resolves empty without an error.
+      - name: Require the deploy token
+        env:
+          DEPLOY_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${DEPLOY_TOKEN:-}" ]; then
+            echo "AZURE_STATIC_WEB_APPS_API_TOKEN is empty. Set it in the production environment or pass it from the caller. Deployment refused." >&2
+            exit 1
+          fi
+
       # The checkout supplies the api folder and the smoke script. Nothing is installed in this job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -199,7 +212,7 @@ jobs:
         id: deploy
         uses: Azure/static-web-apps-deploy@1a947af9992250f3bc2e68ad0754c0b0c11566c9 # v1
         with:
-          azure_static_web_apps_api_token: ${{ secrets.deploy-token }}
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
           action: upload
           app_location: ${{ inputs.app-location }}
           api_location: ${{ inputs.api-location }}

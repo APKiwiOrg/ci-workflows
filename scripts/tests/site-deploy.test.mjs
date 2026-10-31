@@ -208,7 +208,7 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     assert.ok(deploy.includes('app_location: ${{ inputs.app-location }}'))
     assert.ok(deploy.includes('api_location: ${{ inputs.api-location }}'))
     assert.ok(deploy.includes('skip_app_build: true'))
-    assert.ok(deploy.includes('azure_static_web_apps_api_token: ${{ secrets.deploy-token }}'))
+    assert.ok(deploy.includes('azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}'))
     assert.ok(deploy.includes('SITE_URL: ${{ steps.deploy.outputs.static_web_app_url }}'))
     assert.ok(deploy.includes('node scripts/smoke-site.mjs "$SITE_URL"'))
     assert.ok(deploy.indexOf('Azure/static-web-apps-deploy@') < deploy.indexOf('node scripts/smoke-site.mjs'))
@@ -360,7 +360,8 @@ describe('the build never sees the deploy token', () => {
 
   test('the deploy job is the only one that reads a secret', () => {
     for (const id of ['guard', 'build']) assert.doesNotMatch(job(id), /secrets\./u)
-    assert.equal(workflow().match(/secrets\./gu)?.length, 1)
+    assert.equal(workflow().match(/secrets\./gu)?.length, 2)
+    assert.equal(job('deploy').match(/secrets\./gu)?.length, 2)
   })
 
   test('only the job that reads the token runs in the production environment', () => {
@@ -376,14 +377,37 @@ describe('the build never sees the deploy token', () => {
     assert.deepEqual(withProduction, ['deploy'])
   })
 
-  test('only the deploy job references the deploy-token secret', () => {
-    assert.match(workflow(), /\n {4}secrets:\n {6}deploy-token:\n(?: {8}.+\n)* {8}required: true\n/u)
-    assert.match(caller(), /\n {4}secrets:\n {6}deploy-token: \$\{\{ secrets\.AZURE_STATIC_WEB_APPS_API_TOKEN \}\}\n/u)
-    for (const id of ['guard', 'build']) assert.doesNotMatch(job(id), /deploy-token/u)
-    const uses = workflow().match(/secrets\.deploy-token/gu)
-    assert.equal(uses?.length, 1)
-    assert.ok(job('deploy').includes('${{ secrets.deploy-token }}'))
-    // The token reaches the deploy action input, never a step env or a script.
-    assert.doesNotMatch(job('deploy'), /^ +[A-Z_]+: \$\{\{ secrets\./mu)
+  test('only the deploy job references the AZURE_STATIC_WEB_APPS_API_TOKEN secret', () => {
+    // The name matches the production environment secret, which wins over the passed value in a job that
+    // declares the environment. Empty is caught by the deploy job's first step, not by required.
+    assert.match(workflow(), /\n {4}secrets:\n {6}AZURE_STATIC_WEB_APPS_API_TOKEN:\n(?: {8}.+\n)* {8}required: false\n/u)
+    assert.match(caller(), /\n {4}secrets:\n {6}AZURE_STATIC_WEB_APPS_API_TOKEN: \$\{\{ secrets\.AZURE_STATIC_WEB_APPS_API_TOKEN \}\}\n/u)
+    assert.doesNotMatch(workflow(), /deploy-token/u)
+    for (const id of ['guard', 'build']) assert.doesNotMatch(job(id), /AZURE_STATIC_WEB_APPS_API_TOKEN/u)
+    const deploy = job('deploy')
+    assert.equal(workflow().match(/secrets\.AZURE_STATIC_WEB_APPS_API_TOKEN/gu)?.length, 2)
+    assert.equal(deploy.match(/secrets\.AZURE_STATIC_WEB_APPS_API_TOKEN/gu)?.length, 2)
+    assert.ok(deploy.includes('azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}'))
+    // Besides the action input, the token reaches only the empty check, through env.
+    assert.deepEqual(deploy.match(/^ +[A-Z_]+: \$\{\{ secrets\.[A-Z_]+ \}\}$/gmu)?.map((line) => line.trim()), [
+      'DEPLOY_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}',
+    ])
+  })
+
+  test('the deploy job first refuses an empty token without printing it', () => {
+    const deploy = job('deploy')
+    const steps = deploy.match(/^ {6}- .+$/gmu)
+    assert.equal(steps?.[0].trim(), '- name: Require the deploy token')
+    assert.ok(deploy.indexOf('- name: Require the deploy token') < deploy.indexOf('Azure/static-web-apps-deploy@'))
+    const missing = runStep('deploy', 'Require the deploy token', { DEPLOY_TOKEN: '' })
+    assert.notEqual(missing.status, 0)
+    assert.ok(missing.stderr.includes('AZURE_STATIC_WEB_APPS_API_TOKEN is empty.'))
+    const unset = runStep('deploy', 'Require the deploy token')
+    assert.notEqual(unset.status, 0)
+    assert.ok(unset.stderr.includes('AZURE_STATIC_WEB_APPS_API_TOKEN is empty.'))
+    const token = 'token-value-that-must-not-print'
+    const present = runStep('deploy', 'Require the deploy token', { DEPLOY_TOKEN: token })
+    assert.equal(present.status, 0, present.stderr)
+    assert.ok(!`${present.stdout}${present.stderr}`.includes(token))
   })
 })

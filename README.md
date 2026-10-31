@@ -173,7 +173,7 @@ jobs:
       dispatch-sha: ${{ inputs.sha }}
       analytics-token: ${{ vars.CLOUDFLARE_ANALYTICS_TOKEN }}
     secrets:
-      deploy-token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+      AZURE_STATIC_WEB_APPS_API_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
 ```
 
 The caller owns the triggers and the `deploy-main` concurrency group. A called workflow that repeats its
@@ -181,8 +181,9 @@ caller's concurrency group deadlocks, so `site-deploy` sets none. The caller gra
 called job can only narrow the caller's token, and the org default token has no actions read. YAML flow
 mappings cannot hold a `${{ }}` expression, so `with` and `secrets` stay in block style.
 
-The caller's own job has no environment, so the secret it passes resolves from repository or org secrets,
-never from a `production` environment secret.
+Once the token lives in the caller's `production` environment, that environment secret wins over the passed
+value because the deploy job declares the environment, so the caller line can stay. The deploy job's first
+step refuses a token that resolves empty.
 
 Redeploy or roll back to a green main SHA from main:
 
