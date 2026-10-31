@@ -144,6 +144,47 @@ Quote the whole filter for the shell, without embedded quotes around a simple un
 can be stripped while dotnet forwards the filter to the test adapter, leaving an invalid condition and no
 selected tests. Check the retained TRX count before treating a run as evidence.
 
+## site-ci
+
+Runs a site's CI. `checks` lints, typechecks, tests and builds, then holds the build to the asset budget.
+`repo` runs the repository convention checks and the shell script tests. `secrets` scans every commit with a
+checksum-verified gitleaks. `infra` compiles the Bicep template and parameters and checks the infrastructure
+policy. `e2e` builds and runs the browser smoke after `checks` passes. Every checkout drops its credentials.
+
+A site adds this caller as `.github/workflows/ci.yml`, pinned to a commit of this repository. `site-deploy`
+accepts only successful main-push runs of a workflow in that file named `CI`:
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  ci:
+    uses: APKiwiOrg/ci-workflows/.github/workflows/site-ci.yml@<full commit sha>
+```
+
+GitHub names a called job `<caller job> / <job name>`, for example `ci / Lint, typecheck, test and build`, so
+a ruleset that requires checks by their old names needs updating when a site moves to this caller.
+
+Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `has-api` (true), `has-e2e` (true),
+`has-infra` (true), `analytics-test-token` (`00000000000000000000000000000000`), `bicep-file`
+(`infra/main.bicep`) and `bicep-params` (`infra/params/site.bicepparam`). `has-api: false` skips the api
+install, typecheck and test steps. `has-e2e: false` and `has-infra: false` skip those jobs. Every build and
+test sees the analytics test token as `VITE_CLOUDFLARE_ANALYTICS_TOKEN`, so the registered site token never
+reaches CI.
+
+The calling repository supplies `scripts/check-npm-policy.mjs`, `scripts/check-assets.mjs`, which checks
+`build/client`, the npm scripts `lint`, `typecheck`, `test`, `check:theme`, `build` and `test:e2e`, and the
+convention checks `scripts/check-dashes.sh`, `scripts/check-prose.sh`, `scripts/check-scratch.sh` and
+`scripts/check-agent-instructions.sh`, each run with `--tree`. `repo` runs every `scripts/tests/*.test.sh`
+and fails when there is none. With `has-api` the `api` folder is an npm package with `typecheck` and `test`
+scripts. With `has-infra` the repository supplies `scripts/check-infra.mjs`, which receives the compiled
+template.
+
 ## site-deploy
 
 Deploys a site to Azure Static Web Apps, uploading only a SHA that a successful main-push CI run verified. An

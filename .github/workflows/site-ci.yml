@@ -1,0 +1,217 @@
+name: site-ci
+
+# THE shared CI for every site. A site calls it from a small caller of its own (see README.md) named CI in
+# .github/workflows/ci.yml, whose successful main-push runs are what site-deploy.yml accepts.
+#
+# checks, repo and secrets always run. The api steps run only while has-api is true, the infra job only while
+# has-infra is true and the e2e job only while has-e2e is true.
+#
+# Inputs reach scripts only through env, never by expression interpolation into a run line.
+
+on:
+  workflow_call:
+    inputs:
+      node-version-file:
+        description: File naming the Node version every job installs
+        required: false
+        default: .nvmrc
+        type: string
+      has-api:
+        description: Install, typecheck and test the api package
+        required: false
+        default: true
+        type: boolean
+      has-e2e:
+        description: Run the end-to-end smoke after the checks pass
+        required: false
+        default: true
+        type: boolean
+      has-infra:
+        description: Compile the Bicep template and parameters and check the infrastructure policy
+        required: false
+        default: true
+        type: boolean
+      analytics-test-token:
+        description: Fixture Cloudflare Web Analytics token every build and test sees
+        required: false
+        default: '00000000000000000000000000000000'
+        type: string
+      bicep-file:
+        description: Bicep template the infra job compiles
+        required: false
+        default: infra/main.bicep
+        type: string
+      bicep-params:
+        description: Bicep parameters file the infra job compiles
+        required: false
+        default: infra/params/site.bicepparam
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # Browser fixtures intercept telemetry locally. Never use the registered site token in CI.
+  VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-test-token }}
+
+jobs:
+  checks:
+    name: Lint, typecheck, test and build
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: npm install policy
+        run: node scripts/check-npm-policy.mjs
+
+      - name: Install
+        run: npm ci
+
+      # Before lint, because the api files are linted with their own types.
+      - name: Install api
+        if: inputs.has-api
+        run: npm ci --prefix api
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Typecheck api
+        if: inputs.has-api
+        run: npm run typecheck --prefix api
+
+      - name: Test
+        run: npm test
+
+      - name: Test api
+        if: inputs.has-api
+        run: npm test --prefix api
+
+      - name: Theme conventions
+        run: npm run check:theme
+
+      - name: Build
+        run: npm run build
+
+      - name: Asset budget
+        run: node scripts/check-assets.mjs build/client
+
+  repo:
+    name: Repository conventions
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+
+      - name: Dashes
+        run: sh scripts/check-dashes.sh --tree
+
+      - name: Prose
+        run: sh scripts/check-prose.sh --tree
+
+      - name: Scratch docs
+        run: sh scripts/check-scratch.sh --tree
+
+      - name: Agent instruction budget
+        run: sh scripts/check-agent-instructions.sh --tree
+
+      - name: Script tests
+        run: |
+          set -eu
+          for test in scripts/tests/*.test.sh; do
+            sh "$test"
+          done
+
+  e2e:
+    name: End-to-end smoke
+    needs: checks
+    if: inputs.has-e2e
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: npm install policy
+        run: node scripts/check-npm-policy.mjs
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end tests
+        run: npm run test:e2e
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-26.04
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # From the release's gitleaks_8.30.1_checksums.txt. Update both together.
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Secret scan (gitleaks, every commit)
+        run: |
+          curl -sSfL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks git --redact --no-banner --verbose .
+          rm gitleaks gitleaks.tar.gz
+
+  infra:
+    name: Compile Bicep
+    if: inputs.has-infra
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+
+      - name: Build template
+        env:
+          BICEP_FILE: ${{ inputs.bicep-file }}
+        run: |
+          mkdir -p /tmp/web-website
+          chmod 0700 /tmp/web-website
+          az bicep build --file "$BICEP_FILE" --outfile /tmp/web-website/main.json
+
+      - name: Build parameters
+        env:
+          BICEP_PARAMS: ${{ inputs.bicep-params }}
+        run: az bicep build-params --file "$BICEP_PARAMS" --stdout >/dev/null
+
+      - name: Infrastructure policy
+        run: node scripts/check-infra.mjs /tmp/web-website/main.json

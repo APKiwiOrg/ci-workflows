@@ -20,6 +20,8 @@ README says how to call each one. This file holds the rules for changing them.
   template-managed) and KhaozEngine directly.
 - `site-deploy.yml` callers are APKiwiOrg/web, ThriveNZ/web, ShieldPhrase/web and every client site made from
   APKiwiOrg/site-template.
+- `site-ci.yml` callers are APKiwiOrg/web, ThriveNZ/web, ShieldPhrase/web and every client site made from
+  APKiwiOrg/site-template.
 
 ## Work and finish
 
