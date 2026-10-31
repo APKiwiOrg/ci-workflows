@@ -16,16 +16,19 @@ README says how to call each one. This file holds the rules for changing them.
   naming what runs, where, how many iterations and roughly how long. Never run one on the dev Mac.
 - Callers pin this repository by commit SHA. A change here reaches a caller only when that caller moves its
   pin, so a breaking change to inputs names the callers to update in the same piece of work.
-- The callers are the game repositories through game-template (`.github/workflows/stress-test.yml` there is
+- `stress-test.yml` callers are the game repositories through game-template (the caller there is
   template-managed) and KhaozEngine directly.
+- `site-deploy.yml` callers are APKiwiOrg/web, ThriveNZ/web, ShieldPhrase/web and every client site made from
+  APKiwiOrg/site-template.
 
 ## Work and finish
 
 - Work in a git worktree on a `feature/*` or `fix/*` branch. Merge the verified branch to `main` and push.
 - Commit subjects use `area(scope): summary`. No em dashes, en dashes or prose semicolons in shipped text.
-- Verify with `sh scripts/check-workflows.sh`, `sh scripts/check-agent-instructions.sh` and a YAML parse of
-  every workflow. A behaviour change to a reusable workflow is proven by one caller run with a small input,
-  for example one iteration and no load, before callers move their pins.
+- Verify with `sh scripts/check-workflows.sh`, `sh scripts/check-agent-instructions.sh`, a YAML parse of
+  every workflow and `node --test scripts/tests/`, as CI does. A behaviour change to a reusable workflow is
+  proven by one caller run with a small input, for example one iteration and no load, before callers move
+  their pins.
 
 ## Discovered work
 
