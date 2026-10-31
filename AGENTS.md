@@ -1,7 +1,8 @@
 # ci-workflows contributor instructions
 
-This public repository holds the reusable GitHub Actions workflows every APKiwiOrg repository calls. The
-README says how to call each one. This file holds the rules for changing them.
+This public repository holds reusable GitHub Actions workflows. APKiwiOrg repositories call the stress
+workflow. The site workflows have callers in three organisations, APKiwiOrg, ThriveNZ and ShieldPhrase,
+listed below. The README says how to call each one. This file holds the rules for changing them.
 
 ## Rules
 
@@ -30,9 +31,9 @@ README says how to call each one. This file holds the rules for changing them.
 - Work in a git worktree on a `feature/*` or `fix/*` branch. Merge the verified branch to `main` and push.
 - Commit subjects use `area(scope): summary`. No em dashes, en dashes or prose semicolons in shipped text.
 - Verify with `sh scripts/check-workflows.sh`, `sh scripts/check-agent-instructions.sh`, a YAML parse of
-  every workflow and `node --test scripts/tests/`, as CI does. A behaviour change to a reusable workflow is
-  proven by one caller run with a small input, for example one iteration and no load, before callers move
-  their pins.
+  every workflow and `node --test 'scripts/tests/*.test.mjs'`, as CI does. A behaviour change to a reusable
+  workflow is proven by one caller run with a small input, for example one iteration and no load, before
+  callers move their pins.
 
 ## Discovered work
 

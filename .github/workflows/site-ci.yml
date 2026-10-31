@@ -1,6 +1,6 @@
 name: site-ci
 
-# THE shared CI for every site. A site calls it from a small caller of its own (see README.md) named CI in
+# The shared CI for every site. A site calls it from a small caller of its own (see README.md) named CI in
 # .github/workflows/ci.yml, whose successful main-push runs are what site-deploy.yml accepts.
 #
 # checks, repo and secrets always run. The api steps run only while has-api is true, the infra job only while
@@ -35,6 +35,11 @@ on:
         description: Fixture Cloudflare Web Analytics token every build and test sees
         required: false
         default: '00000000000000000000000000000000'
+        type: string
+      app-location:
+        description: Built static site folder the asset budget checks
+        required: false
+        default: build/client
         type: string
       bicep-file:
         description: Bicep template the infra job compiles
@@ -103,7 +108,9 @@ jobs:
         run: npm run build
 
       - name: Asset budget
-        run: node scripts/check-assets.mjs build/client
+        env:
+          APP_LOCATION: ${{ inputs.app-location }}
+        run: node scripts/check-assets.mjs "$APP_LOCATION"
 
   repo:
     name: Repository conventions
@@ -204,9 +211,9 @@ jobs:
         env:
           BICEP_FILE: ${{ inputs.bicep-file }}
         run: |
-          mkdir -p /tmp/web-website
-          chmod 0700 /tmp/web-website
-          az bicep build --file "$BICEP_FILE" --outfile /tmp/web-website/main.json
+          mkdir -p /tmp/site-infra
+          chmod 0700 /tmp/site-infra
+          az bicep build --file "$BICEP_FILE" --outfile /tmp/site-infra/main.json
 
       - name: Build parameters
         env:
@@ -214,4 +221,4 @@ jobs:
         run: az bicep build-params --file "$BICEP_PARAMS" --stdout >/dev/null
 
       - name: Infrastructure policy
-        run: node scripts/check-infra.mjs /tmp/web-website/main.json
+        run: node scripts/check-infra.mjs /tmp/site-infra/main.json

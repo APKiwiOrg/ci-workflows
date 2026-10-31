@@ -335,6 +335,15 @@ describe('the build never sees the deploy token', () => {
     assert.equal(failedInstall.log, 'npm ci token=public-token\n')
   })
 
+  for (const command of ['false; npm run after', 'false | cat; npm run after', 'echo "$UNSET_NAME"; npm run after']) {
+    test(`a build command that fails part way fails the step: ${command}`, () => {
+      const env = { BUILD_COMMAND: command, VITE_CLOUDFLARE_ANALYTICS_TOKEN: 'public-token' }
+      const result = runStep('build', 'Build site', env)
+      assert.notEqual(result.status, 0)
+      assert.equal(result.log, 'npm ci token=public-token\n')
+    })
+  }
+
   test('the inputs default to the APKiwi web layout', () => {
     const source = workflow()
     const defaults = {
@@ -384,9 +393,8 @@ describe('the build never sees the deploy token', () => {
     assert.match(caller(), /\n {4}secrets:\n {6}AZURE_STATIC_WEB_APPS_API_TOKEN: \$\{\{ secrets\.AZURE_STATIC_WEB_APPS_API_TOKEN \}\}\n/u)
     assert.doesNotMatch(workflow(), /deploy-token/u)
     for (const id of ['guard', 'build']) assert.doesNotMatch(job(id), /AZURE_STATIC_WEB_APPS_API_TOKEN/u)
+    // The only-reader test above counts both secret references. These assertions name them.
     const deploy = job('deploy')
-    assert.equal(workflow().match(/secrets\.AZURE_STATIC_WEB_APPS_API_TOKEN/gu)?.length, 2)
-    assert.equal(deploy.match(/secrets\.AZURE_STATIC_WEB_APPS_API_TOKEN/gu)?.length, 2)
     assert.ok(deploy.includes('azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}'))
     // Besides the action input, the token reaches only the empty check, through env.
     assert.deepEqual(deploy.match(/^ +[A-Z_]+: \$\{\{ secrets\.[A-Z_]+ \}\}$/gmu)?.map((line) => line.trim()), [

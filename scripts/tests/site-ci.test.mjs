@@ -86,9 +86,24 @@ describe('inputs switch the optional work', () => {
     assert.match(params, /az bicep build-params --file "\$BICEP_PARAMS"/u)
   })
 
+  test('the asset budget checks the app-location folder through env', () => {
+    const budget = step('checks', 'Asset budget')
+    assert.match(budget, /^ {10}APP_LOCATION: \$\{\{ inputs\.app-location \}\}$/mu)
+    assert.match(budget, /run: node scripts\/check-assets\.mjs "\$APP_LOCATION"$/mu)
+    assert.doesNotMatch(workflow(), /check-assets\.mjs build\/client/u)
+  })
+
+  test('the infra job compiles into a scratch folder named for no one site', () => {
+    const infra = job('infra')
+    assert.doesNotMatch(workflow(), /web-website/u)
+    assert.match(step('infra', 'Build template'), /--outfile \/tmp\/site-infra\/main\.json/u)
+    assert.match(infra, /node scripts\/check-infra\.mjs \/tmp\/site-infra\/main\.json/u)
+  })
+
   test('the inputs default to the APKiwi web layout', () => {
     const defaults = {
       'node-version-file': ['.nvmrc', 'string'],
+      'app-location': ['build/client', 'string'],
       'has-api': ['true', 'boolean'],
       'has-e2e': ['true', 'boolean'],
       'has-infra': ['true', 'boolean'],

@@ -1,7 +1,9 @@
 # ci-workflows
 
-Shared reusable GitHub Actions workflows for every APKiwiOrg repository. One implementation lives here and
-each repository calls it with a small caller, so a fix lands once.
+Shared reusable GitHub Actions workflows. One implementation lives here and each repository calls it with
+a small caller, so a fix lands once. The stress workflow serves APKiwiOrg repositories. The site workflows
+serve callers in three organisations: APKiwiOrg/web, ThriveNZ/web, ShieldPhrase/web and every client site
+made from APKiwiOrg/site-template.
 
 Every workflow here runs on a GitHub-hosted runner, never a self-hosted one. The org's self-hosted runners
 are the dev Mac, and this repository is public.
@@ -172,18 +174,18 @@ a ruleset that requires checks by their old names needs updating when a site mov
 
 Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `has-api` (true), `has-e2e` (true),
 `has-infra` (true), `analytics-test-token` (`00000000000000000000000000000000`), `bicep-file`
-(`infra/main.bicep`) and `bicep-params` (`infra/params/site.bicepparam`). `has-api: false` skips the api
-install, typecheck and test steps. `has-e2e: false` and `has-infra: false` skip those jobs. Every build and
-test sees the analytics test token as `VITE_CLOUDFLARE_ANALYTICS_TOKEN`, so the registered site token never
-reaches CI.
+(`infra/main.bicep`), `bicep-params` (`infra/params/site.bicepparam`) and `app-location` (`build/client`).
+`has-api: false` skips the api install, typecheck and test steps. `has-e2e: false` and `has-infra: false`
+skip those jobs. Every build and test sees the analytics test token as `VITE_CLOUDFLARE_ANALYTICS_TOKEN`, so
+the registered site token never reaches CI.
 
-The calling repository supplies `scripts/check-npm-policy.mjs`, `scripts/check-assets.mjs`, which checks
-`build/client`, the npm scripts `lint`, `typecheck`, `test`, `check:theme`, `build` and `test:e2e`, and the
-convention checks `scripts/check-dashes.sh`, `scripts/check-prose.sh`, `scripts/check-scratch.sh` and
-`scripts/check-agent-instructions.sh`, each run with `--tree`. `repo` runs every `scripts/tests/*.test.sh`
-and fails when there is none. With `has-api` the `api` folder is an npm package with `typecheck` and `test`
-scripts. With `has-infra` the repository supplies `scripts/check-infra.mjs`, which receives the compiled
-template.
+The calling repository supplies `scripts/check-npm-policy.mjs` and `scripts/check-assets.mjs`, which
+receives the `app-location` folder after the build. It also supplies the npm scripts `lint`, `typecheck`,
+`test`, `check:theme`, `build` and `test:e2e`, and the convention checks `scripts/check-dashes.sh`,
+`scripts/check-prose.sh`, `scripts/check-scratch.sh` and `scripts/check-agent-instructions.sh`, each run with
+`--tree`. `repo` runs every `scripts/tests/*.test.sh` and fails when there is none. With `has-api` the `api`
+folder is an npm package with `typecheck` and `test` scripts. With `has-infra` the repository supplies
+`scripts/check-infra.mjs`, which receives the compiled template.
 
 ## site-deploy
 
@@ -222,9 +224,11 @@ caller's concurrency group deadlocks, so `site-deploy` sets none. The caller gra
 called job can only narrow the caller's token, and the org default token has no actions read. YAML flow
 mappings cannot hold a `${{ }}` expression, so `with` and `secrets` stay in block style.
 
-Once the token lives in the caller's `production` environment, that environment secret wins over the passed
-value because the deploy job declares the environment, so the caller line can stay. The deploy job's first
-step refuses a token that resolves empty.
+Every caller must pass `AZURE_STATIC_WEB_APPS_API_TOKEN` by that name, as above. `secrets: inherit` does
+not cross organisations, and the token in the caller's `production` environment takes precedence only over a
+secret the caller passes by that name, because the deploy job declares the environment. The deploy job's
+first step refuses a token that resolves empty. A caller outside APKiwiOrg also needs its organisation's
+Actions policy to allow `APKiwiOrg/ci-workflows` reusable workflows, or the call never starts.
 
 Redeploy or roll back to a green main SHA from main:
 
@@ -239,6 +243,7 @@ which receives the deployed URL.
 Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `app-location` (`build/client`),
 `api-location` (`api`), `build-command` (`npm run build`) and `analytics-token` (empty). The build command
 runs as one bash command line after `npm ci`, with the analytics token in `VITE_CLOUDFLARE_ANALYTICS_TOKEN`.
+It runs under `bash -euo pipefail`, so any failing command in it fails the build and nothing uploads.
 
 ## site-live-throttle-check
 
@@ -288,16 +293,20 @@ Each run spends the runner's slots for the site's throttle window, so a rerun so
 fails at post 1 with 429. A throttle held in one instance's memory also fails the run when that instance
 recycles mid-run. Rerun after the window.
 
-The check is meaningful only when `sender-limit` plus 1 is at most the smallest site-wide cap, less any
-enquiries the site already took in that cap's window. Otherwise a site-wide cap answers the last post's 429 and
-the run passes without testing the per-sender key. The template's limit of 3 with its cap of 4 a minute just
-fits. One run spends `sender-limit` slots of each site-wide cap for that cap's window. The last post spends
-none, because the template throttle records a post only when every limit allows it.
+The check is meaningful only when `sender-limit` plus 1 is at most C, the smallest site-wide cap less any
+enquiries the site already took in that cap's window. When `sender-limit` equals C, the site-wide cap answers
+the last post's 429 and the run passes falsely, without testing the per-sender key. When `sender-limit` is
+greater than C, the site-wide cap answers post C plus 1 with 429 and the run fails early with
+`did not answer 503`. When C is 0 that is post 1, which reports a full bucket instead. The template's limit
+of 3 with its cap of 4 a minute just fits. One run spends `sender-limit` slots of each site-wide cap for that
+cap's window. The last post spends none, because the template throttle records a post only when every limit
+allows it.
 
 The calling repository supplies the template enquiry api at `/api/enquiry`. The valid body
 `{"name":"Throttle Check","email":"throttle-check@example.com","needs":"Throttle check","elapsedMs":5000}` fits
-its schema, and `elapsedMs` clears the 3000 ms timing check. The handler checks the honeypot, then timing, then
-the throttle, and only then answers 503 `enquiries-not-open` in off mode, so the throttle's 429 still shows.
+its schema, and `elapsedMs` clears the 3000 ms timing check. The handler checks the honeypot, then the schema,
+then timing, then the throttle, and only then answers 503 `enquiries-not-open` in off mode, so the throttle's
+429 still shows.
 
 ThriveNZ/web keeps its own live throttle check until it moves onto the template api, because its schema takes
 `plan` where the template takes `needs`.

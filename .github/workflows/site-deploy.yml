@@ -1,6 +1,6 @@
 name: site-deploy
 
-# THE shared Azure Static Web Apps deploy for every site. A site calls it from a small caller of its own
+# The shared Azure Static Web Apps deploy for every site. A site calls it from a small caller of its own
 # (see README.md) that owns the triggers and the deploy-main concurrency group. A called workflow that
 # repeats its caller's concurrency group deadlocks, so this file sets none.
 #
@@ -151,14 +151,15 @@ jobs:
       - name: npm install policy
         run: node scripts/check-npm-policy.mjs
 
-      # The build command reaches the shell through env and runs as one bash command line.
+      # The build command reaches the shell through env and runs as one bash command line. Errexit, nounset
+      # and pipefail make any failing part fail the step, so a partial build never uploads.
       - name: Build site
         env:
           VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-token }}
           BUILD_COMMAND: ${{ inputs.build-command }}
         run: |
           npm ci
-          bash -c "$BUILD_COMMAND"
+          bash -euo pipefail -c "$BUILD_COMMAND"
 
       # Overwrite lets a re-run of this job replace the artifact its earlier attempt uploaded.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
