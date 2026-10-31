@@ -1,16 +1,22 @@
 // Checks site-ci.yml statically: the hardening every job keeps and the inputs that switch the optional work.
 // A static test cannot watch GitHub skip a job, so a switch is proven by the if that reads its input.
+// The template drift step is run for real against a stub checker.
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { describe, test } from 'node:test'
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { jobBlock } from './workflow-steps.mjs'
+import { jobBlock, stepScript } from './workflow-steps.mjs'
 
 const workflowPath = fileURLToPath(new URL('../../.github/workflows/site-ci.yml', import.meta.url))
 const workflow = () => readFileSync(workflowPath, 'utf8')
 const job = (id) => jobBlock(workflowPath, id)
 const jobIds = ['checks', 'repo', 'secrets', 'infra', 'e2e']
 const apiSteps = ['Install api', 'Typecheck api', 'Test api']
+const driftStep = 'Site template drift'
+const folders = []
 
 // The lines of one step, from its "- name:" line to the next step.
 function step(jobId, name) {
@@ -120,5 +126,44 @@ describe('inputs switch the optional work', () => {
     for (const id of ['checks', 'repo', 'infra', 'e2e']) {
       assert.match(job(id), /node-version-file: \$\{\{ inputs\.node-version-file \}\}/u)
     }
+  })
+})
+
+// Runs the drift step in a temp site under bash -e, the shell GitHub uses for a run step with no shell set.
+// The stub checker exits with the given code. A null exit leaves the site without a lock.
+function runDrift(checkerExit) {
+  const folder = mkdtempSync(join(tmpdir(), 'ciwf-site-ci-'))
+  folders.push(folder)
+  mkdirSync(join(folder, 'scripts'))
+  writeFileSync(join(folder, 'scripts', 'check-site-template.mjs'),
+    `console.log('stub checker ran')\nprocess.exit(${checkerExit ?? 0})\n`)
+  if (checkerExit !== null) writeFileSync(join(folder, 'site-template.lock.json'), '{}\n')
+  return spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'repo', driftStep)], {
+    cwd: folder, encoding: 'utf8', env: { PATH: process.env.PATH },
+  })
+}
+
+afterEach(() => {
+  for (const folder of folders.splice(0)) rmSync(folder, { recursive: true, force: true })
+})
+
+describe('the repo job fails on template drift', () => {
+  test('a site with a lock fails when the checker fails', () => {
+    const result = runDrift(1)
+    assert.equal(result.status, 1)
+    assert.equal(result.stdout, 'stub checker ran\n')
+  })
+
+  test('a site with a lock passes when the checker passes', () => {
+    const result = runDrift(0)
+    assert.equal(result.status, 0)
+    assert.equal(result.stdout, 'stub checker ran\n')
+  })
+
+  test('a repository with no lock prints one skip line and passes', () => {
+    const result = runDrift(null)
+    assert.equal(result.status, 0)
+    assert.equal(result.stdout, 'Site template drift: no site-template.lock.json, skipping\n')
+    assert.equal(result.stderr, '')
   })
 })

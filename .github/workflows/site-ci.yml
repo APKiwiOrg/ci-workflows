@@ -136,6 +136,16 @@ jobs:
       - name: Agent instruction budget
         run: sh scripts/check-agent-instructions.sh --tree
 
+      # A site made from APKiwiOrg/site-template carries site-template.lock.json and the checker that
+      # hashes its template-managed files against it. A repository with no lock is not a template site.
+      - name: Site template drift
+        run: |
+          if [ -f site-template.lock.json ]; then
+            node scripts/check-site-template.mjs
+          else
+            echo "Site template drift: no site-template.lock.json, skipping"
+          fi
+
       - name: Script tests
         run: |
           set -eu

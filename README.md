@@ -149,9 +149,10 @@ selected tests. Check the retained TRX count before treating a run as evidence.
 ## site-ci
 
 Runs a site's CI. `checks` lints, typechecks, tests and builds, then holds the build to the asset budget.
-`repo` runs the repository convention checks and the shell script tests. `secrets` scans every commit with a
-checksum-verified gitleaks. `infra` compiles the Bicep template and parameters and checks the infrastructure
-policy. `e2e` builds and runs the browser smoke after `checks` passes. Every checkout drops its credentials.
+`repo` runs the repository convention checks, the site template drift check and the shell script tests.
+`secrets` scans every commit with a checksum-verified gitleaks. `infra` compiles the Bicep template and
+parameters and checks the infrastructure policy. `e2e` builds and runs the browser smoke after `checks`
+passes. Every checkout drops its credentials.
 
 A site adds this caller as `.github/workflows/ci.yml`, pinned to a commit of this repository. `site-deploy`
 accepts only successful main-push runs of a workflow in that file named `CI`:
@@ -183,9 +184,11 @@ The calling repository supplies `scripts/check-npm-policy.mjs` and `scripts/chec
 receives the `app-location` folder after the build. It also supplies the npm scripts `lint`, `typecheck`,
 `test`, `check:theme`, `build` and `test:e2e`, and the convention checks `scripts/check-dashes.sh`,
 `scripts/check-prose.sh`, `scripts/check-scratch.sh` and `scripts/check-agent-instructions.sh`, each run with
-`--tree`. `repo` runs every `scripts/tests/*.test.sh` and fails when there is none. With `has-api` the `api`
-folder is an npm package with `typecheck` and `test` scripts. With `has-infra` the repository supplies
-`scripts/check-infra.mjs`, which receives the compiled template.
+`--tree`. A site made from APKiwiOrg/site-template carries `site-template.lock.json`, and `repo` then runs its
+`scripts/check-site-template.mjs`, which fails when a template-managed file differs from the lock. A
+repository with no lock prints one skip line instead. `repo` runs every `scripts/tests/*.test.sh` and fails
+when there is none. With `has-api` the `api` folder is an npm package with `typecheck` and `test` scripts.
+With `has-infra` the repository supplies `scripts/check-infra.mjs`, which receives the compiled template.
 
 ## site-deploy
 
