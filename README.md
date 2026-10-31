@@ -254,7 +254,7 @@ before the schema, timing and throttle checks without calling delivery. The run 
 the last post must answer 429 `rate-limited`. It prints status codes, never an address.
 
 A site adds this caller as `.github/workflows/live-throttle-check.yml`, pinned to a commit of this repository.
-`sender-limit` is the site's own per-sender limit, from 1 to 253:
+`sender-limit` is the site's own per-sender limit, from 1 to 253, and the template's is 3:
 
 ```yaml
 name: Live throttle check
@@ -274,7 +274,7 @@ jobs:
     uses: APKiwiOrg/ci-workflows/.github/workflows/site-live-throttle-check.yml@<full commit sha>
     with:
       site-url: ${{ inputs.site-url }}
-      sender-limit: 5
+      sender-limit: 3
 ```
 
 The caller owns the concurrency group, so two runs never share the runner's throttle slots. A `default` on
@@ -288,6 +288,16 @@ Each run spends the runner's slots for the site's throttle window, so a rerun so
 fails at post 1 with 429. A throttle held in one instance's memory also fails the run when that instance
 recycles mid-run. Rerun after the window.
 
-The calling repository supplies `/api/enquiry`, which accepts the synthetic body
-`{"name":"Throttle Check","email":"throttle-check@example.com","plan":"unsure","elapsedMs":5000}` and answers
-503 `enquiries-not-open` to a honeypot hit and to a valid post while delivery is off.
+The check is meaningful only when `sender-limit` plus 1 is at most the smallest site-wide cap, less any
+enquiries the site already took in that cap's window. Otherwise a site-wide cap answers the last post's 429 and
+the run passes without testing the per-sender key. The template's limit of 3 with its cap of 4 a minute just
+fits. One run spends `sender-limit` slots of each site-wide cap for that cap's window. The last post spends
+none, because the template throttle records a post only when every limit allows it.
+
+The calling repository supplies the template enquiry api at `/api/enquiry`. The valid body
+`{"name":"Throttle Check","email":"throttle-check@example.com","needs":"Throttle check","elapsedMs":5000}` fits
+its schema, and `elapsedMs` clears the 3000 ms timing check. The handler checks the honeypot, then timing, then
+the throttle, and only then answers 503 `enquiries-not-open` in off mode, so the throttle's 429 still shows.
+
+ThriveNZ/web keeps its own live throttle check until it moves onto the template api, because its schema takes
+`plan` where the template takes `needs`.

@@ -22,8 +22,8 @@ README says how to call each one. This file holds the rules for changing them.
   APKiwiOrg/site-template.
 - `site-ci.yml` callers are APKiwiOrg/web, ThriveNZ/web, ShieldPhrase/web and every client site made from
   APKiwiOrg/site-template.
-- `site-live-throttle-check.yml` callers are APKiwiOrg/web, ThriveNZ/web and every client site made from
-  APKiwiOrg/site-template, the sites with an enquiry throttle.
+- `site-live-throttle-check.yml` callers are APKiwiOrg/web and every client site made from
+  APKiwiOrg/site-template, the sites on the template enquiry api.
 
 ## Work and finish
 

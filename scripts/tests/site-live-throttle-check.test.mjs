@@ -69,6 +69,20 @@ function runCheck(answers, env = {}) {
   return { ...result, calls }
 }
 
+// The template enquiry schema in api/src/enquiry/request.ts requires a name, an email and needs as
+// non-empty strings and an integer elapsedMs. The handler answers too-fast below 3000 ms, before the
+// throttle, so a faster body would never reach the throttle.
+function assertTemplateEnquiry(data) {
+  const body = JSON.parse(data)
+  for (const field of ['name', 'email', 'needs']) {
+    assert.equal(typeof body[field], 'string', `the body has ${field}`)
+    assert.ok(body[field].trim().length > 0, `${field} is not empty`)
+  }
+  assert.equal(body.email, 'throttle-check@example.com')
+  assert.ok(Number.isInteger(body.elapsedMs) && body.elapsedMs >= 3000, 'elapsedMs passes the timing check')
+  assert.equal('notes_extra' in body, false, 'a valid post never trips the honeypot')
+}
+
 // A run where the probe and posts 1 to limit answer 503 and the last post answers the given line.
 const passingAnswers = (limit, last = limited) => [closed, ...Array(limit).fill(closed), last]
 
@@ -106,8 +120,7 @@ describe('sends sender-limit plus one posts', () => {
       assert.equal(posts.length, limit + 1)
       for (const post of posts) {
         assert.equal(post.url, endpoint)
-        assert.match(post.data, /"email":"throttle-check@example\.com"/u)
-        assert.doesNotMatch(post.data, /notes_extra/u)
+        assertTemplateEnquiry(post.data)
       }
       assert.equal(posts[0].xff, '', 'post 1 is plain')
       assert.deepEqual(posts.slice(1).map((post) => post.xff),

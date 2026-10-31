@@ -2,7 +2,9 @@ name: site-live-throttle-check
 
 # Tests that a site's live enquiry throttle cannot be bypassed with a forged X-Forwarded-For header. A site
 # calls it from a small manual caller of its own (see README.md). Run it after any change to how the site's
-# api reads the client address, and before email delivery is ever switched on.
+# api reads the client address, and before email delivery is ever switched on. The valid posts fit the
+# template enquiry api, whose handler checks the honeypot, then timing, then the throttle, and only then
+# answers 503 enquiries-not-open in off mode. So a post the throttle refuses answers 429 even in off mode.
 #
 # No secrets and no token permissions. It sends no email while delivery stays off for the run, and never
 # starts unless delivery is off. It first probes the delivery mode with a honeypot-only post. The handler
@@ -62,7 +64,8 @@ jobs:
           last=$((SENDER_LIMIT + 1))
           endpoint="${SITE_URL%/}/api/enquiry"
           probe='{"notes_extra":"x"}'
-          valid='{"name":"Throttle Check","email":"throttle-check@example.com","plan":"unsure","elapsedMs":5000}'
+          # Fits the template enquiry schema. elapsedMs clears the 3000 ms timing check, which runs before the throttle.
+          valid='{"name":"Throttle Check","email":"throttle-check@example.com","needs":"Throttle check","elapsedMs":5000}'
           answer=$(mktemp)
           trap 'rm -f "$answer"' EXIT
 
