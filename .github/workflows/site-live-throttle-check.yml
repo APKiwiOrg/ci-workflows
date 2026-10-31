@@ -33,6 +33,11 @@ on:
         description: The site's per-sender enquiry limit, 1 to 253
         required: true
         type: number
+      enquiry-fields:
+        description: JSON object of the site's form fields with string values, excluding core fields
+        required: false
+        type: string
+        default: '{"needs":"Throttle check"}'
 
 permissions: {}
 
@@ -46,6 +51,7 @@ jobs:
         env:
           SITE_URL: ${{ inputs.site-url }}
           SENDER_LIMIT: ${{ inputs.sender-limit }}
+          ENQUIRY_FIELDS: ${{ inputs.enquiry-fields }}
         run: |
           set -eu
           case "$SITE_URL" in
@@ -65,8 +71,18 @@ jobs:
           last=$((SENDER_LIMIT + 1))
           endpoint="${SITE_URL%/}/api/enquiry"
           probe='{"notes_extra":"x"}'
-          # Fits the template enquiry schema. elapsedMs clears the 3000 ms timing check, which runs before the throttle.
-          valid='{"name":"Throttle Check","email":"throttle-check@example.com","needs":"Throttle check","elapsedMs":5000}'
+          # Validate before the probe and keep parser errors from exposing supplied values.
+          # elapsedMs clears the 3000 ms timing check, which runs before the throttle.
+          if ! valid=$(jq -cen --argjson fields "$ENQUIRY_FIELDS" '
+            $fields
+            | select(type == "object")
+            | select(all(.[]; type == "string"))
+            | select(has("name") or has("email") or has("elapsedMs") or has("notes_extra") | not)
+            | {name: "Throttle Check", email: "throttle-check@example.com"} + . + {elapsedMs: 5000}
+          ' 2>/dev/null); then
+            echo "enquiry-fields must be a JSON object with string values and no name, email, elapsedMs or notes_extra keys" >&2
+            exit 1
+          fi
           answer=$(mktemp)
           trap 'rm -f "$answer"' EXIT
 

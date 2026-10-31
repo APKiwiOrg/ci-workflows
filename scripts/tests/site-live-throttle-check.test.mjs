@@ -58,7 +58,7 @@ function runCheck(answers, env = {}) {
     encoding: 'utf8',
     env: {
       PATH: `${folder}:${process.env.PATH}`, TEST_CURL_LOG: log, TEST_CURL_ANSWERS: answerFile,
-      SITE_URL: siteUrl, SENDER_LIMIT: '5', ...env,
+      SITE_URL: siteUrl, SENDER_LIMIT: '5', ENQUIRY_FIELDS: '{"needs":"Throttle check"}', ...env,
     },
   })
   const recorded = existsSync(log) ? readFileSync(log, 'utf8') : ''
@@ -112,6 +112,15 @@ describe('the run stops unless the probe answers 503 enquiries-not-open', () => 
 })
 
 describe('sends sender-limit plus one posts', () => {
+  test('the default enquiry body stays byte for byte unchanged on every valid post', () => {
+    const result = runCheck(passingAnswers(5))
+    assert.equal(result.status, 0, result.stderr)
+    for (const post of result.calls.slice(1)) {
+      assert.equal(post.data,
+        '{"name":"Throttle Check","email":"throttle-check@example.com","needs":"Throttle check","elapsedMs":5000}')
+    }
+  })
+
   for (const limit of [1, 5, 7]) {
     test(`sends sender-limit plus one posts, here ${limit} plus one`, () => {
       const result = runCheck(passingAnswers(limit), { SENDER_LIMIT: String(limit) })
@@ -164,7 +173,85 @@ describe('sends sender-limit plus one posts', () => {
   })
 })
 
+describe('per-site enquiry fields', () => {
+  test('custom fields replace needs on every valid post and leave the probe honeypot-only', () => {
+    const result = runCheck(passingAnswers(5), {
+      ENQUIRY_FIELDS: '{"plan":"Starter","goals":"Build strength"}',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.deepEqual(result.calls[0], { data: probe, xff: '', url: endpoint })
+    assert.equal(result.calls.length, 7)
+    for (const post of result.calls.slice(1)) {
+      assert.deepEqual(JSON.parse(post.data), {
+        name: 'Throttle Check', email: 'throttle-check@example.com',
+        plan: 'Starter', goals: 'Build strength', elapsedMs: 5000,
+      })
+    }
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /203\.0\.113|@|example\.com/u)
+  })
+
+  test('custom fields never get added to a probe that finds delivery open', () => {
+    const result = runCheck(['202 accepted', closed], { ENQUIRY_FIELDS: '{"plan":"Starter"}' })
+    assert.notEqual(result.status, 0)
+    assert.deepEqual(result.calls, [{ data: probe, xff: '', url: endpoint }])
+  })
+
+  test('an empty object sends only the core fields on valid posts', () => {
+    const result = runCheck(passingAnswers(1), { SENDER_LIMIT: '1', ENQUIRY_FIELDS: '{}' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.calls.length, 3)
+    for (const post of result.calls.slice(1)) {
+      assert.deepEqual(JSON.parse(post.data), {
+        name: 'Throttle Check', email: 'throttle-check@example.com', elapsedMs: 5000,
+      })
+    }
+  })
+
+  test('string values keep quotes, newlines and shell syntax as data', () => {
+    const result = runCheck(passingAnswers(1), {
+      SENDER_LIMIT: '1', ENQUIRY_FIELDS: '{"plan":"Starter","goals":"A \\"quote\\"\\n$(exit 99)"}',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.calls.length, 3)
+    for (const post of result.calls.slice(1)) {
+      assert.deepEqual(JSON.parse(post.data), {
+        name: 'Throttle Check', email: 'throttle-check@example.com',
+        plan: 'Starter', goals: 'A "quote"\n$(exit 99)', elapsedMs: 5000,
+      })
+    }
+  })
+})
+
 describe('inputs are checked before anything is posted', () => {
+  for (const [name, fields] of [
+    ['malformed JSON', '{broken'],
+    ['malformed JSON containing an address', '{"email":"private@example.test"'],
+    ['empty input', ''],
+    ['multiple JSON documents', '{} {}'],
+    ['null', 'null'],
+    ['an array', '[]'],
+    ['a string', '"text"'],
+    ['a boolean', 'true'],
+    ['a number', '42'],
+    ['a null value', '{"plan":null}'],
+    ['an array value', '{"plan":[]}'],
+    ['an object value', '{"plan":{}}'],
+    ['a boolean value', '{"plan":false}'],
+    ['a number value', '{"plan":0}'],
+    ['the name field', '{"name":"Override"}'],
+    ['the email field', '{"email":"private@example.test"}'],
+    ['the elapsedMs field', '{"elapsedMs":"5000"}'],
+    ['the honeypot field', '{"notes_extra":""}'],
+  ]) {
+    test(`enquiry-fields refuses ${name} before the probe`, () => {
+      const result = runCheck(passingAnswers(5), { ENQUIRY_FIELDS: fields })
+      assert.notEqual(result.status, 0)
+      assert.equal(result.calls.length, 0, 'invalid fields never reach curl')
+      assert.match(result.stderr, /enquiry-fields must be a JSON object with string values/u)
+      assert.doesNotMatch(`${result.stdout}${result.stderr}`, /@|203\.0\.113/u)
+    })
+  }
+
   for (const url of ['', 'http://site.example.test', 'ftp://site.example.test', 'site.example.test']) {
     test(`site-url ${JSON.stringify(url)} is refused`, () => {
       const result = runCheck(passingAnswers(5), { SITE_URL: url })
@@ -190,7 +277,7 @@ describe('inputs are checked before anything is posted', () => {
 })
 
 describe('the workflow is a tokenless reusable check', () => {
-  test('it is called only, with the two required inputs', () => {
+  test('it is called only, with two required inputs and optional enquiry fields', () => {
     assert.match(workflow(), /^on:\n {2}workflow_call:\n {4}inputs:\n/mu)
     assert.doesNotMatch(workflow(), /^ *(?:workflow_dispatch|secrets):/mu)
     for (const [name, type] of [['site-url', 'string'], ['sender-limit', 'number']]) {
@@ -199,6 +286,11 @@ describe('the workflow is a tokenless reusable check', () => {
       assert.match(input, /^ {8}required: true$/mu)
       assert.match(input, new RegExp(`^ {8}type: ${type}$`, 'mu'))
     }
+    const fields = workflow().match(/^ {6}enquiry-fields:\n((?: {8}.+\n)+)/mu)?.[1]
+    assert.ok(fields, 'workflow_call declares enquiry-fields')
+    assert.match(fields, /^ {8}required: false$/mu)
+    assert.match(fields, /^ {8}type: string$/mu)
+    assert.match(fields, /^ {8}default: '\{"needs":"Throttle check"\}'$/mu)
   })
 
   test('the token has no permissions and the job runs on the pinned hosted image', () => {
@@ -211,6 +303,7 @@ describe('the workflow is a tokenless reusable check', () => {
   test('inputs reach the script only through env', () => {
     assert.match(job(), /^ {10}SITE_URL: \$\{\{ inputs\.site-url \}\}$/mu)
     assert.match(job(), /^ {10}SENDER_LIMIT: \$\{\{ inputs\.sender-limit \}\}$/mu)
+    assert.match(job(), /^ {10}ENQUIRY_FIELDS: \$\{\{ inputs\.enquiry-fields \}\}$/mu)
     assert.doesNotMatch(stepScript(workflowPath, 'check', stepName), /\$\{\{/u)
   })
 

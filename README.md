@@ -288,6 +288,19 @@ jobs:
 The caller owns the concurrency group, so two runs never share the runner's throttle slots. A `default` on
 `site-url` saves typing the hostname.
 
+The optional string input `enquiry-fields` defaults to `{"needs":"Throttle check"}`. It supplies the site's
+form fields on every valid post, replacing the default `needs` field when provided. For a form with `plan`
+and optional `goals`, add this under the caller's `with` and choose values its schema accepts:
+
+```yaml
+      enquiry-fields: '{"plan":"Throttle check","goals":"Throttle check"}'
+```
+
+The input must be a JSON object with string values. It cannot contain `name`, `email`, `elapsedMs` or the
+honeypot field `notes_extra`. Invalid input stops before any request, including the mode probe, without
+printing the supplied values. An empty object adds no site fields. The probe stays honeypot-only because
+the handler answers it before schema validation, without calling delivery or spending a throttle slot.
+
 ```bash
 gh workflow run live-throttle-check.yml --ref main -f site-url=https://<site hostname>
 ```
@@ -305,11 +318,11 @@ of 3 with its cap of 4 a minute just fits. One run spends `sender-limit` slots o
 cap's window. The last post spends none, because the template throttle records a post only when every limit
 allows it.
 
-The calling repository supplies the template enquiry api at `/api/enquiry`. The valid body
+The calling repository supplies the template enquiry api at `/api/enquiry`. The default valid body
 `{"name":"Throttle Check","email":"throttle-check@example.com","needs":"Throttle check","elapsedMs":5000}` fits
 its schema, and `elapsedMs` clears the 3000 ms timing check. The handler checks the honeypot, then the schema,
 then timing, then the throttle, and only then answers 503 `enquiries-not-open` in off mode, so the throttle's
 429 still shows.
 
-ThriveNZ/web keeps its own live throttle check until it moves onto the template api, because its schema takes
-`plan` where the template takes `needs`.
+Sites with different form fields use `enquiry-fields` to match their schema while keeping the core fields
+and the honeypot probe fixed.
