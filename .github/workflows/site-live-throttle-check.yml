@@ -1,0 +1,125 @@
+name: site-live-throttle-check
+
+# Tests that a site's live enquiry throttle cannot be bypassed with a forged X-Forwarded-For header. A site
+# calls it from a small manual caller of its own (see README.md). Run it after any change to how the site's
+# api reads the client address, and before email delivery is ever switched on.
+#
+# No secrets and no token permissions. It sends no email while delivery stays off for the run, and never
+# starts unless delivery is off. It first probes the delivery mode with a honeypot-only post. The handler
+# answers a honeypot hit before the schema, timing and throttle checks and never calls delivery. It answers
+# 503 enquiries-not-open only in off mode, 202 in console or acs, and 500 when misconfigured. So the probe
+# sends nothing and spends no throttle slot, and the run stops unless it answers 503 enquiries-not-open. Only
+# then does it send sender-limit plus one valid posts, one plain and the rest each forging a different
+# X-Forwarded-For value. Posts 1 to sender-limit must answer 503 and the last post must answer 429. It prints
+# status codes only, never an address.
+#
+# Each run spends this runner's throttle slots for the site's throttle window. A run started sooner from the
+# same address fails at post 1 with 429 and tests nothing. The caller owns the concurrency group, because a
+# called workflow that repeats its caller's group deadlocks.
+#
+# Inputs reach scripts only through env, never by expression interpolation into a run line.
+
+on:
+  workflow_call:
+    inputs:
+      site-url:
+        description: Site to check, starting with https://
+        required: true
+        type: string
+      sender-limit:
+        description: The site's per-sender enquiry limit, 1 to 253
+        required: true
+        type: number
+
+permissions: {}
+
+jobs:
+  check:
+    name: Forged X-Forwarded-For hits the throttle
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe the mode, then post sender-limit plus one enquiries in off mode
+        env:
+          SITE_URL: ${{ inputs.site-url }}
+          SENDER_LIMIT: ${{ inputs.sender-limit }}
+        run: |
+          set -eu
+          case "$SITE_URL" in
+            https://*) ;;
+            *) echo "site-url must start with https://" >&2; exit 1 ;;
+          esac
+          # The forged values stay in the 203.0.113.0/24 documentation range, so the last one is at most .254.
+          # Four or more digits are refused before the comparison, so it never sees an overflowing number.
+          case "$SENDER_LIMIT" in
+            '' | 0* | *[!0-9]* | ????*) limit_ok=false ;;
+            *) limit_ok=true ;;
+          esac
+          if [ "$limit_ok" != true ] || [ "$SENDER_LIMIT" -gt 253 ]; then
+            echo "sender-limit must be a whole number from 1 to 253" >&2
+            exit 1
+          fi
+          last=$((SENDER_LIMIT + 1))
+          endpoint="${SITE_URL%/}/api/enquiry"
+          probe='{"notes_extra":"x"}'
+          valid='{"name":"Throttle Check","email":"throttle-check@example.com","plan":"unsure","elapsedMs":5000}'
+          answer=$(mktemp)
+          trap 'rm -f "$answer"' EXIT
+
+          # Sends one post of body $1 and sets code. A forged value in $2 is added only when given.
+          post() {
+            if [ -n "${2:-}" ]; then
+              code=$(curl --silent --max-time 30 --request POST \
+                --header 'Content-Type: application/json' --header "X-Forwarded-For: $2" \
+                --data "$1" --output "$answer" --write-out '%{http_code}' "$endpoint") || code=000
+            else
+              code=$(curl --silent --max-time 30 --request POST \
+                --header 'Content-Type: application/json' \
+                --data "$1" --output "$answer" --write-out '%{http_code}' "$endpoint") || code=000
+            fi
+          }
+
+          answered() {
+            [ "$code" = "$1" ] && grep -q "\"code\":\"$2\"" "$answer"
+          }
+
+          post "$probe"
+          echo "mode probe answered $code"
+          if ! answered 503 enquiries-not-open; then
+            case "$code" in
+              202) echo "mode probe answered 202, so delivery is console or acs. Nothing more is sent." >&2 ;;
+              500) echo "mode probe answered 500, so delivery is misconfigured. Nothing more is sent." >&2 ;;
+              000) echo "mode probe got no connection. Check site-url." >&2 ;;
+              *) echo "mode probe answered an unexpected $code. Nothing more is sent." >&2 ;;
+            esac
+            exit 1
+          fi
+
+          post "$valid"
+          echo "post 1 answered $code"
+          if ! answered 503 enquiries-not-open; then
+            case "$code" in
+              429) echo "post 1 answered 429, so this address's bucket is already full. Rerun after the site's throttle window. If it repeats, keys are colliding." >&2 ;;
+              000) echo "post 1 got no connection" >&2 ;;
+              *) echo "post 1 answered an unexpected $code" >&2 ;;
+            esac
+            exit 1
+          fi
+
+          # Documentation range values, so no real address is forged.
+          n=2
+          while [ "$n" -le "$last" ]; do
+            post "$valid" "203.0.113.$n"
+            echo "post $n answered $code"
+            if [ "$n" -lt "$last" ]; then
+              if ! answered 503 enquiries-not-open; then
+                echo "post $n did not answer 503 enquiries-not-open, stopping" >&2
+                exit 1
+              fi
+            elif ! answered 429 rate-limited; then
+              echo "post $n did not answer 429 rate-limited, so forged values bypass the throttle" >&2
+              exit 1
+            fi
+            n=$((n + 1))
+          done
+          echo "forged X-Forwarded-For values hit 429 on post $last"

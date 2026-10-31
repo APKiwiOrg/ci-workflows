@@ -239,3 +239,55 @@ which receives the deployed URL.
 Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `app-location` (`build/client`),
 `api-location` (`api`), `build-command` (`npm run build`) and `analytics-token` (empty). The build command
 runs as one bash command line after `npm ci`, with the analytics token in `VITE_CLOUDFLARE_ANALYTICS_TOKEN`.
+
+## site-live-throttle-check
+
+Tests that a site's live enquiry throttle cannot be bypassed with a forged `X-Forwarded-For` header. Run it
+after any change to how the site's api reads the client address, and before email delivery is ever switched
+on. It has no secrets and no token permissions.
+
+It first probes the delivery mode with a honeypot-only post, `{"notes_extra":"x"}`, which the handler answers
+before the schema, timing and throttle checks without calling delivery. The run stops unless the probe answers
+503 `enquiries-not-open`, so the valid posts only reach off mode and no email is sent. It then sends
+`sender-limit` plus one valid synthetic enquiries, one plain and the rest each with a different forged
+`X-Forwarded-For` from the `203.0.113.0/24` documentation range. Posts 1 to `sender-limit` must answer 503 and
+the last post must answer 429 `rate-limited`. It prints status codes, never an address.
+
+A site adds this caller as `.github/workflows/live-throttle-check.yml`, pinned to a commit of this repository.
+`sender-limit` is the site's own per-sender limit, from 1 to 253:
+
+```yaml
+name: Live throttle check
+on:
+  workflow_dispatch:
+    inputs:
+      site-url:
+        description: Site to check
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: live-throttle-check
+  cancel-in-progress: false
+jobs:
+  check:
+    uses: APKiwiOrg/ci-workflows/.github/workflows/site-live-throttle-check.yml@<full commit sha>
+    with:
+      site-url: ${{ inputs.site-url }}
+      sender-limit: 5
+```
+
+The caller owns the concurrency group, so two runs never share the runner's throttle slots. A `default` on
+`site-url` saves typing the hostname.
+
+```bash
+gh workflow run live-throttle-check.yml --ref main -f site-url=https://<site hostname>
+```
+
+Each run spends the runner's slots for the site's throttle window, so a rerun sooner from the same address
+fails at post 1 with 429. A throttle held in one instance's memory also fails the run when that instance
+recycles mid-run. Rerun after the window.
+
+The calling repository supplies `/api/enquiry`, which accepts the synthetic body
+`{"name":"Throttle Check","email":"throttle-check@example.com","plan":"unsure","elapsedMs":5000}` and answers
+503 `enquiries-not-open` to a honeypot hit and to a valid post while delivery is off.
