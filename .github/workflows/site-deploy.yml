@@ -1,0 +1,215 @@
+name: site-deploy
+
+# THE shared Azure Static Web Apps deploy for every site. A site calls it from a small caller of its own
+# (see README.md) that owns the triggers and the deploy-main concurrency group. A called workflow that
+# repeats its caller's concurrency group deadlocks, so this file sets none.
+#
+# Uploads only a SHA verified by a successful main-push run of the caller's ci.yml. An automatic run uploads
+# the newest commit on main that has one, so an older commit cannot deploy last. Deployment runs only while
+# the enabled input is true. A manual run must start from main. Only the deploy job references the
+# production environment and the deploy token.
+#
+# Inputs reach scripts only through env, never by expression interpolation into a run line.
+
+on:
+  workflow_call:
+    inputs:
+      enabled:
+        description: Deploy only when true. Callers pass vars.AZURE_ENABLED == 'true'
+        required: true
+        type: boolean
+      dispatch-sha:
+        description: Full green main-push SHA a manual run redeploys, empty for the selected ref
+        required: false
+        default: ''
+        type: string
+      node-version-file:
+        description: File naming the Node version both jobs install
+        required: false
+        default: .nvmrc
+        type: string
+      app-location:
+        description: Built static site folder the build uploads and the deploy publishes
+        required: false
+        default: build/client
+        type: string
+      api-location:
+        description: Functions folder Oryx builds and deploys beside the site
+        required: false
+        default: api
+        type: string
+      build-command:
+        description: Command that builds the site after npm ci
+        required: false
+        default: npm run build
+        type: string
+      analytics-token:
+        description: Cloudflare Web Analytics token the build embeds, empty for none
+        required: false
+        default: ''
+        type: string
+    secrets:
+      deploy-token:
+        description: Static Web Apps deployment token, read only by the deploy job
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Check deployment is enabled and CI passed
+    if: >-
+      inputs.enabled == true &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-26.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sha: ${{ steps.ci.outputs.sha }}
+    steps:
+      - name: Refuse unless explicitly enabled
+        env:
+          ENABLED: ${{ inputs.enabled }}
+        run: |
+          set -eu
+          if [ "$ENABLED" != "true" ]; then
+            echo "The enabled input must be exactly true. Deployment refused." >&2
+            exit 1
+          fi
+
+      # An automatic run deploys the newest green main commit, not its own SHA, so a cancelled
+      # pending run or CI finishing out of order cannot leave production behind.
+      # A manual run deploys its exact SHA, so dispatch stays the rollback path to any green main SHA.
+      - name: Select the green main SHA to deploy
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_SHA: ${{ inputs.dispatch-sha || github.sha }}
+          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
+          TRIGGER_EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$TRIGGER_EVENT" = "workflow_dispatch" ]; then
+            if [[ ! "$REQUESTED_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+              echo "Deployment requires a full commit SHA." >&2
+              exit 1
+            fi
+            runs=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+              -f branch=main -f event=push -f head_sha="$REQUESTED_SHA" \
+              -f status=success -f per_page=1 --jq '.workflow_runs | length')
+            if [ "$runs" != "1" ]; then
+              echo "No successful main-push CI run for $REQUESTED_SHA. Deployment refused." >&2
+              exit 1
+            fi
+            echo "Deploying $REQUESTED_SHA, the SHA the manual run requested."
+            echo "sha=$REQUESTED_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          commits=$(gh api --method GET "repos/$GITHUB_REPOSITORY/commits" \
+            -f sha=main -f per_page=30 --jq '.[].sha')
+          green=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main -f event=push -f status=success -f per_page=100 --jq '.workflow_runs[].head_sha')
+          for commit in $commits; do
+            if [[ "$commit" =~ ^[a-f0-9]{40}$ ]] && grep -qxF "$commit" <<< "$green"; then
+              echo "Deploying $commit, the newest main commit with a successful main-push CI run. CI passing for $TRIGGER_SHA started this run."
+              echo "sha=$commit" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Skipping $commit, it has no successful main-push CI run."
+          done
+          echo "None of main's latest 30 commits has a successful main-push CI run. Deployment refused." >&2
+          exit 1
+
+  # Dev tooling runs here, in a job that never receives the deploy token.
+  build:
+    name: Build site
+    needs: guard
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: npm install policy
+        run: node scripts/check-npm-policy.mjs
+
+      # The build command reaches the shell through env and runs as one bash command line.
+      - name: Build site
+        env:
+          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-token }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          npm ci
+          bash -c "$BUILD_COMMAND"
+
+      # Overwrite lets a re-run of this job replace the artifact its earlier attempt uploaded.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site
+          path: ${{ inputs.app-location }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  deploy:
+    name: Deploy and smoke test
+    needs: [guard, build]
+    environment: production
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      # The checkout supplies the api folder and the smoke script. Nothing is installed in this job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+
+      # No install runs here, so the automatic npm cache stays off.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site
+          path: ${{ inputs.app-location }}
+
+      # Oryx builds the independent api package and supplies its runtime metadata.
+      # The api folder's .npmrc blocks dependency install scripts with Oryx's npm too.
+      - name: Deploy to Static Web Apps
+        id: deploy
+        uses: Azure/static-web-apps-deploy@1a947af9992250f3bc2e68ad0754c0b0c11566c9 # v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.deploy-token }}
+          action: upload
+          app_location: ${{ inputs.app-location }}
+          api_location: ${{ inputs.api-location }}
+          output_location: ''
+          skip_app_build: true
+
+      - name: Smoke test the deployed site
+        env:
+          SITE_URL: ${{ steps.deploy.outputs.static_web_app_url }}
+        run: |
+          set -eu
+          : "${SITE_URL:?Deploy action did not return a site URL}"
+          node scripts/smoke-site.mjs "$SITE_URL"

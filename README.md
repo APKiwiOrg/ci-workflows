@@ -143,3 +143,57 @@ timing or load run, stays with the caller.
 Quote the whole filter for the shell, without embedded quotes around a simple unit name. Embedded quotes
 can be stripped while dotnet forwards the filter to the test adapter, leaving an invalid condition and no
 selected tests. Check the retained TRX count before treating a run as evidence.
+
+## site-deploy
+
+Deploys a site to Azure Static Web Apps, uploading only a SHA that a successful main-push CI run verified. An
+automatic run deploys the newest such commit on main, so CI finishing out of order cannot leave production
+behind. A manual run from main deploys the exact full SHA it is given, which is the rollback path. Nothing
+runs unless `enabled` is true.
+
+`guard` selects the SHA with a read-only token. `build` runs `npm ci` and the build command with no secret
+and uploads the app folder. `deploy` is the only job in the `production` environment and the only one that
+reads the deploy token. It installs nothing, uploads the built folder with the api folder for Oryx to build,
+then smoke tests the URL the deploy returns.
+
+A site adds this caller as `.github/workflows/deploy.yml`, pinned to a commit of this repository:
+
+```yaml
+name: Deploy
+on:
+  workflow_run: { workflows: [CI], branches: [main], types: [completed] }
+  workflow_dispatch: { inputs: { sha: { type: string, required: false } } }
+permissions: { actions: read, contents: read }
+concurrency: { group: deploy-main, cancel-in-progress: false }
+jobs:
+  deploy:
+    uses: APKiwiOrg/ci-workflows/.github/workflows/site-deploy.yml@<full commit sha>
+    with:
+      enabled: ${{ vars.AZURE_ENABLED == 'true' }}
+      dispatch-sha: ${{ inputs.sha }}
+      analytics-token: ${{ vars.CLOUDFLARE_ANALYTICS_TOKEN }}
+    secrets:
+      deploy-token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+```
+
+The caller owns the triggers and the `deploy-main` concurrency group. A called workflow that repeats its
+caller's concurrency group deadlocks, so `site-deploy` sets none. The caller grants `actions: read` because a
+called job can only narrow the caller's token, and the org default token has no actions read. YAML flow
+mappings cannot hold a `${{ }}` expression, so `with` and `secrets` stay in block style.
+
+The caller's own job has no environment, so the secret it passes resolves from repository or org secrets,
+never from a `production` environment secret.
+
+Redeploy or roll back to a green main SHA from main:
+
+```bash
+gh workflow run deploy.yml --ref main -f sha=<full green main sha>
+```
+
+The calling repository supplies `.github/workflows/ci.yml` named `CI`, whose successful main-push runs are
+the verification, `scripts/check-npm-policy.mjs`, which runs before `npm ci`, and `scripts/smoke-site.mjs`,
+which receives the deployed URL.
+
+Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `app-location` (`build/client`),
+`api-location` (`api`), `build-command` (`npm run build`) and `analytics-token` (empty). The build command
+runs as one bash command line after `npm ci`, with the analytics token in `VITE_CLOUDFLARE_ANALYTICS_TOKEN`.
