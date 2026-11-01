@@ -7,11 +7,11 @@ import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
-import { jobBlock, stepBlock, stepScript } from './workflow-steps.mjs'
+import { calledWorkflowPath, jobBlock, stepBlock, stepScript } from './workflow-steps.mjs'
 
 const workflows = [
   [fileURLToPath(new URL('../../.github/workflows/site-ci.yml', import.meta.url)), 'config'],
-  [fileURLToPath(new URL('../../.github/workflows/site-deploy.yml', import.meta.url)), 'guard'],
+  [fileURLToPath(new URL('../../.github/workflows/site-deploy.yml', import.meta.url)), 'config'],
 ]
 const folders = []
 const values = {
@@ -44,7 +44,8 @@ function readConfig(path, jobId, output = values, options = {}) {
       `process.exit(${options.exit ?? 0})`,
     ].join('\n'))
   }
-  const result = run(folder, stepScript(path, jobId, 'Read site config'))
+  const implementation = calledWorkflowPath(path, jobId)
+  const result = run(folder, stepScript(implementation, 'config', 'Read site config'))
   return { ...result, output: readFileSync(join(folder, 'output'), 'utf8') }
 }
 
@@ -52,7 +53,7 @@ function condition(path, jobId, name, outputs) {
   const source = stepBlock(path, jobId, name).match(/^ {8}if: (.+)$/mu)?.[1]
   assert.ok(source, `${name} has a capability condition`)
   return runInNewContext(source.replace(/\.([A-Za-z_]\w*(?:-\w+)+)/gu, "['$1']"), {
-    needs: { config: { outputs }, guard: { outputs } },
+    needs: { config: { outputs } },
   })
 }
 
@@ -74,14 +75,23 @@ for (const [path, jobId] of workflows) {
     test('the fixture CLI exports all five validated job outputs', () => {
       const result = readConfig(path, jobId)
       assert.equal(result.status, 0, result.stderr)
+      const implementation = calledWorkflowPath(path, jobId)
+      const shared = readFileSync(implementation, 'utf8')
       for (const [key, value] of Object.entries(values)) {
         assert.ok(result.output.includes(`${key}=${value}\n`))
-        assert.ok(jobBlock(path, jobId).includes(`${key}: \${{ steps.config.outputs.${key} }}`))
+        assert.ok(jobBlock(implementation, 'config').includes(`${key}: \${{ steps.config.outputs.${key} }}`))
+        const output = shared.match(new RegExp(`^ {6}${key}:\\n((?: {8}.+\\n)+)`, 'mu'))?.[1]
+        assert.ok(output?.includes(`value: \${{ jobs.config.outputs.${key} }}`))
       }
-      assert.equal(readFileSync(path, 'utf8').match(/node scripts\/site-config\.mjs --github-output/gu)?.length, 1)
-      assert.match(jobBlock(path, jobId), /node-version-file: \.nvmrc/u)
-      assert.match(jobBlock(path, jobId), /persist-credentials: false/u)
-      assert.doesNotMatch(jobBlock(path, jobId), /npm ci|cache: npm/u)
+      assert.match(jobBlock(path, jobId), /^ {4}uses: \.\/\.github\/workflows\/site-config\.yml$/mu)
+      assert.doesNotMatch(readFileSync(path, 'utf8'), /node scripts\/site-config\.mjs --github-output/u)
+      assert.equal(shared.match(/node scripts\/site-config\.mjs --github-output/gu)?.length, 1)
+      assert.match(jobBlock(implementation, 'config'), /node-version-file: \.nvmrc/u)
+      assert.match(jobBlock(implementation, 'config'), /^ {4}runs-on: ubuntu-26\.04$/mu)
+      assert.match(jobBlock(implementation, 'config'), /persist-credentials: false/u)
+      assert.doesNotMatch(shared, /npm ci|cache: npm|secrets\.|environment:/u)
+      assert.match(jobBlock(path, jobId), /permissions:\n {6}contents: read\n/u)
+      assert.match(jobBlock(implementation, 'config'), /permissions:\n {6}contents: read\n/u)
     })
 
     test('accepts the alternate framework and capability values', () => {
@@ -154,11 +164,22 @@ describe('capabilities control the consumer steps', () => {
       assert.equal(condition(ciPath, id, 'Build', plain), true)
       assert.equal(condition(ciPath, id, 'Build', themed), false)
     }
-    const deploy = fixtureOutputs(deployPath, 'guard', values)
+    const deploy = fixtureOutputs(deployPath, 'config', values)
     assert.equal(condition(deployPath, 'build', 'Build site with analytics', deploy), false)
     assert.equal(condition(deployPath, 'build', 'Build site with analytics', { ...deploy, analytics: 'cloudflare' }), true)
     assert.equal(condition(deployPath, 'build', 'Build site', deploy), true)
     assert.doesNotMatch(stepBlock(deployPath, 'build', 'Build site'), /inputs\.analytics-token|VITE_CLOUDFLARE_ANALYTICS_TOKEN/u)
+  })
+
+  test('both callers resolve the same implementation while deploy passes its selected SHA', () => {
+    const implementation = calledWorkflowPath(ciPath, 'config')
+    assert.equal(calledWorkflowPath(deployPath, 'config'), implementation)
+    assert.match(jobBlock(deployPath, 'config'), /^ {4}needs: guard$/mu)
+    assert.match(jobBlock(deployPath, 'config'), /checkout-ref: \$\{\{ needs\.guard\.outputs\.sha \}\}/u)
+    assert.match(jobBlock(implementation, 'config'), /^ {10}ref: \$\{\{ inputs\.checkout-ref \}\}$/mu)
+    assert.doesNotMatch(jobBlock(implementation, 'config'), /repository:/u)
+    assert.doesNotMatch(jobBlock(ciPath, 'config'), /checkout-ref:/u)
+    assert.doesNotMatch(jobBlock(deployPath, 'guard'), /actions\/checkout|actions\/setup-node|Read site config/u)
   })
 
   test('api install, typecheck and test use the directory rather than the form flag', () => {

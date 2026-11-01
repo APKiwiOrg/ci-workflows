@@ -32,70 +32,9 @@ permissions: {}
 jobs:
   config:
     name: Validate site config
-    runs-on: ubuntu-26.04
+    uses: ./.github/workflows/site-config.yml
     permissions:
       contents: read
-    outputs:
-      app-location: ${{ steps.config.outputs.app-location }}
-      has-form: ${{ steps.config.outputs.has-form }}
-      has-theme: ${{ steps.config.outputs.has-theme }}
-      analytics: ${{ steps.config.outputs.analytics }}
-      infra-params: ${{ steps.config.outputs.infra-params }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .nvmrc
-          package-manager-cache: false
-
-      - name: Read site config
-        id: config
-        run: |
-          set -eu
-          if [ ! -f scripts/site-config.mjs ]; then
-            echo "Missing scripts/site-config.mjs. Site config is required." >&2
-            exit 1
-          fi
-          node scripts/site-config.mjs --github-output
-          node --input-type=module <<'NODE'
-          import { readFileSync } from 'node:fs'
-          const fail = (reason) => {
-            console.error(`Invalid site config output: ${reason}`)
-            process.exit(1)
-          }
-          const outputs = new Map()
-          for (const line of readFileSync(process.env.GITHUB_OUTPUT, 'utf8').split('\n')) {
-            if (line === '') continue
-            const match = /^([a-z][a-z-]*)=(.*)$/u.exec(line)
-            if (!match) fail('expected key=value lines')
-            if (outputs.has(match[1])) fail(`duplicate ${match[1]}`)
-            outputs.set(match[1], match[2])
-          }
-          for (const [key, allowed] of Object.entries({
-            'app-location': ['build/client', 'out'],
-            'has-form': ['true', 'false'],
-            'has-theme': ['true', 'false'],
-            analytics: ['cloudflare', 'none'],
-          })) {
-            if (!allowed.includes(outputs.get(key))) fail(`${key} must be one of ${allowed.join(', ')}`)
-          }
-          const raw = outputs.get('infra-params')
-          let params
-          try {
-            params = JSON.parse(raw)
-          } catch {
-            fail('infra-params must be a compact JSON array of repo-relative params paths')
-          }
-          if (!Array.isArray(params) || params.length === 0 || JSON.stringify(params) !== raw ||
-              !params.every((path) => typeof path === 'string' && path.endsWith('.bicepparam') &&
-                !/[\u0000-\u001f\u007f\\:]/u.test(path) &&
-                path.split('/').every((part) => part !== '' && part !== '.' && part !== '..'))) {
-            fail('infra-params must be a nonempty compact JSON array of repo-relative .bicepparam paths')
-          }
-          NODE
 
   checks:
     needs: config

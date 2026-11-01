@@ -64,11 +64,6 @@ jobs:
       contents: read
     outputs:
       sha: ${{ steps.ci.outputs.sha }}
-      app-location: ${{ steps.config.outputs.app-location }}
-      has-form: ${{ steps.config.outputs.has-form }}
-      has-theme: ${{ steps.config.outputs.has-theme }}
-      analytics: ${{ steps.config.outputs.analytics }}
-      infra-params: ${{ steps.config.outputs.infra-params }}
     steps:
       - name: Refuse unless explicitly enabled
         env:
@@ -123,67 +118,20 @@ jobs:
           echo "None of main's latest 30 commits has a successful main-push CI run. Deployment refused." >&2
           exit 1
 
-      # Read the selected commit, so rollback uses its config as well as its source.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.ci.outputs.sha }}
-          persist-credentials: false
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .nvmrc
-          package-manager-cache: false
-
-      - name: Read site config
-        id: config
-        run: |
-          set -eu
-          if [ ! -f scripts/site-config.mjs ]; then
-            echo "Missing scripts/site-config.mjs. Site config is required." >&2
-            exit 1
-          fi
-          node scripts/site-config.mjs --github-output
-          node --input-type=module <<'NODE'
-          import { readFileSync } from 'node:fs'
-          const fail = (reason) => {
-            console.error(`Invalid site config output: ${reason}`)
-            process.exit(1)
-          }
-          const outputs = new Map()
-          for (const line of readFileSync(process.env.GITHUB_OUTPUT, 'utf8').split('\n')) {
-            if (line === '') continue
-            const match = /^([a-z][a-z-]*)=(.*)$/u.exec(line)
-            if (!match) fail('expected key=value lines')
-            if (outputs.has(match[1])) fail(`duplicate ${match[1]}`)
-            outputs.set(match[1], match[2])
-          }
-          for (const [key, allowed] of Object.entries({
-            'app-location': ['build/client', 'out'],
-            'has-form': ['true', 'false'],
-            'has-theme': ['true', 'false'],
-            analytics: ['cloudflare', 'none'],
-          })) {
-            if (!allowed.includes(outputs.get(key))) fail(`${key} must be one of ${allowed.join(', ')}`)
-          }
-          const raw = outputs.get('infra-params')
-          let params
-          try {
-            params = JSON.parse(raw)
-          } catch {
-            fail('infra-params must be a compact JSON array of repo-relative params paths')
-          }
-          if (!Array.isArray(params) || params.length === 0 || JSON.stringify(params) !== raw ||
-              !params.every((path) => typeof path === 'string' && path.endsWith('.bicepparam') &&
-                !/[\u0000-\u001f\u007f\\:]/u.test(path) &&
-                path.split('/').every((part) => part !== '' && part !== '.' && part !== '..'))) {
-            fail('infra-params must be a nonempty compact JSON array of repo-relative .bicepparam paths')
-          }
-          NODE
+  # The implementation uses the parent's pin. The input selects only caller source.
+  config:
+    name: Validate site config
+    needs: guard
+    uses: ./.github/workflows/site-config.yml
+    permissions:
+      contents: read
+    with:
+      checkout-ref: ${{ needs.guard.outputs.sha }}
 
   # Dev tooling runs here, in a job that never receives the deploy token.
   build:
     name: Build site
-    needs: guard
+    needs: [guard, config]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -205,7 +153,7 @@ jobs:
       # The build command reaches the shell through env and runs as one bash command line. Errexit, nounset
       # and pipefail make any failing part fail the step, so a partial build never uploads.
       - name: Build site
-        if: needs.guard.outputs.analytics == 'none'
+        if: needs.config.outputs.analytics == 'none'
         env:
           BUILD_COMMAND: ${{ inputs.build-command }}
         run: |
@@ -213,7 +161,7 @@ jobs:
           bash -euo pipefail -c "$BUILD_COMMAND"
 
       - name: Build site with analytics
-        if: needs.guard.outputs.analytics == 'cloudflare'
+        if: needs.config.outputs.analytics == 'cloudflare'
         env:
           VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-token }}
           BUILD_COMMAND: ${{ inputs.build-command }}
@@ -225,14 +173,14 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: site
-          path: ${{ needs.guard.outputs.app-location }}
+          path: ${{ needs.config.outputs.app-location }}
           if-no-files-found: error
           retention-days: 1
           overwrite: true
 
   deploy:
     name: Deploy and smoke test
-    needs: [guard, build]
+    needs: [guard, config, build]
     environment: production
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -265,7 +213,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: site
-          path: ${{ needs.guard.outputs.app-location }}
+          path: ${{ needs.config.outputs.app-location }}
 
       - name: Detect api
         id: api
@@ -284,7 +232,7 @@ jobs:
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
           action: upload
-          app_location: ${{ needs.guard.outputs.app-location }}
+          app_location: ${{ needs.config.outputs.app-location }}
           api_location: ${{ steps.api.outputs.location }}
           output_location: ''
           skip_app_build: true

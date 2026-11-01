@@ -12,7 +12,7 @@ import { jobBlock, stepBlock, stepScript } from './workflow-steps.mjs'
 const workflowPath = fileURLToPath(new URL('../../.github/workflows/site-ci.yml', import.meta.url))
 const workflow = () => readFileSync(workflowPath, 'utf8')
 const job = (id) => jobBlock(workflowPath, id)
-const jobIds = ['config', 'checks', 'repo', 'secrets', 'infra', 'e2e', 'audit']
+const jobIds = ['checks', 'repo', 'secrets', 'infra', 'e2e', 'audit']
 const apiSteps = ['Install api', 'Typecheck api', 'Test api']
 const driftStep = 'Site template drift'
 const folders = []
@@ -29,7 +29,10 @@ describe('every job is hardened', () => {
   test('every uses is pinned to a full sha', () => {
     const uses = workflow().match(/^ *(?:- )?uses: .+$/gmu) ?? []
     assert.ok(uses.length > 0)
-    for (const line of uses) assert.match(line, /uses: [\w.-]+\/[\w./-]+@[a-f0-9]{40} # v[\d.]+$/u)
+    for (const line of uses) {
+      if (line.includes('uses: ./')) assert.equal(line.trim(), 'uses: ./.github/workflows/site-config.yml')
+      else assert.match(line, /uses: [\w.-]+\/[\w./-]+@[a-f0-9]{40} # v[\d.]+$/u)
+    }
   })
 
   test('every job runs on the pinned hosted image', () => {

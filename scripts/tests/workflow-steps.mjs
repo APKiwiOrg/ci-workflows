@@ -1,6 +1,7 @@
 // Reads jobs and step scripts out of a workflow file by indentation, so a test can assert on one job and
 // run one step's shell with stubs. Node built-ins only, because this repository has no Node toolchain.
 import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 
 const indent = (line) => line.length - line.trimStart().length
 const blank = (line) => line.trim() === ''
@@ -27,6 +28,13 @@ export function jobBlock(workflowPath, jobId) {
   const header = section.findIndex((line) => indent(line) === depth && line.trim() === `${jobId}:`)
   if (header < 0) throw new Error(`${workflowPath} has no job ${jobId}`)
   return `${children(section, header).join('\n')}\n`
+}
+
+// Follow the same-commit local call to the file that supplies the executable steps.
+export function calledWorkflowPath(workflowPath, jobId) {
+  const relative = jobBlock(workflowPath, jobId).match(/^ {4}uses: (\.\/\.github\/workflows\/[\w-]+\.yml)$/mu)?.[1]
+  if (!relative) throw new Error(`job ${jobId} has no local reusable workflow call`)
+  return resolve(dirname(workflowPath), '../..', relative)
 }
 
 export function stepBlock(workflowPath, jobId, stepName) {

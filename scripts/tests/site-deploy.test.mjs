@@ -129,11 +129,13 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     assert.equal(envExpression('guard', 'ENABLED'), 'inputs.enabled')
   })
 
-  test('successful main-push CI admits the run and the selected SHA feeds both later jobs', () => {
+  test('successful main-push CI admits the run and the selected SHA feeds every later job', () => {
     assert.equal(admitted(context()), true)
     assert.ok(job('guard').includes('sha: ${{ steps.ci.outputs.sha }}'))
-    assert.ok(job('build').includes('needs: guard'))
-    assert.ok(job('deploy').includes('needs: [guard, build]'))
+    assert.ok(job('config').includes('needs: guard'))
+    assert.ok(job('config').includes('checkout-ref: ${{ needs.guard.outputs.sha }}'))
+    assert.ok(job('build').includes('needs: [guard, config]'))
+    assert.ok(job('deploy').includes('needs: [guard, config, build]'))
     assert.ok(job('build').includes('ref: ${{ needs.guard.outputs.sha }}'))
     assert.ok(job('deploy').includes('ref: ${{ needs.guard.outputs.sha }}'))
   })
@@ -205,7 +207,7 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     assert.doesNotMatch(source, /azure\/login|id-token:|skip_api_build|api_language|api_version/iu)
     assert.ok(job('guard').includes('actions: read'))
     const deploy = job('deploy')
-    assert.ok(deploy.includes('app_location: ${{ needs.guard.outputs.app-location }}'))
+    assert.ok(deploy.includes('app_location: ${{ needs.config.outputs.app-location }}'))
     assert.ok(deploy.includes('api_location: ${{ steps.api.outputs.location }}'))
     assert.ok(deploy.includes('skip_app_build: true'))
     assert.ok(deploy.includes('azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}'))
@@ -319,7 +321,7 @@ describe('the build never sees the deploy token', () => {
     assert.equal(envExpression('build', 'VITE_CLOUDFLARE_ANALYTICS_TOKEN'), 'inputs.analytics-token')
     assert.equal(envExpression('build', 'BUILD_COMMAND'), 'inputs.build-command')
     assert.ok(build.indexOf('"$BUILD_COMMAND"') < build.indexOf('actions/upload-artifact@'))
-    assert.match(build, /upload-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ needs\.guard\.outputs\.app-location \}\}\n {10}if-no-files-found: error\n {10}retention-days: 1\n {10}overwrite: true\n/u)
+    assert.match(build, /upload-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ needs\.config\.outputs\.app-location \}\}\n {10}if-no-files-found: error\n {10}retention-days: 1\n {10}overwrite: true\n/u)
   })
 
   test('the build step installs first, then runs the build command from env', () => {
@@ -370,25 +372,25 @@ describe('the build never sees the deploy token', () => {
     assert.ok(deploy.includes('persist-credentials: false'))
     assert.ok(deploy.includes('package-manager-cache: false'))
     assert.doesNotMatch(deploy, /cache: npm/u)
-    assert.match(deploy, /download-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ needs\.guard\.outputs\.app-location \}\}\n/u)
+    assert.match(deploy, /download-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ needs\.config\.outputs\.app-location \}\}\n/u)
     assert.ok(deploy.indexOf('actions/download-artifact@') < deploy.indexOf('Azure/static-web-apps-deploy@'))
   })
 
   test('the deploy job is the only one that reads a secret', () => {
-    for (const id of ['guard', 'build']) assert.doesNotMatch(job(id), /secrets\./u)
+    for (const id of ['guard', 'config', 'build']) assert.doesNotMatch(job(id), /secrets\./u)
     assert.equal(workflow().match(/secrets\./gu)?.length, 2)
     assert.equal(job('deploy').match(/secrets\./gu)?.length, 2)
   })
 
   test('only the job that reads the token runs in the production environment', () => {
     assert.match(job('deploy'), /^ {4}environment: production$/mu)
-    for (const id of ['guard', 'build']) assert.doesNotMatch(job(id), /environment:/u)
+    for (const id of ['guard', 'config', 'build']) assert.doesNotMatch(job(id), /environment:/u)
     assert.equal(workflow().match(/^\s+environment:/gmu)?.length, 1)
   })
 
   test('deploy job is the only job with environment production', () => {
     const ids = workflow().split('\njobs:\n')[1].match(/^ {2}[a-z][\w-]*(?=:$)/gmu).map((id) => id.trim())
-    assert.deepEqual(ids, ['guard', 'build', 'deploy'])
+    assert.deepEqual(ids, ['guard', 'config', 'build', 'deploy'])
     const withProduction = ids.filter((id) => /^ {4}environment: production$/mu.test(job(id)))
     assert.deepEqual(withProduction, ['deploy'])
   })
@@ -399,7 +401,7 @@ describe('the build never sees the deploy token', () => {
     assert.match(workflow(), /\n {4}secrets:\n {6}AZURE_STATIC_WEB_APPS_API_TOKEN:\n(?: {8}.+\n)* {8}required: false\n/u)
     assert.match(caller(), /\n {4}secrets:\n {6}AZURE_STATIC_WEB_APPS_API_TOKEN: \$\{\{ secrets\.AZURE_STATIC_WEB_APPS_API_TOKEN \}\}\n/u)
     assert.doesNotMatch(workflow(), /deploy-token/u)
-    for (const id of ['guard', 'build']) assert.doesNotMatch(job(id), /AZURE_STATIC_WEB_APPS_API_TOKEN/u)
+    for (const id of ['guard', 'config', 'build']) assert.doesNotMatch(job(id), /AZURE_STATIC_WEB_APPS_API_TOKEN/u)
     // The only-reader test above counts both secret references. These assertions name them.
     const deploy = job('deploy')
     assert.ok(deploy.includes('azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}'))

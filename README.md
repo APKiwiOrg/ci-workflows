@@ -179,7 +179,12 @@ Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `analytic
 `VITE_CLOUDFLARE_ANALYTICS_TOKEN` only when analytics is `cloudflare`. The registered site token never
 reaches CI.
 
-Both site workflows run `node scripts/site-config.mjs --github-output` once from the site checkout, before
+Both site workflows call `site-config.yml` through `./.github/workflows/site-config.yml`. GitHub resolves
+this local reusable workflow from the same commit as its calling workflow, so validation stays on the
+site caller's existing pin. Its checkout reads the site repository. The optional `checkout-ref` input
+selects the source commit to read, without changing the validation implementation's ref.
+
+The shared config job runs `node scripts/site-config.mjs --github-output` once from that checkout before
 any install. The CLI validates the config and appends these five `key=value` lines to `$GITHUB_OUTPUT`:
 
 | Key | Required value | Use |
@@ -220,9 +225,10 @@ automatic run deploys the newest such commit on main, so CI finishing out of ord
 behind. A manual run from main deploys the exact full SHA it is given, which is the rollback path. Nothing
 runs unless `enabled` is true.
 
-`guard` selects the SHA with a read-only token, checks it out without persisted credentials and validates
-its site config using `.nvmrc`. Every later job uses those outputs, so a rollback uses the selected commit's
-config. `build` runs `npm ci` and the build command with no secret
+`guard` selects the SHA with a read-only token. `config` passes that SHA to the shared config workflow,
+which checks out the site without persisted credentials and validates its config using `.nvmrc`.
+Build and deploy require both jobs, so a rollback reads the selected commit's source and config while
+validation stays at the shared workflow's pinned commit. `build` runs `npm ci` and the build command with no secret
 and uploads the app folder. `deploy` is the only job in the `production` environment and the only one that
 reads the deploy token. It installs nothing, uploads the built folder with the api folder for Oryx to build,
 then smoke tests the URL the deploy returns.
