@@ -213,9 +213,12 @@ receives the `app-location` folder after the build. It also supplies the npm scr
 `scripts/check-site-template.mjs`, which fails when a template-managed file differs from the lock. A
 repository with no lock prints one skip line instead. `repo` runs every `scripts/tests/*.test.sh` and fails
 when there is none. When an `api/` directory exists, it is an npm package with `typecheck` and `test` scripts.
-Every site supplies e2e and infrastructure checks. The infra job compiles every configured params file,
-then runs `scripts/check-infra.mjs` against the compiled template, including its bandwidth alert policy.
-An absent params file or any compilation failure fails the job. The audit job runs the npm policy check
+Every site supplies e2e and infrastructure checks. The infra job compiles every configured params file
+to a separate indexed JSON file in `/tmp/site-infra/`, a mode 0700 directory. It then runs
+`scripts/check-infra.mjs <compiled-template.json> <compiled-params.json>` once per params file, in config
+order, including the bandwidth alert policy. The checker uses the compiled parameters to skip resources
+that file disables. A missing params file, a compilation failure or a policy failure fails the job and
+names the params file. A failed policy check stops later checks. The audit job runs the npm policy check
 before `npm ci`, then `npm audit --audit-level=high` in the root and, when present, in `api/`.
 
 ## site-deploy

@@ -245,7 +245,7 @@ jobs:
           INFRA_PARAMS: ${{ needs.config.outputs.infra-params }}
         run: |
           node --input-type=module <<'NODE'
-          import { existsSync, statSync } from 'node:fs'
+          import { closeSync, existsSync, openSync, statSync } from 'node:fs'
           import { spawnSync } from 'node:child_process'
           const params = JSON.parse(process.env.INFRA_PARAMS)
           for (const path of params) {
@@ -254,17 +254,42 @@ jobs:
               process.exit(1)
             }
           }
-          for (const path of params) {
-            const result = spawnSync('az', ['bicep', 'build-params', '--file', path, '--stdout'], {
-              stdio: ['ignore', 'ignore', 'inherit'],
-            })
+          for (const [index, path] of params.entries()) {
+            const output = openSync(`/tmp/site-infra/params-${index}.json`, 'w', 0o600)
+            let result
+            try {
+              result = spawnSync('az', ['bicep', 'build-params', '--file', path, '--stdout'], {
+                stdio: ['ignore', output, 'inherit'],
+              })
+            } finally {
+              closeSync(output)
+            }
             if (result.error) console.error(result.error.message)
-            if (result.status !== 0) process.exit(result.status ?? 1)
+            if (result.status !== 0) {
+              console.error(`Infrastructure params compilation failed: ${path}`)
+              process.exit(result.status ?? 1)
+            }
           }
           NODE
 
       - name: Infrastructure policy
-        run: node scripts/check-infra.mjs /tmp/site-infra/main.json
+        env:
+          INFRA_PARAMS: ${{ needs.config.outputs.infra-params }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { spawnSync } from 'node:child_process'
+          const params = JSON.parse(process.env.INFRA_PARAMS)
+          for (const [index, path] of params.entries()) {
+            const result = spawnSync(process.execPath, ['scripts/check-infra.mjs', '/tmp/site-infra/main.json', `/tmp/site-infra/params-${index}.json`], {
+              stdio: 'inherit',
+            })
+            if (result.error) console.error(result.error.message)
+            if (result.status !== 0) {
+              console.error(`Infrastructure policy failed for params file: ${path}`)
+              process.exit(result.status ?? 1)
+            }
+          }
+          NODE
 
   audit:
     name: Dependency audit

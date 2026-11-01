@@ -74,9 +74,10 @@ describe('config controls the site layout', () => {
     const template = step('infra', 'Build template')
     assert.match(template, /BICEP_FILE: \$\{\{ inputs\.bicep-file \}\}/u)
     assert.match(template, /az bicep build --file "\$BICEP_FILE"/u)
-    assert.match(step('infra', 'Build parameters'), /INFRA_PARAMS: \$\{\{ needs\.config\.outputs\.infra-params \}\}/u)
+    for (const name of ['Build parameters', 'Infrastructure policy']) {
+      assert.match(step('infra', name), /INFRA_PARAMS: \$\{\{ needs\.config\.outputs\.infra-params \}\}/u)
+    }
     assert.match(template, /--outfile \/tmp\/site-infra\/main\.json/u)
-    assert.match(job('infra'), /node scripts\/check-infra\.mjs \/tmp\/site-infra\/main\.json/u)
   })
 
   test('the asset budget checks the config app-location through env', () => {

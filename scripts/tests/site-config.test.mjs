@@ -197,12 +197,13 @@ describe('capabilities control the consumer steps', () => {
 
   test('every params file is compiled and a missing or failing one fails the step', () => {
     const folder = fixture()
+    mkdirSync(join(folder, 'compiled'))
     mkdirSync(join(folder, 'infra/params'), { recursive: true })
     for (const name of ['site', 'preview']) writeFileSync(join(folder, `infra/params/${name}.bicepparam`), '')
     writeFileSync(join(folder, 'az'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$PARAMS_LOG"\nif [ "$4" = "${AZ_FAIL_FILE:-}" ]; then exit 3; fi\n', { mode: 0o700 })
     const log = join(folder, 'params-log')
     const env = { INFRA_PARAMS: values['infra-params'], PATH: `${folder}:${process.env.PATH}`, PARAMS_LOG: log }
-    const script = stepScript(ciPath, 'infra', 'Build parameters')
+    const script = stepScript(ciPath, 'infra', 'Build parameters').replaceAll('/tmp/site-infra', join(folder, 'compiled'))
     const result = run(folder, script, env)
     assert.equal(result.status, 0, result.stderr)
     assert.equal(readFileSync(log, 'utf8'), 'bicep build-params --file infra/params/site.bicepparam --stdout\nbicep build-params --file infra/params/preview.bicepparam --stdout\n')
