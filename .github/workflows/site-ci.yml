@@ -3,8 +3,8 @@ name: site-ci
 # The shared CI for every site. A site calls it from a small caller of its own (see README.md) named CI in
 # .github/workflows/ci.yml, whose successful main-push runs are what site-deploy.yml accepts.
 #
-# checks, repo and secrets always run. The api steps run only while has-api is true, the infra job only while
-# has-infra is true and the e2e job only while has-e2e is true.
+# Config validation gates every job. The site capabilities select the theme and analytics checks.
+# The api steps run when the checkout has an api directory. Infrastructure and e2e are required.
 #
 # Inputs reach scripts only through env, never by expression interpolation into a run line.
 
@@ -12,57 +12,97 @@ on:
   workflow_call:
     inputs:
       node-version-file:
-        description: File naming the Node version every job installs
+        description: File naming the Node version jobs after config validation install
         required: false
         default: .nvmrc
         type: string
-      has-api:
-        description: Install, typecheck and test the api package
-        required: false
-        default: true
-        type: boolean
-      has-e2e:
-        description: Run the end-to-end smoke after the checks pass
-        required: false
-        default: true
-        type: boolean
-      has-infra:
-        description: Compile the Bicep template and parameters and check the infrastructure policy
-        required: false
-        default: true
-        type: boolean
       analytics-test-token:
-        description: Fixture Cloudflare Web Analytics token every build and test sees
+        description: Fixture Cloudflare Web Analytics token for cloudflare builds and tests
         required: false
         default: '00000000000000000000000000000000'
-        type: string
-      app-location:
-        description: Built static site folder the asset budget checks
-        required: false
-        default: build/client
         type: string
       bicep-file:
         description: Bicep template the infra job compiles
         required: false
         default: infra/main.bicep
         type: string
-      bicep-params:
-        description: Bicep parameters file the infra job compiles
-        required: false
-        default: infra/params/site.bicepparam
-        type: string
 
-permissions:
-  contents: read
-
-env:
-  # Browser fixtures intercept telemetry locally. Never use the registered site token in CI.
-  VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-test-token }}
+permissions: {}
 
 jobs:
+  config:
+    name: Validate site config
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      app-location: ${{ steps.config.outputs.app-location }}
+      has-form: ${{ steps.config.outputs.has-form }}
+      has-theme: ${{ steps.config.outputs.has-theme }}
+      analytics: ${{ steps.config.outputs.analytics }}
+      infra-params: ${{ steps.config.outputs.infra-params }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Read site config
+        id: config
+        run: |
+          set -eu
+          if [ ! -f scripts/site-config.mjs ]; then
+            echo "Missing scripts/site-config.mjs. Site config is required." >&2
+            exit 1
+          fi
+          node scripts/site-config.mjs --github-output
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+          const fail = (reason) => {
+            console.error(`Invalid site config output: ${reason}`)
+            process.exit(1)
+          }
+          const outputs = new Map()
+          for (const line of readFileSync(process.env.GITHUB_OUTPUT, 'utf8').split('\n')) {
+            if (line === '') continue
+            const match = /^([a-z][a-z-]*)=(.*)$/u.exec(line)
+            if (!match) fail('expected key=value lines')
+            if (outputs.has(match[1])) fail(`duplicate ${match[1]}`)
+            outputs.set(match[1], match[2])
+          }
+          for (const [key, allowed] of Object.entries({
+            'app-location': ['build/client', 'out'],
+            'has-form': ['true', 'false'],
+            'has-theme': ['true', 'false'],
+            analytics: ['cloudflare', 'none'],
+          })) {
+            if (!allowed.includes(outputs.get(key))) fail(`${key} must be one of ${allowed.join(', ')}`)
+          }
+          const raw = outputs.get('infra-params')
+          let params
+          try {
+            params = JSON.parse(raw)
+          } catch {
+            fail('infra-params must be a compact JSON array of repo-relative params paths')
+          }
+          if (!Array.isArray(params) || params.length === 0 || JSON.stringify(params) !== raw ||
+              !params.every((path) => typeof path === 'string' && path.endsWith('.bicepparam') &&
+                !/[\u0000-\u001f\u007f\\:]/u.test(path) &&
+                path.split('/').every((part) => part !== '' && part !== '.' && part !== '..'))) {
+            fail('infra-params must be a nonempty compact JSON array of repo-relative .bicepparam paths')
+          }
+          NODE
+
   checks:
+    needs: config
     name: Lint, typecheck, test and build
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,8 +121,10 @@ jobs:
 
       # Before lint, because the api files are linted with their own types.
       - name: Install api
-        if: inputs.has-api
-        run: npm ci --prefix api
+        run: |
+          if [ -d api ]; then
+            npm ci --prefix api
+          fi
 
       - name: Lint
         run: npm run lint
@@ -91,30 +133,48 @@ jobs:
         run: npm run typecheck
 
       - name: Typecheck api
-        if: inputs.has-api
-        run: npm run typecheck --prefix api
+        run: |
+          if [ -d api ]; then
+            npm run typecheck --prefix api
+          fi
 
       - name: Test
+        env:
+          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ needs.config.outputs.analytics == 'cloudflare' && inputs.analytics-test-token || '' }}
         run: npm test
 
       - name: Test api
-        if: inputs.has-api
-        run: npm test --prefix api
+        run: |
+          if [ -d api ]; then
+            npm test --prefix api
+          fi
 
       - name: Theme conventions
+        if: needs.config.outputs.has-theme == 'true'
         run: npm run check:theme
 
       - name: Build
+        if: needs.config.outputs.analytics == 'none'
+        run: npm run build
+
+      # Browser fixtures intercept telemetry locally. Use only the fixture token in CI.
+      - name: Build with analytics
+        if: needs.config.outputs.analytics == 'cloudflare'
+        env:
+          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-test-token }}
         run: npm run build
 
       - name: Asset budget
         env:
-          APP_LOCATION: ${{ inputs.app-location }}
+          APP_LOCATION: ${{ needs.config.outputs.app-location }}
         run: node scripts/check-assets.mjs "$APP_LOCATION"
 
   repo:
+    needs: config
     name: Repository conventions
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -154,10 +214,11 @@ jobs:
           done
 
   e2e:
+    needs: [config, checks]
     name: End-to-end smoke
-    needs: checks
-    if: inputs.has-e2e
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -175,17 +236,30 @@ jobs:
         run: npm ci
 
       - name: Build
+        if: needs.config.outputs.analytics == 'none'
+        run: npm run build
+
+      # Browser fixtures intercept telemetry locally. Use only the fixture token in CI.
+      - name: Build with analytics
+        if: needs.config.outputs.analytics == 'cloudflare'
+        env:
+          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-test-token }}
         run: npm run build
 
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
 
       - name: End-to-end tests
+        env:
+          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ needs.config.outputs.analytics == 'cloudflare' && inputs.analytics-test-token || '' }}
         run: npm run test:e2e
 
   secrets:
+    needs: config
     name: Secret scan
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
     env:
       GITLEAKS_VERSION: 8.30.1
       # From the release's gitleaks_8.30.1_checksums.txt. Update both together.
@@ -205,9 +279,11 @@ jobs:
           rm gitleaks gitleaks.tar.gz
 
   infra:
+    needs: config
     name: Compile Bicep
-    if: inputs.has-infra
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -227,8 +303,54 @@ jobs:
 
       - name: Build parameters
         env:
-          BICEP_PARAMS: ${{ inputs.bicep-params }}
-        run: az bicep build-params --file "$BICEP_PARAMS" --stdout >/dev/null
+          INFRA_PARAMS: ${{ needs.config.outputs.infra-params }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { existsSync, statSync } from 'node:fs'
+          import { spawnSync } from 'node:child_process'
+          const params = JSON.parse(process.env.INFRA_PARAMS)
+          for (const path of params) {
+            if (!existsSync(path) || !statSync(path).isFile()) {
+              console.error(`Missing infrastructure params file: ${path}`)
+              process.exit(1)
+            }
+          }
+          for (const path of params) {
+            const result = spawnSync('az', ['bicep', 'build-params', '--file', path, '--stdout'], {
+              stdio: ['ignore', 'ignore', 'inherit'],
+            })
+            if (result.error) console.error(result.error.message)
+            if (result.status !== 0) process.exit(result.status ?? 1)
+          }
+          NODE
 
       - name: Infrastructure policy
         run: node scripts/check-infra.mjs /tmp/site-infra/main.json
+
+  audit:
+    name: Dependency audit
+    needs: config
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: npm install policy
+        run: node scripts/check-npm-policy.mjs
+
+      - name: Install and audit
+        run: |
+          npm ci
+          npm audit --audit-level=high
+          if [ -d api ]; then
+            npm ci --prefix api
+            npm audit --audit-level=high --prefix api
+          fi

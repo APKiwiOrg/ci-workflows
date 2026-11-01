@@ -147,7 +147,8 @@ selected tests. Check the retained TRX count before treating a run as evidence.
 
 ## site-ci
 
-Runs a site's CI. `checks` lints, typechecks, tests and builds, then holds the build to the asset budget.
+Runs a site's CI. `config` validates the site config before any install. `checks` lints, typechecks, tests
+and builds, then holds the build to the asset budget. `audit` installs and audits the root and any api package.
 `repo` runs the repository convention checks, the site template drift check and the shell script tests.
 `secrets` scans every commit with a checksum-verified gitleaks. `infra` compiles the Bicep template and
 parameters and checks the infrastructure policy. `e2e` builds and runs the browser smoke after `checks`
@@ -172,22 +173,45 @@ jobs:
 GitHub names a called job `<caller job> / <job name>`, for example `ci / Lint, typecheck, test and build`, so
 a ruleset that requires checks by their old names needs updating when a site moves to this caller.
 
-Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `has-api` (true), `has-e2e` (true),
-`has-infra` (true), `analytics-test-token` (`00000000000000000000000000000000`), `bicep-file`
-(`infra/main.bicep`), `bicep-params` (`infra/params/site.bicepparam`) and `app-location` (`build/client`).
-`has-api: false` skips the api install, typecheck and test steps. `has-e2e: false` and `has-infra: false`
-skip those jobs. Every build and test sees the analytics test token as `VITE_CLOUDFLARE_ANALYTICS_TOKEN`, so
-the registered site token never reaches CI.
+Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `analytics-test-token`
+(`00000000000000000000000000000000`) and `bicep-file` (`infra/main.bicep`). The config job always uses
+`.nvmrc`. The version input applies to later jobs. Builds and tests receive the fixture token as
+`VITE_CLOUDFLARE_ANALYTICS_TOKEN` only when analytics is `cloudflare`. The registered site token never
+reaches CI.
+
+Both site workflows run `node scripts/site-config.mjs --github-output` once from the site checkout, before
+any install. The CLI validates the config and appends these five `key=value` lines to `$GITHUB_OUTPUT`:
+
+| Key | Required value | Use |
+| --- | --- | --- |
+| `app-location` | `build/client` or `out` | Asset budget, artifact upload and deployment folder |
+| `has-form` | `true` or `false` | Exposed capability, independent of the api directory |
+| `has-theme` | `true` or `false` | Run the theme check only when true |
+| `analytics` | `cloudflare` or `none` | Pass a build token only for cloudflare |
+| `infra-params` | Compact JSON array such as `["infra/params/site.bicepparam"]` | Compile every params file |
+
+The workflows reject a missing CLI, a failed CLI, missing or duplicate keys and invalid values. The params
+array must be nonempty and contain repo-relative `.bicepparam` paths without empty, `.` or `..` segments.
+Absolute paths, backslashes and control characters are refused. Every listed params file must exist.
+There are no default capabilities or output folders.
+
+This is a breaking caller contract. The `app-location`, `has-api`, `has-e2e`, `has-infra` and `bicep-params`
+inputs have been removed. The deploy workflow also removes `api-location`, since the checkout determines
+whether `api/` exists. Existing callers keep their old SHA pin until the template provides the CLI contract,
+removes those inputs and re-pins them in a later task. Update the template and its synced callers together.
 
 The calling repository supplies `scripts/check-npm-policy.mjs` and `scripts/check-assets.mjs`, which
 receives the `app-location` folder after the build. It also supplies the npm scripts `lint`, `typecheck`,
-`test`, `check:theme`, `build` and `test:e2e`, and the convention checks `scripts/check-dashes.sh`,
+`test`, `build` and `test:e2e`, plus `check:theme` when `has-theme` is true, and the convention checks `scripts/check-dashes.sh`,
 `scripts/check-prose.sh`, `scripts/check-scratch.sh` and `scripts/check-agent-instructions.sh`, each run with
 `--tree`. A site made from APKiwiOrg/site-template carries `site-template.lock.json`, and `repo` then runs its
 `scripts/check-site-template.mjs`, which fails when a template-managed file differs from the lock. A
 repository with no lock prints one skip line instead. `repo` runs every `scripts/tests/*.test.sh` and fails
-when there is none. With `has-api` the `api` folder is an npm package with `typecheck` and `test` scripts.
-With `has-infra` the repository supplies `scripts/check-infra.mjs`, which receives the compiled template.
+when there is none. When an `api/` directory exists, it is an npm package with `typecheck` and `test` scripts.
+Every site supplies e2e and infrastructure checks. The infra job compiles every configured params file,
+then runs `scripts/check-infra.mjs` against the compiled template, including its bandwidth alert policy.
+An absent params file or any compilation failure fails the job. The audit job runs the npm policy check
+before `npm ci`, then `npm audit --audit-level=high` in the root and, when present, in `api/`.
 
 ## site-deploy
 
@@ -196,7 +220,9 @@ automatic run deploys the newest such commit on main, so CI finishing out of ord
 behind. A manual run from main deploys the exact full SHA it is given, which is the rollback path. Nothing
 runs unless `enabled` is true.
 
-`guard` selects the SHA with a read-only token. `build` runs `npm ci` and the build command with no secret
+`guard` selects the SHA with a read-only token, checks it out without persisted credentials and validates
+its site config using `.nvmrc`. Every later job uses those outputs, so a rollback uses the selected commit's
+config. `build` runs `npm ci` and the build command with no secret
 and uploads the app folder. `deploy` is the only job in the `production` environment and the only one that
 reads the deploy token. It installs nothing, uploads the built folder with the api folder for Oryx to build,
 then smoke tests the URL the deploy returns.
@@ -242,10 +268,13 @@ The calling repository supplies `.github/workflows/ci.yml` named `CI`, whose suc
 the verification, `scripts/check-npm-policy.mjs`, which runs before `npm ci`, and `scripts/smoke-site.mjs`,
 which receives the deployed URL.
 
-Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `app-location` (`build/client`),
-`api-location` (`api`), `build-command` (`npm run build`) and `analytics-token` (empty). The build command
-runs as one bash command line after `npm ci`, with the analytics token in `VITE_CLOUDFLARE_ANALYTICS_TOKEN`.
+Optional inputs and their defaults are `dispatch-sha` (empty), `node-version-file` (`.nvmrc`),
+`build-command` (`npm run build`) and `analytics-token` (empty). The required `enabled` input gates all work.
+The build command runs as one bash command line after `npm ci`. Only `analytics: cloudflare` passes the
+analytics token in `VITE_CLOUDFLARE_ANALYTICS_TOKEN`. With `none`, the build receives no analytics token.
 It runs under `bash -euo pipefail`, so any failing command in it fails the build and nothing uploads.
+The validated `app-location` selects the artifact and deploy folder. Oryx builds `api/` only when that
+directory exists. The CLI contract and removed inputs are documented in the site-ci section above.
 
 ## site-live-throttle-check
 

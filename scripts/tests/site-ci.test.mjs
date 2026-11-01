@@ -1,5 +1,4 @@
-// Checks site-ci.yml statically: the hardening every job keeps and the inputs that switch the optional work.
-// A static test cannot watch GitHub skip a job, so a switch is proven by the if that reads its input.
+// Checks site-ci.yml hardening and the wiring from validated config to each consumer job.
 // The template drift step is run for real against a stub checker.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
@@ -8,24 +7,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { jobBlock, stepScript } from './workflow-steps.mjs'
+import { jobBlock, stepBlock, stepScript } from './workflow-steps.mjs'
 
 const workflowPath = fileURLToPath(new URL('../../.github/workflows/site-ci.yml', import.meta.url))
 const workflow = () => readFileSync(workflowPath, 'utf8')
 const job = (id) => jobBlock(workflowPath, id)
-const jobIds = ['checks', 'repo', 'secrets', 'infra', 'e2e']
+const jobIds = ['config', 'checks', 'repo', 'secrets', 'infra', 'e2e', 'audit']
 const apiSteps = ['Install api', 'Typecheck api', 'Test api']
 const driftStep = 'Site template drift'
 const folders = []
 
-// The lines of one step, from its "- name:" line to the next step.
-function step(jobId, name) {
-  const block = job(jobId)
-  const start = block.indexOf(`- name: ${name}\n`)
-  assert.ok(start >= 0, `job ${jobId} has step ${name}`)
-  const next = block.indexOf('\n      - ', start)
-  return next < 0 ? block.slice(start) : block.slice(start, next + 1)
-}
+const step = (jobId, name) => stepBlock(workflowPath, jobId, name)
 
 describe('every job is hardened', () => {
   test('every checkout sets persist-credentials false', () => {
@@ -56,74 +48,46 @@ describe('every job is hardened', () => {
   })
 })
 
-describe('inputs switch the optional work', () => {
-  test('the e2e job if references inputs.has-e2e', () => {
-    assert.match(job('e2e'), /^ {4}if: inputs\.has-e2e$/mu)
+describe('config controls the site layout', () => {
+  test('every api step checks for the api directory', () => {
+    for (const name of apiSteps) assert.match(step('checks', name), /if \[ -d api \]/u)
+    assert.doesNotMatch(workflow(), /inputs\.has-api/u)
   })
 
-  test('the infra job if references inputs.has-infra', () => {
-    assert.match(job('infra'), /^ {4}if: inputs\.has-infra$/mu)
+  test('e2e and infra are required after config validation', () => {
+    for (const id of ['e2e', 'infra']) assert.doesNotMatch(job(id), /^ {4}if:/mu)
   })
 
-  test('the api steps if references inputs.has-api', () => {
-    for (const name of apiSteps) assert.match(step('checks', name), /^ {8}if: inputs\.has-api$/mu)
-    const gated = job('checks').match(/inputs\.has-api/gu) ?? []
-    assert.equal(gated.length, apiSteps.length)
+  test('the checks and browser tests receive a token only for cloudflare', () => {
+    assert.doesNotMatch(workflow(), /^env:/mu)
+    for (const id of ['checks', 'e2e']) {
+      assert.match(step(id, 'Build with analytics'), /if: needs\.config\.outputs\.analytics == 'cloudflare'/u)
+      assert.match(step(id, 'Build with analytics'), /VITE_CLOUDFLARE_ANALYTICS_TOKEN: \$\{\{ inputs\.analytics-test-token \}\}/u)
+      assert.match(step(id, 'Build'), /if: needs\.config\.outputs\.analytics == 'none'/u)
+    }
   })
 
-  test('the core jobs always run', () => {
-    for (const id of ['checks', 'repo', 'secrets']) assert.doesNotMatch(job(id), /^ {4}if:/mu)
-  })
-
-  test('the build step passes analytics-test-token as VITE_CLOUDFLARE_ANALYTICS_TOKEN', () => {
-    // Workflow-level env, so the build, the unit tests and the browser smoke all see the fixture token.
-    assert.match(workflow(), /^env:\n(?: {2}#.*\n)* {2}VITE_CLOUDFLARE_ANALYTICS_TOKEN: \$\{\{ inputs\.analytics-test-token \}\}$/mu)
-    assert.equal(workflow().match(/VITE_CLOUDFLARE_ANALYTICS_TOKEN/gu)?.length, 1)
-    assert.match(step('checks', 'Build'), /run: npm run build/u)
-    assert.match(step('e2e', 'Build'), /run: npm run build/u)
-  })
-
-  test('the infra job compiles the bicep inputs through env', () => {
+  test('the infra job compiles the template input and all config params through env', () => {
     const template = step('infra', 'Build template')
     assert.match(template, /BICEP_FILE: \$\{\{ inputs\.bicep-file \}\}/u)
     assert.match(template, /az bicep build --file "\$BICEP_FILE"/u)
-    const params = step('infra', 'Build parameters')
-    assert.match(params, /BICEP_PARAMS: \$\{\{ inputs\.bicep-params \}\}/u)
-    assert.match(params, /az bicep build-params --file "\$BICEP_PARAMS"/u)
+    assert.match(step('infra', 'Build parameters'), /INFRA_PARAMS: \$\{\{ needs\.config\.outputs\.infra-params \}\}/u)
+    assert.match(template, /--outfile \/tmp\/site-infra\/main\.json/u)
+    assert.match(job('infra'), /node scripts\/check-infra\.mjs \/tmp\/site-infra\/main\.json/u)
   })
 
-  test('the asset budget checks the app-location folder through env', () => {
+  test('the asset budget checks the config app-location through env', () => {
     const budget = step('checks', 'Asset budget')
-    assert.match(budget, /^ {10}APP_LOCATION: \$\{\{ inputs\.app-location \}\}$/mu)
+    assert.match(budget, /APP_LOCATION: \$\{\{ needs\.config\.outputs\.app-location \}\}/u)
     assert.match(budget, /run: node scripts\/check-assets\.mjs "\$APP_LOCATION"$/mu)
-    assert.doesNotMatch(workflow(), /check-assets\.mjs build\/client/u)
   })
 
-  test('the infra job compiles into a scratch folder named for no one site', () => {
-    const infra = job('infra')
-    assert.doesNotMatch(workflow(), /web-website/u)
-    assert.match(step('infra', 'Build template'), /--outfile \/tmp\/site-infra\/main\.json/u)
-    assert.match(infra, /node scripts\/check-infra\.mjs \/tmp\/site-infra\/main\.json/u)
-  })
-
-  test('the inputs default to the APKiwi web layout', () => {
-    const defaults = {
-      'node-version-file': ['.nvmrc', 'string'],
-      'app-location': ['build/client', 'string'],
-      'has-api': ['true', 'boolean'],
-      'has-e2e': ['true', 'boolean'],
-      'has-infra': ['true', 'boolean'],
-      'analytics-test-token': ["'00000000000000000000000000000000'", 'string'],
-      'bicep-file': ['infra/main.bicep', 'string'],
-      'bicep-params': ['infra/params/site.bicepparam', 'string'],
-    }
-    for (const [name, [value, type]] of Object.entries(defaults)) {
-      const input = workflow().match(new RegExp(`^ {6}${name}:\\n((?: {8}.+\\n)+)`, 'mu'))?.[1]
-      assert.ok(input, `workflow_call declares ${name}`)
-      assert.match(input, new RegExp(`^ {8}default: ${value.replace(/\./gu, '\\.')}$`, 'mu'))
-      assert.match(input, new RegExp(`^ {8}type: ${type}$`, 'mu'))
-    }
-    for (const id of ['checks', 'repo', 'infra', 'e2e']) {
+  test('only operational inputs remain', () => {
+    const inputs = workflow().split('    inputs:\n')[1].split('\npermissions:')[0]
+    assert.deepEqual(inputs.match(/^ {6}[a-z-]+:/gmu)?.map((line) => line.trim()), [
+      'node-version-file:', 'analytics-test-token:', 'bicep-file:',
+    ])
+    for (const id of ['checks', 'repo', 'infra', 'e2e', 'audit']) {
       assert.match(job(id), /node-version-file: \$\{\{ inputs\.node-version-file \}\}/u)
     }
   })

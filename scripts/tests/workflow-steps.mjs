@@ -29,6 +29,13 @@ export function jobBlock(workflowPath, jobId) {
   return `${children(section, header).join('\n')}\n`
 }
 
+export function stepBlock(workflowPath, jobId, stepName) {
+  const lines = jobBlock(workflowPath, jobId).split('\n')
+  const start = lines.findIndex((line) => line.trim() === `- name: ${stepName}`)
+  if (start < 0) throw new Error(`job ${jobId} has no step ${stepName}`)
+  return `${children(lines, start).join('\n')}\n`
+}
+
 // The run: | script of the named step in one job, dedented to column zero.
 export function stepScript(workflowPath, jobId, stepName) {
   const lines = jobBlock(workflowPath, jobId).split('\n')

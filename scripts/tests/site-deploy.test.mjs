@@ -205,8 +205,8 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     assert.doesNotMatch(source, /azure\/login|id-token:|skip_api_build|api_language|api_version/iu)
     assert.ok(job('guard').includes('actions: read'))
     const deploy = job('deploy')
-    assert.ok(deploy.includes('app_location: ${{ inputs.app-location }}'))
-    assert.ok(deploy.includes('api_location: ${{ inputs.api-location }}'))
+    assert.ok(deploy.includes('app_location: ${{ needs.guard.outputs.app-location }}'))
+    assert.ok(deploy.includes('api_location: ${{ steps.api.outputs.location }}'))
     assert.ok(deploy.includes('skip_app_build: true'))
     assert.ok(deploy.includes('azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}'))
     assert.ok(deploy.includes('SITE_URL: ${{ steps.deploy.outputs.static_web_app_url }}'))
@@ -319,40 +319,47 @@ describe('the build never sees the deploy token', () => {
     assert.equal(envExpression('build', 'VITE_CLOUDFLARE_ANALYTICS_TOKEN'), 'inputs.analytics-token')
     assert.equal(envExpression('build', 'BUILD_COMMAND'), 'inputs.build-command')
     assert.ok(build.indexOf('"$BUILD_COMMAND"') < build.indexOf('actions/upload-artifact@'))
-    assert.match(build, /upload-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ inputs\.app-location \}\}\n {10}if-no-files-found: error\n {10}retention-days: 1\n {10}overwrite: true\n/u)
+    assert.match(build, /upload-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ needs\.guard\.outputs\.app-location \}\}\n {10}if-no-files-found: error\n {10}retention-days: 1\n {10}overwrite: true\n/u)
   })
 
   test('the build step installs first, then runs the build command from env', () => {
-    const env = { BUILD_COMMAND: 'npm run build', VITE_CLOUDFLARE_ANALYTICS_TOKEN: 'public-token' }
+    const env = { BUILD_COMMAND: 'npm run build' }
     const result = runStep('build', 'Build site', env)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.log, 'npm ci token=public-token\nnpm run build token=public-token\n')
+    assert.equal(result.log, 'npm ci token=\nnpm run build token=\n')
     const custom = runStep('build', 'Build site', { ...env, BUILD_COMMAND: 'npm run build:site -- --mode "a b"' })
     assert.equal(custom.status, 0, custom.stderr)
-    assert.equal(custom.log, 'npm ci token=public-token\nnpm run build:site -- --mode a b token=public-token\n')
+    assert.equal(custom.log, 'npm ci token=\nnpm run build:site -- --mode a b token=\n')
     const failedInstall = runStep('build', 'Build site', { ...env, TEST_NPM_EXIT: '1' })
     assert.notEqual(failedInstall.status, 0)
-    assert.equal(failedInstall.log, 'npm ci token=public-token\n')
+    assert.equal(failedInstall.log, 'npm ci token=\n')
+    const analytics = runStep('build', 'Build site with analytics', {
+      ...env, VITE_CLOUDFLARE_ANALYTICS_TOKEN: 'fixture-analytics',
+    })
+    assert.equal(analytics.status, 0, analytics.stderr)
+    assert.equal(analytics.log, 'npm ci token=fixture-analytics\nnpm run build token=fixture-analytics\n')
   })
 
   for (const command of ['false; npm run after', 'false | cat; npm run after', 'echo "$UNSET_NAME"; npm run after']) {
     test(`a build command that fails part way fails the step: ${command}`, () => {
-      const env = { BUILD_COMMAND: command, VITE_CLOUDFLARE_ANALYTICS_TOKEN: 'public-token' }
+      const env = { BUILD_COMMAND: command }
       const result = runStep('build', 'Build site', env)
       assert.notEqual(result.status, 0)
-      assert.equal(result.log, 'npm ci token=public-token\n')
+      assert.equal(result.log, 'npm ci token=\n')
     })
   }
 
-  test('the inputs default to the APKiwi web layout', () => {
+  test('only operational inputs remain', () => {
     const source = workflow()
     const defaults = {
-      'dispatch-sha': "''", 'node-version-file': '.nvmrc', 'app-location': 'build/client',
-      'api-location': 'api', 'build-command': 'npm run build', 'analytics-token': "''",
+      'dispatch-sha': "''", 'node-version-file': '.nvmrc',
+      'build-command': 'npm run build', 'analytics-token': "''",
     }
     for (const [name, value] of Object.entries(defaults)) {
       assert.match(source, new RegExp(`\\n {6}${name}:\\n(?: {8}.+\\n)* {8}default: ${value.replace(/\./gu, '\\.')}\\n`, 'u'), name)
     }
+    const inputs = source.split('    inputs:\n')[1].split('    secrets:')[0]
+    assert.doesNotMatch(inputs, /\n {6}(?:app-location|api-location|has-api|has-e2e|has-infra|bicep-params):/u)
     assert.match(source, /\n {6}enabled:\n(?: {8}.+\n)* {8}required: true\n/u)
     assert.match(source, /\n {6}enabled:\n(?: {8}.+\n)* {8}type: boolean\n/u)
   })
@@ -363,7 +370,7 @@ describe('the build never sees the deploy token', () => {
     assert.ok(deploy.includes('persist-credentials: false'))
     assert.ok(deploy.includes('package-manager-cache: false'))
     assert.doesNotMatch(deploy, /cache: npm/u)
-    assert.match(deploy, /download-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ inputs\.app-location \}\}\n/u)
+    assert.match(deploy, /download-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ needs\.guard\.outputs\.app-location \}\}\n/u)
     assert.ok(deploy.indexOf('actions/download-artifact@') < deploy.indexOf('Azure/static-web-apps-deploy@'))
   })
 
