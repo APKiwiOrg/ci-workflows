@@ -2,7 +2,7 @@
 // The template drift step is run for real against a stub checker.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
@@ -73,17 +73,14 @@ describe('config controls the site layout', () => {
   test('the infra job compiles the template input and all config params through env', () => {
     const template = step('infra', 'Build template')
     assert.match(template, /BICEP_FILE: \$\{\{ inputs\.bicep-file \}\}/u)
-    assert.match(template, /az bicep build --file "\$BICEP_FILE"/u)
     for (const name of ['Build parameters', 'Infrastructure policy']) {
       assert.match(step('infra', name), /INFRA_PARAMS: \$\{\{ needs\.config\.outputs\.infra-params \}\}/u)
     }
-    assert.match(template, /--outfile \/tmp\/site-infra\/main\.json/u)
   })
 
   test('the asset budget checks the config app-location through env', () => {
     const budget = step('checks', 'Asset budget')
     assert.match(budget, /APP_LOCATION: \$\{\{ needs\.config\.outputs\.app-location \}\}/u)
-    assert.match(budget, /run: node scripts\/check-assets\.mjs "\$APP_LOCATION"$/mu)
   })
 
   test('only operational inputs remain', () => {
@@ -135,3 +132,37 @@ describe('the repo job fails on template drift', () => {
     assert.equal(result.stderr, '')
   })
 })
+
+function runBudget(path, symlink = false) {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'ciwf-assets-')))
+  folders.push(base)
+  const folder = join(base, 'checkout')
+  mkdirSync(join(folder, 'scripts'), { recursive: true })
+  const target = symlink ? join(base, 'outside') : join(folder, path)
+  mkdirSync(target, { recursive: true })
+  if (symlink) symlinkSync(target, join(folder, path))
+  writeFileSync(join(folder, 'scripts/check-assets.mjs'), 'console.log(JSON.stringify(process.argv.slice(2)))\n')
+  const inline = step('checks', 'Asset budget').match(/^ {8}run: ([^|\n].*)$/mu)?.[1]
+  const script = inline ?? stepScript(workflowPath, 'checks', 'Asset budget')
+  const result = spawnSync('bash', ['-e', '-c', script], {
+    cwd: folder, encoding: 'utf8', env: { PATH: process.env.PATH, APP_LOCATION: path },
+  })
+  return { ...result, folder }
+}
+
+for (const path of ['out', 'build/client', '-assets', 'built assets']) {
+  test(`the asset checker receives an absolute single argument for ${path}`, () => {
+    const result = runBudget(path)
+    assert.equal(result.status, 0, result.stderr)
+    assert.deepEqual(JSON.parse(result.stdout), [join(result.folder, path)])
+  })
+}
+
+for (const path of ['../outside', '../checkout-sibling/outside', 'linked']) {
+  test(`the asset checker refuses a checkout escape through ${path}`, () => {
+    const result = runBudget(path, path === 'linked')
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /outside.*checkout/iu)
+    assert.equal(result.stdout, '')
+  })
+}

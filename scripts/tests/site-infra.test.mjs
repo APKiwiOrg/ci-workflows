@@ -1,7 +1,7 @@
 // Run the infra steps with a local compiler and checker to verify their file and process boundaries.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
@@ -15,26 +15,38 @@ const secondary = 'infra/params/secondary/settings.bicepparam'
 const third = 'infra/params/third/settings.bicepparam'
 
 function runInfra(paths = ['infra/params/site.bicepparam'], options = {}) {
-  const folder = mkdtempSync(join(tmpdir(), 'ciwf-infra-'))
-  folders.push(folder)
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'ciwf-infra-')))
+  folders.push(base)
+  const folder = join(base, 'checkout')
+  mkdirSync(folder)
   const compiled = join(folder, 'compiled')
   const log = join(folder, 'calls.jsonl')
   mkdirSync(join(folder, 'scripts'))
   writeFileSync(log, '')
+  const template = options.template ?? 'infra/main.bicep'
+  mkdirSync(dirname(join(folder, template)), { recursive: true })
+  writeFileSync(join(folder, template), '')
   for (const [index, path] of paths.entries()) {
     if (path === options.missing) continue
     mkdirSync(dirname(join(folder, path)), { recursive: true })
-    writeFileSync(join(folder, path), JSON.stringify({ parameters: { fixture: { value: index } } }))
+    const target = path === options.symlink ? join(base, 'outside.bicepparam') : join(folder, path)
+    writeFileSync(target, JSON.stringify({ parameters: { fixture: { value: index } } }))
+    if (path === options.symlink) symlinkSync(target, join(folder, path))
   }
   writeFileSync(join(folder, 'az'), `#!/usr/bin/env node
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 const args = process.argv.slice(2)
 if (args[0] !== 'bicep') process.exit(2)
+const path = args[args.indexOf('--file') + 1]
+if (!path || path.startsWith('-')) {
+  console.error('--file: expected one argument')
+  process.exit(2)
+}
 if (args[1] === 'build') {
+  appendFileSync(process.env.INFRA_LOG, JSON.stringify({ kind: 'template', args }) + '\\n')
   writeFileSync(args[args.indexOf('--outfile') + 1], JSON.stringify({ resources: [] }))
 } else if (args[1] === 'build-params') {
   appendFileSync(process.env.INFRA_LOG, JSON.stringify({ kind: 'compile', args }) + '\\n')
-  const path = args[args.indexOf('--file') + 1]
   if (path === process.env.COMPILE_FAIL) process.exit(3)
   process.stdout.write(readFileSync(path))
 } else process.exit(2)
@@ -55,15 +67,15 @@ if (String(parameters.parameters.fixture.value) === process.env.POLICY_FAIL) pro
     result = spawnSync('bash', ['-e', '-c', script], {
       cwd: folder, encoding: 'utf8',
       env: {
-        PATH: `${folder}:${process.env.PATH}`, BICEP_FILE: 'infra/main.bicep',
+        PATH: `${folder}:${process.env.PATH}`, BICEP_FILE: template,
         INFRA_PARAMS: JSON.stringify(paths), INFRA_LOG: log,
-        COMPILE_FAIL: options.compileFail ?? '', POLICY_FAIL: String(options.policyFail ?? ''),
+        COMPILE_FAIL: options.compileFail ? join(folder, options.compileFail) : '', POLICY_FAIL: String(options.policyFail ?? ''),
       },
     })
     if (result.status !== 0) break
   }
   const calls = readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
-  return { ...result, compiled, calls }
+  return { ...result, folder, compiled, calls }
 }
 
 afterEach(() => {
@@ -76,8 +88,8 @@ test('each params file has a distinct compiled output and receives its own polic
   assert.equal(statSync(result.compiled).mode & 0o777, 0o700)
   const compiles = result.calls.filter(({ kind }) => kind === 'compile')
   assert.deepEqual(compiles.map(({ args }) => args), [
-    ['bicep', 'build-params', '--file', primary, '--stdout'],
-    ['bicep', 'build-params', '--file', secondary, '--stdout'],
+    ['bicep', 'build-params', '--file', join(result.folder, primary), '--stdout'],
+    ['bicep', 'build-params', '--file', join(result.folder, secondary), '--stdout'],
   ])
   const checks = result.calls.filter(({ kind }) => kind === 'check')
   assert.equal(checks.length, 2)
@@ -106,24 +118,61 @@ test('a failing second policy check names its params file and stops before check
 test('the default single params file is compiled once and checked once with two arguments', () => {
   const result = runInfra()
   assert.equal(result.status, 0, result.stderr)
-  assert.deepEqual(result.calls.map(({ kind }) => kind), ['compile', 'check'])
-  assert.deepEqual(result.calls[0].args, ['bicep', 'build-params', '--file', 'infra/params/site.bicepparam', '--stdout'])
-  assert.equal(result.calls[1].args.length, 2)
-  assert.equal(result.calls[1].args[0], join(result.compiled, 'main.json'))
-  assert.deepEqual(result.calls[1].parameters, { parameters: { fixture: { value: 0 } } })
+  const calls = result.calls.filter(({ kind }) => kind !== 'template')
+  assert.deepEqual(calls.map(({ kind }) => kind), ['compile', 'check'])
+  assert.deepEqual(calls[0].args, ['bicep', 'build-params', '--file', join(result.folder, 'infra/params/site.bicepparam'), '--stdout'])
+  assert.equal(calls[1].args.length, 2)
+  assert.equal(calls[1].args[0], join(result.compiled, 'main.json'))
+  assert.deepEqual(calls[1].parameters, { parameters: { fixture: { value: 0 } } })
 })
 
 test('a params compilation failure names the file and stops before later compiles or policy checks', () => {
   const result = runInfra([primary, secondary, third], { compileFail: secondary })
   assert.equal(result.status, 3, result.stderr)
   assert.ok(result.stderr.includes(secondary), result.stderr)
-  assert.deepEqual(result.calls.map(({ kind, args }) => [kind, args[3]]), [['compile', primary], ['compile', secondary]])
+  assert.deepEqual(result.calls.filter(({ kind }) => kind !== 'template').map(({ kind, args }) => [kind, args[3]]), [
+    ['compile', join(result.folder, primary)], ['compile', join(result.folder, secondary)],
+  ])
 })
 
 test('a missing params file fails before compiling parameters or checking policy', () => {
   const result = runInfra([primary, secondary], { missing: secondary })
   assert.notEqual(result.status, 0)
   assert.ok(result.stderr.includes(secondary), result.stderr)
-  assert.deepEqual(result.calls, [])
+  assert.deepEqual(result.calls.map(({ kind }) => kind), ['template'])
   assert.ok(existsSync(join(result.compiled, 'main.json')))
+})
+
+for (const path of ['-leading.bicepparam', 'infra/params/with spaces.bicepparam']) {
+  test(`the params compiler receives an absolute single argument for ${path}`, () => {
+    const result = runInfra([path])
+    assert.equal(result.status, 0, result.stderr)
+    const compile = result.calls.find(({ kind }) => kind === 'compile')
+    assert.deepEqual(compile.args, ['bicep', 'build-params', '--file', join(result.folder, path), '--stdout'])
+    assert.deepEqual(result.calls.find(({ kind }) => kind === 'check').parameters, { parameters: { fixture: { value: 0 } } })
+  })
+}
+
+for (const path of ['../outside.bicepparam', '../checkout-sibling/outside.bicepparam', 'linked.bicepparam']) {
+  test(`the params compiler refuses a checkout escape through ${path}`, () => {
+    const result = runInfra([path], { symlink: path === 'linked.bicepparam' ? path : undefined })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /outside.*checkout/iu)
+    assert.deepEqual(result.calls.map(({ kind }) => kind), ['template'])
+  })
+}
+
+for (const path of ['-leading.bicep', 'infra/with spaces.bicep']) {
+  test(`the template compiler receives an absolute single argument for ${path}`, () => {
+    const result = runInfra(undefined, { template: path })
+    assert.equal(result.status, 0, result.stderr)
+    assert.deepEqual(result.calls[0].args, ['bicep', 'build', '--file', join(result.folder, path), '--outfile', join(result.compiled, 'main.json')])
+  })
+}
+
+test('the template compiler refuses a path outside the checkout before invoking the CLI', () => {
+  const result = runInfra(undefined, { template: '../outside.bicep' })
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /outside.*checkout/iu)
+  assert.deepEqual(result.calls, [])
 })

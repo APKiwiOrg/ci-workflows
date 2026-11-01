@@ -106,7 +106,24 @@ jobs:
       - name: Asset budget
         env:
           APP_LOCATION: ${{ needs.config.outputs.app-location }}
-        run: node scripts/check-assets.mjs "$APP_LOCATION"
+        run: |
+          node --input-type=module <<'NODE'
+          import { realpathSync } from 'node:fs'
+          import { resolve, sep } from 'node:path'
+          import { spawnSync } from 'node:child_process'
+          const checkout = realpathSync(process.cwd())
+          function inside(path) {
+            if (!path.startsWith(`${checkout}${sep}`)) {
+              console.error(`Asset path resolves outside checkout: ${process.env.APP_LOCATION}`)
+              process.exit(1)
+            }
+            return path
+          }
+          const path = inside(realpathSync(inside(resolve(checkout, process.env.APP_LOCATION))))
+          const result = spawnSync(process.execPath, ['scripts/check-assets.mjs', path], { stdio: 'inherit' })
+          if (result.error) console.error(result.error.message)
+          process.exit(result.status ?? 1)
+          NODE
 
   repo:
     needs: config
@@ -238,27 +255,54 @@ jobs:
         run: |
           mkdir -p /tmp/site-infra
           chmod 0700 /tmp/site-infra
-          az bicep build --file "$BICEP_FILE" --outfile /tmp/site-infra/main.json
+          node --input-type=module <<'NODE'
+          import { realpathSync } from 'node:fs'
+          import { resolve, sep } from 'node:path'
+          import { spawnSync } from 'node:child_process'
+          const checkout = realpathSync(process.cwd())
+          function inside(path) {
+            if (!path.startsWith(`${checkout}${sep}`)) {
+              console.error(`Infrastructure template path resolves outside checkout: ${process.env.BICEP_FILE}`)
+              process.exit(1)
+            }
+            return path
+          }
+          const path = inside(realpathSync(inside(resolve(checkout, process.env.BICEP_FILE))))
+          const result = spawnSync('az', ['bicep', 'build', '--file', path, '--outfile', '/tmp/site-infra/main.json'], { stdio: 'inherit' })
+          if (result.error) console.error(result.error.message)
+          process.exit(result.status ?? 1)
+          NODE
 
       - name: Build parameters
         env:
           INFRA_PARAMS: ${{ needs.config.outputs.infra-params }}
         run: |
           node --input-type=module <<'NODE'
-          import { closeSync, existsSync, openSync, statSync } from 'node:fs'
+          import { closeSync, existsSync, openSync, realpathSync, statSync } from 'node:fs'
+          import { resolve, sep } from 'node:path'
           import { spawnSync } from 'node:child_process'
           const params = JSON.parse(process.env.INFRA_PARAMS)
-          for (const path of params) {
-            if (!existsSync(path) || !statSync(path).isFile()) {
+          const checkout = realpathSync(process.cwd())
+          function inside(path, source) {
+            if (!path.startsWith(`${checkout}${sep}`)) {
+              console.error(`Infrastructure params path resolves outside checkout: ${source}`)
+              process.exit(1)
+            }
+            return path
+          }
+          const resolved = params.map((path) => {
+            const absolute = inside(resolve(checkout, path), path)
+            if (!existsSync(absolute) || !statSync(absolute).isFile()) {
               console.error(`Missing infrastructure params file: ${path}`)
               process.exit(1)
             }
-          }
+            return inside(realpathSync(absolute), path)
+          })
           for (const [index, path] of params.entries()) {
             const output = openSync(`/tmp/site-infra/params-${index}.json`, 'w', 0o600)
             let result
             try {
-              result = spawnSync('az', ['bicep', 'build-params', '--file', path, '--stdout'], {
+              result = spawnSync('az', ['bicep', 'build-params', '--file', resolved[index], '--stdout'], {
                 stdio: ['ignore', output, 'inherit'],
               })
             } finally {

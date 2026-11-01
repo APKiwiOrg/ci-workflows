@@ -1,7 +1,7 @@
 // Run the workflows' config gate and capability steps against a fixture caller, without dependencies.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
@@ -197,6 +197,7 @@ describe('capabilities control the consumer steps', () => {
 
   test('every params file is compiled and a missing or failing one fails the step', () => {
     const folder = fixture()
+    const checkout = realpathSync(folder)
     mkdirSync(join(folder, 'compiled'))
     mkdirSync(join(folder, 'infra/params'), { recursive: true })
     for (const name of ['site', 'preview']) writeFileSync(join(folder, `infra/params/${name}.bicepparam`), '')
@@ -206,8 +207,8 @@ describe('capabilities control the consumer steps', () => {
     const script = stepScript(ciPath, 'infra', 'Build parameters').replaceAll('/tmp/site-infra', join(folder, 'compiled'))
     const result = run(folder, script, env)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(readFileSync(log, 'utf8'), 'bicep build-params --file infra/params/site.bicepparam --stdout\nbicep build-params --file infra/params/preview.bicepparam --stdout\n')
-    assert.notEqual(run(folder, script, { ...env, AZ_FAIL_FILE: 'infra/params/preview.bicepparam' }).status, 0)
+    assert.equal(readFileSync(log, 'utf8'), `bicep build-params --file ${checkout}/infra/params/site.bicepparam --stdout\nbicep build-params --file ${checkout}/infra/params/preview.bicepparam --stdout\n`)
+    assert.notEqual(run(folder, script, { ...env, AZ_FAIL_FILE: join(checkout, 'infra/params/preview.bicepparam') }).status, 0)
     rmSync(join(folder, 'infra/params/preview.bicepparam'))
     const missing = run(folder, script, env)
     assert.notEqual(missing.status, 0)

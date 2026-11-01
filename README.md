@@ -206,7 +206,10 @@ whether `api/` exists. Existing callers keep their old SHA pin until the templat
 removes those inputs and re-pins them in a later task. Update the template and its synced callers together.
 
 The calling repository supplies `scripts/check-npm-policy.mjs` and `scripts/check-assets.mjs`, which
-receives the `app-location` folder after the build. It also supplies the npm scripts `lint`, `typecheck`,
+receives the absolute `app-location` folder after the build. The asset folder, Bicep template and params
+file paths are resolved inside the checkout before CLI use. Paths and symlink targets outside the
+checkout are refused. Names with spaces or leading hyphens remain single path arguments.
+It also supplies the npm scripts `lint`, `typecheck`,
 `test`, `build` and `test:e2e`, plus `check:theme` when `has-theme` is true, and the convention checks `scripts/check-dashes.sh`,
 `scripts/check-prose.sh`, `scripts/check-scratch.sh` and `scripts/check-agent-instructions.sh`, each run with
 `--tree`. A site made from APKiwiOrg/site-template carries `site-template.lock.json`, and `repo` then runs its
