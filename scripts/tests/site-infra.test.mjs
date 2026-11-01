@@ -48,7 +48,23 @@ if (args[1] === 'build') {
 } else if (args[1] === 'build-params') {
   appendFileSync(process.env.INFRA_LOG, JSON.stringify({ kind: 'compile', args }) + '\\n')
   if (path === process.env.COMPILE_FAIL) process.exit(3)
-  process.stdout.write(readFileSync(path))
+  const parameters = {
+    $schema: 'deploymentParameters.json#', contentVersion: '1.0.0.0',
+    ...JSON.parse(readFileSync(path, 'utf8')),
+  }
+  const wrapper = { parametersJson: JSON.stringify(parameters), templateJson: '{}', templateSpecId: null }
+  let output = JSON.stringify(parameters)
+  if (path === process.env.INVALID_FILE) {
+    const shape = process.env.INVALID_SHAPE
+    if (shape === 'wrapper') output = JSON.stringify(wrapper)
+    else if (shape === 'invalid-json') output = '{'
+    else if (shape === 'missing') output = '{}'
+    else if (shape === 'root-null') output = 'null'
+    else output = JSON.stringify({ parameters: JSON.parse(shape) })
+  }
+  if (args.includes('--stdout')) process.stdout.write(JSON.stringify(wrapper))
+  else if (args.includes('--outfile')) writeFileSync(args[args.indexOf('--outfile') + 1], output)
+  else process.exit(2)
 } else process.exit(2)
 `, { mode: 0o700 })
   writeFileSync(join(folder, 'scripts/check-infra.mjs'), `
@@ -70,6 +86,7 @@ if (String(parameters.parameters.fixture.value) === process.env.POLICY_FAIL) pro
         PATH: `${folder}:${process.env.PATH}`, BICEP_FILE: template,
         INFRA_PARAMS: JSON.stringify(paths), INFRA_LOG: log,
         COMPILE_FAIL: options.compileFail ? join(folder, options.compileFail) : '', POLICY_FAIL: String(options.policyFail ?? ''),
+        INVALID_FILE: options.invalidFile ? join(folder, options.invalidFile) : '', INVALID_SHAPE: options.invalidShape ?? '',
       },
     })
     if (result.status !== 0) break
@@ -88,8 +105,8 @@ test('each params file has a distinct compiled output and receives its own polic
   assert.equal(statSync(result.compiled).mode & 0o777, 0o700)
   const compiles = result.calls.filter(({ kind }) => kind === 'compile')
   assert.deepEqual(compiles.map(({ args }) => args), [
-    ['bicep', 'build-params', '--file', join(result.folder, primary), '--stdout'],
-    ['bicep', 'build-params', '--file', join(result.folder, secondary), '--stdout'],
+    ['bicep', 'build-params', '--file', join(result.folder, primary), '--outfile', join(result.compiled, 'params-0.json')],
+    ['bicep', 'build-params', '--file', join(result.folder, secondary), '--outfile', join(result.compiled, 'params-1.json')],
   ])
   const checks = result.calls.filter(({ kind }) => kind === 'check')
   assert.equal(checks.length, 2)
@@ -102,8 +119,9 @@ test('each params file has a distinct compiled output and receives its own polic
   assert.notEqual(outputs[0], outputs[1])
   assert.equal(readdirSync(result.compiled).length, 3)
   for (const [index, check] of checks.entries()) {
+    assert.equal(statSync(outputs[index]).mode & 0o777, 0o600)
     assert.deepEqual(check.template, { resources: [] })
-    assert.deepEqual(check.parameters, { parameters: { fixture: { value: index } } })
+    assert.deepEqual(check.parameters, { $schema: 'deploymentParameters.json#', contentVersion: '1.0.0.0', parameters: { fixture: { value: index } } })
     assert.deepEqual(JSON.parse(readFileSync(outputs[index], 'utf8')), check.parameters)
   }
 })
@@ -120,10 +138,10 @@ test('the default single params file is compiled once and checked once with two 
   assert.equal(result.status, 0, result.stderr)
   const calls = result.calls.filter(({ kind }) => kind !== 'template')
   assert.deepEqual(calls.map(({ kind }) => kind), ['compile', 'check'])
-  assert.deepEqual(calls[0].args, ['bicep', 'build-params', '--file', join(result.folder, 'infra/params/site.bicepparam'), '--stdout'])
+  assert.deepEqual(calls[0].args, ['bicep', 'build-params', '--file', join(result.folder, 'infra/params/site.bicepparam'), '--outfile', join(result.compiled, 'params-0.json')])
   assert.equal(calls[1].args.length, 2)
   assert.equal(calls[1].args[0], join(result.compiled, 'main.json'))
-  assert.deepEqual(calls[1].parameters, { parameters: { fixture: { value: 0 } } })
+  assert.deepEqual(calls[1].parameters, { $schema: 'deploymentParameters.json#', contentVersion: '1.0.0.0', parameters: { fixture: { value: 0 } } })
 })
 
 test('a params compilation failure names the file and stops before later compiles or policy checks', () => {
@@ -148,8 +166,8 @@ for (const path of ['-leading.bicepparam', 'infra/params/with spaces.bicepparam'
     const result = runInfra([path])
     assert.equal(result.status, 0, result.stderr)
     const compile = result.calls.find(({ kind }) => kind === 'compile')
-    assert.deepEqual(compile.args, ['bicep', 'build-params', '--file', join(result.folder, path), '--stdout'])
-    assert.deepEqual(result.calls.find(({ kind }) => kind === 'check').parameters, { parameters: { fixture: { value: 0 } } })
+    assert.deepEqual(compile.args, ['bicep', 'build-params', '--file', join(result.folder, path), '--outfile', join(result.compiled, 'params-0.json')])
+    assert.deepEqual(result.calls.find(({ kind }) => kind === 'check').parameters, { $schema: 'deploymentParameters.json#', contentVersion: '1.0.0.0', parameters: { fixture: { value: 0 } } })
   })
 }
 
@@ -176,3 +194,14 @@ test('the template compiler refuses a path outside the checkout before invoking 
   assert.match(result.stderr, /outside.*checkout/iu)
   assert.deepEqual(result.calls, [])
 })
+
+for (const shape of ['wrapper', 'invalid-json', 'missing', 'root-null', 'null', '[]', 'false', '"value"']) {
+  test(`compiled params with ${shape} shape fail before checking that file or later files`, () => {
+    const result = runInfra([primary, secondary, third], { invalidFile: secondary, invalidShape: shape })
+    assert.equal(result.status, 1, result.stderr)
+    assert.ok(result.stderr.includes(secondary), result.stderr)
+    assert.ok(result.stderr.includes(join(result.compiled, 'params-1.json')), result.stderr)
+    assert.match(result.stderr, /invalid compiled infrastructure params/iu)
+    assert.deepEqual(result.calls.filter(({ kind }) => kind === 'check').map(({ parameters }) => parameters.parameters.fixture.value), [0])
+  })
+}

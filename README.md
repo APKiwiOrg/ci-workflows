@@ -217,10 +217,12 @@ It also supplies the npm scripts `lint`, `typecheck`,
 repository with no lock prints one skip line instead. `repo` runs every `scripts/tests/*.test.sh` and fails
 when there is none. When an `api/` directory exists, it is an npm package with `typecheck` and `test` scripts.
 Every site supplies e2e and infrastructure checks. The infra job compiles every configured params file
-to a separate indexed JSON file in `/tmp/site-infra/`, a mode 0700 directory. It then runs
+with `--outfile` to a separate indexed deployment parameters JSON file in `/tmp/site-infra/`, a mode 0700
+directory. The output must parse as JSON with a `parameters` object before the checker runs, since
+`--stdout` produces a wrapper containing both parameters and template output. It then runs
 `scripts/check-infra.mjs <compiled-template.json> <compiled-params.json>` once per params file, in config
 order, including the bandwidth alert policy. The checker uses the compiled parameters to skip resources
-that file disables. A missing params file, a compilation failure or a policy failure fails the job and
+that file disables. A missing params file, a compilation failure, an invalid output or a policy failure fails the job and
 names the params file. A failed policy check stops later checks. The audit job runs the npm policy check
 before `npm ci`, then `npm audit --audit-level=high` in the root and, when present, in `api/`.
 

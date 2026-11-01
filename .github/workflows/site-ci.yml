@@ -277,8 +277,9 @@ jobs:
         env:
           INFRA_PARAMS: ${{ needs.config.outputs.infra-params }}
         run: |
+          umask 077
           node --input-type=module <<'NODE'
-          import { closeSync, existsSync, openSync, realpathSync, statSync } from 'node:fs'
+          import { existsSync, realpathSync, statSync } from 'node:fs'
           import { resolve, sep } from 'node:path'
           import { spawnSync } from 'node:child_process'
           const params = JSON.parse(process.env.INFRA_PARAMS)
@@ -299,15 +300,10 @@ jobs:
             return inside(realpathSync(absolute), path)
           })
           for (const [index, path] of params.entries()) {
-            const output = openSync(`/tmp/site-infra/params-${index}.json`, 'w', 0o600)
-            let result
-            try {
-              result = spawnSync('az', ['bicep', 'build-params', '--file', resolved[index], '--stdout'], {
-                stdio: ['ignore', output, 'inherit'],
-              })
-            } finally {
-              closeSync(output)
-            }
+            const output = `/tmp/site-infra/params-${index}.json`
+            const result = spawnSync('az', ['bicep', 'build-params', '--file', resolved[index], '--outfile', output], {
+              stdio: 'inherit',
+            })
             if (result.error) console.error(result.error.message)
             if (result.status !== 0) {
               console.error(`Infrastructure params compilation failed: ${path}`)
@@ -321,10 +317,22 @@ jobs:
           INFRA_PARAMS: ${{ needs.config.outputs.infra-params }}
         run: |
           node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
           import { spawnSync } from 'node:child_process'
           const params = JSON.parse(process.env.INFRA_PARAMS)
           for (const [index, path] of params.entries()) {
-            const result = spawnSync(process.execPath, ['scripts/check-infra.mjs', '/tmp/site-infra/main.json', `/tmp/site-infra/params-${index}.json`], {
+            const compiledPath = `/tmp/site-infra/params-${index}.json`
+            try {
+              const parameters = JSON.parse(readFileSync(compiledPath, 'utf8'))?.parameters
+              if (parameters === null || typeof parameters !== 'object' || Array.isArray(parameters)) {
+                throw new Error('Expected a parameters object.')
+              }
+            } catch (error) {
+              console.error(`Invalid compiled infrastructure params file ${compiledPath} for ${path}`)
+              console.error(error.message)
+              process.exit(1)
+            }
+            const result = spawnSync(process.execPath, ['scripts/check-infra.mjs', '/tmp/site-infra/main.json', compiledPath], {
               stdio: 'inherit',
             })
             if (result.error) console.error(result.error.message)

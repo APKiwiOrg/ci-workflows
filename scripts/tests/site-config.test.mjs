@@ -207,7 +207,7 @@ describe('capabilities control the consumer steps', () => {
     const script = stepScript(ciPath, 'infra', 'Build parameters').replaceAll('/tmp/site-infra', join(folder, 'compiled'))
     const result = run(folder, script, env)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(readFileSync(log, 'utf8'), `bicep build-params --file ${checkout}/infra/params/site.bicepparam --stdout\nbicep build-params --file ${checkout}/infra/params/preview.bicepparam --stdout\n`)
+    assert.equal(readFileSync(log, 'utf8'), `bicep build-params --file ${checkout}/infra/params/site.bicepparam --outfile ${folder}/compiled/params-0.json\nbicep build-params --file ${checkout}/infra/params/preview.bicepparam --outfile ${folder}/compiled/params-1.json\n`)
     assert.notEqual(run(folder, script, { ...env, AZ_FAIL_FILE: join(checkout, 'infra/params/preview.bicepparam') }).status, 0)
     rmSync(join(folder, 'infra/params/preview.bicepparam'))
     const missing = run(folder, script, env)
