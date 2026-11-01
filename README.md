@@ -2,8 +2,7 @@
 
 Shared reusable GitHub Actions workflows. One implementation lives here and each repository calls it with
 a small caller, so a fix lands once. The stress workflow serves APKiwiOrg repositories. The site workflows
-serve callers in three organisations: APKiwiOrg/web, ThriveNZ/web, ShieldPhrase/web and every client site
-made from APKiwiOrg/site-template.
+serve the owner's private site repositories, each one made from or synced with APKiwiOrg/site-template.
 
 Every workflow here runs on a GitHub-hosted runner, never a self-hosted one. The org's self-hosted runners
 are the dev Mac, and this repository is public.

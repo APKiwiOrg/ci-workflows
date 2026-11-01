@@ -1,8 +1,9 @@
 # ci-workflows contributor instructions
 
 This public repository holds reusable GitHub Actions workflows. APKiwiOrg repositories call the stress
-workflow. The site workflows have callers in three organisations, APKiwiOrg, ThriveNZ and ShieldPhrase,
-listed below. The README says how to call each one. This file holds the rules for changing them.
+workflow. The site workflows have callers in the owner's private site repositories, across more than one
+organisation, as listed below. The README says how to call each one. This file holds the rules for
+changing them.
 
 ## Rules
 
@@ -19,12 +20,10 @@ listed below. The README says how to call each one. This file holds the rules fo
   pin, so a breaking change to inputs names the callers to update in the same piece of work.
 - `stress-test.yml` callers are the game repositories through game-template (the caller there is
   template-managed) and KhaozEngine directly.
-- `site-deploy.yml` callers are APKiwiOrg/web, ThriveNZ/web, ShieldPhrase/web and every client site made from
-  APKiwiOrg/site-template.
-- `site-ci.yml` callers are APKiwiOrg/web, ThriveNZ/web, ShieldPhrase/web and every client site made from
-  APKiwiOrg/site-template.
-- `site-live-throttle-check.yml` callers are APKiwiOrg/web and every client site made from
-  APKiwiOrg/site-template, the sites on the template enquiry api.
+- `site-deploy.yml` callers are every site repository on APKiwiOrg/site-template. The template's fleet sweep
+  (`node scripts/check-fleet.mjs` there) lists them.
+- `site-ci.yml` callers are every site repository on APKiwiOrg/site-template, the same list.
+- `site-live-throttle-check.yml` callers are the site repositories on the template enquiry api.
 
 ## Work and finish
 
