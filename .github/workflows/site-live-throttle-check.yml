@@ -6,6 +6,8 @@ name: site-live-throttle-check
 # template enquiry api, whose handler checks the honeypot, then the schema, then timing, then the throttle,
 # and only then answers 503 enquiries-not-open in off mode. So a post the throttle refuses answers 429 even
 # in off mode.
+# Set ask-name to false for a site whose form asks for no name. Valid posts then omit name, which remains
+# a core field that enquiry-fields cannot supply. The honeypot-only probe is unchanged.
 #
 # No secrets and no token permissions. It sends no email while delivery stays off for the run, and never
 # starts unless delivery is off. It first probes the delivery mode with a honeypot-only post. The handler
@@ -33,6 +35,11 @@ on:
         description: The site's per-sender enquiry limit, 1 to 253
         required: true
         type: number
+      ask-name:
+        description: Whether the site's form asks for a name
+        required: false
+        type: boolean
+        default: true
       enquiry-fields:
         description: JSON object of the site's form fields with string values, excluding core fields
         required: false
@@ -51,6 +58,7 @@ jobs:
         env:
           SITE_URL: ${{ inputs.site-url }}
           SENDER_LIMIT: ${{ inputs.sender-limit }}
+          ASK_NAME: ${{ inputs.ask-name }}
           ENQUIRY_FIELDS: ${{ inputs.enquiry-fields }}
         run: |
           set -eu
@@ -73,12 +81,13 @@ jobs:
           probe='{"notes_extra":"x"}'
           # Validate before the probe and keep parser errors from exposing supplied values.
           # elapsedMs clears the 3000 ms timing check, which runs before the throttle.
-          if ! valid=$(jq -cen --argjson fields "$ENQUIRY_FIELDS" '
+          if ! valid=$(jq -cen --argjson fields "$ENQUIRY_FIELDS" --argjson askName "$ASK_NAME" '
             $fields
             | select(type == "object")
             | select(all(.[]; type == "string"))
             | select(has("name") or has("email") or has("elapsedMs") or has("notes_extra") | not)
-            | {name: "Throttle Check", email: "throttle-check@example.com"} + . + {elapsedMs: 5000}
+            | (if $askName then {name: "Throttle Check"} else {} end)
+              + {email: "throttle-check@example.com"} + . + {elapsedMs: 5000}
           ' 2>/dev/null); then
             echo "enquiry-fields must be a JSON object with string values and no name, email, elapsedMs or notes_extra keys" >&2
             exit 1

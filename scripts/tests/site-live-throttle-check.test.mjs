@@ -58,7 +58,8 @@ function runCheck(answers, env = {}) {
     encoding: 'utf8',
     env: {
       PATH: `${folder}:${process.env.PATH}`, TEST_CURL_LOG: log, TEST_CURL_ANSWERS: answerFile,
-      SITE_URL: siteUrl, SENDER_LIMIT: '5', ENQUIRY_FIELDS: '{"needs":"Throttle check"}', ...env,
+      SITE_URL: siteUrl, SENDER_LIMIT: '5', ASK_NAME: 'true',
+      ENQUIRY_FIELDS: '{"needs":"Throttle check"}', ...env,
     },
   })
   const recorded = existsSync(log) ? readFileSync(log, 'utf8') : ''
@@ -100,10 +101,13 @@ describe('the run stops unless the probe answers 503 enquiries-not-open', () => 
     })
   }
 
-  test('the probe is a honeypot-only post with no forged header', () => {
-    const [first] = runCheck(['202 accepted']).calls
-    assert.deepEqual(first, { data: probe, xff: '', url: endpoint })
-  })
+  for (const askName of ['true', 'false']) {
+    test(`the probe is a honeypot-only post with no forged header when ask-name is ${askName}`, () => {
+      const result = runCheck(['202 accepted'], { ASK_NAME: askName })
+      assert.notEqual(result.status, 0)
+      assert.deepEqual(result.calls, [{ data: probe, xff: '', url: endpoint }])
+    })
+  }
 
   test('the endpoint drops a trailing slash from the site url', () => {
     const [first] = runCheck(['202 accepted'], { SITE_URL: `${siteUrl}/` }).calls
@@ -174,6 +178,24 @@ describe('sends sender-limit plus one posts', () => {
 })
 
 describe('per-site enquiry fields', () => {
+  for (const [name, fields, body] of [
+    ['default fields', '{"needs":"Throttle check"}',
+      '{"email":"throttle-check@example.com","needs":"Throttle check","elapsedMs":5000}'],
+    ['custom fields', '{"region":"North"}',
+      '{"email":"throttle-check@example.com","region":"North","elapsedMs":5000}'],
+    ['no site fields', '{}', '{"email":"throttle-check@example.com","elapsedMs":5000}'],
+  ]) {
+    test(`ask-name false omits name from every post with ${name}`, () => {
+      const result = runCheck(passingAnswers(5), { ASK_NAME: 'false', ENQUIRY_FIELDS: fields })
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.calls.length, 7)
+      assert.deepEqual(result.calls[0], { data: probe, xff: '', url: endpoint })
+      for (const post of result.calls.slice(1)) {
+        assert.equal(post.data, body)
+      }
+    })
+  }
+
   test('custom fields replace needs on every valid post and leave the probe honeypot-only', () => {
     const result = runCheck(passingAnswers(5), {
       ENQUIRY_FIELDS: '{"plan":"Starter","goals":"Build strength"}',
@@ -223,6 +245,15 @@ describe('per-site enquiry fields', () => {
 })
 
 describe('inputs are checked before anything is posted', () => {
+  test('enquiry-fields refuses name even when ask-name is false', () => {
+    const result = runCheck(passingAnswers(5), {
+      ASK_NAME: 'false', ENQUIRY_FIELDS: '{"name":"Override"}',
+    })
+    assert.notEqual(result.status, 0)
+    assert.equal(result.calls.length, 0, 'invalid fields never reach curl')
+    assert.match(result.stderr, /enquiry-fields must be a JSON object with string values/u)
+  })
+
   for (const [name, fields] of [
     ['malformed JSON', '{broken'],
     ['malformed JSON containing an address', '{"email":"private@example.test"'],
@@ -277,7 +308,7 @@ describe('inputs are checked before anything is posted', () => {
 })
 
 describe('the workflow is a tokenless reusable check', () => {
-  test('it is called only, with two required inputs and optional enquiry fields', () => {
+  test('it is called only, with two required inputs and optional ask-name and enquiry-fields', () => {
     assert.match(workflow(), /^on:\n {2}workflow_call:\n {4}inputs:\n/mu)
     assert.doesNotMatch(workflow(), /^ *(?:workflow_dispatch|secrets):/mu)
     for (const [name, type] of [['site-url', 'string'], ['sender-limit', 'number']]) {
@@ -286,6 +317,11 @@ describe('the workflow is a tokenless reusable check', () => {
       assert.match(input, /^ {8}required: true$/mu)
       assert.match(input, new RegExp(`^ {8}type: ${type}$`, 'mu'))
     }
+    const askName = workflow().match(/^ {6}ask-name:\n((?: {8}.+\n)+)/mu)?.[1]
+    assert.ok(askName, 'workflow_call declares ask-name')
+    assert.match(askName, /^ {8}required: false$/mu)
+    assert.match(askName, /^ {8}type: boolean$/mu)
+    assert.match(askName, /^ {8}default: true$/mu)
     const fields = workflow().match(/^ {6}enquiry-fields:\n((?: {8}.+\n)+)/mu)?.[1]
     assert.ok(fields, 'workflow_call declares enquiry-fields')
     assert.match(fields, /^ {8}required: false$/mu)
@@ -303,6 +339,7 @@ describe('the workflow is a tokenless reusable check', () => {
   test('inputs reach the script only through env', () => {
     assert.match(job(), /^ {10}SITE_URL: \$\{\{ inputs\.site-url \}\}$/mu)
     assert.match(job(), /^ {10}SENDER_LIMIT: \$\{\{ inputs\.sender-limit \}\}$/mu)
+    assert.match(job(), /^ {10}ASK_NAME: \$\{\{ inputs\.ask-name \}\}$/mu)
     assert.match(job(), /^ {10}ENQUIRY_FIELDS: \$\{\{ inputs\.enquiry-fields \}\}$/mu)
     assert.doesNotMatch(stepScript(workflowPath, 'check', stepName), /\$\{\{/u)
   })

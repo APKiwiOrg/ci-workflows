@@ -330,6 +330,10 @@ jobs:
 The caller owns the concurrency group, so two runs never share the runner's throttle slots. A `default` on
 `site-url` saves typing the hostname.
 
+The optional boolean input `ask-name` defaults to `true`. For a site whose form asks for no name, add
+`ask-name: false` under the caller's `with`. Every valid post then omits `name`, keeping `email`, the site's
+fields and `elapsedMs` in that order. The honeypot-only probe is unchanged.
+
 The optional string input `enquiry-fields` defaults to `{"needs":"Throttle check"}`. It supplies the site's
 form fields on every valid post, replacing the default `needs` field when provided. For a form with `plan`
 and optional `goals`, add this under the caller's `with` and choose values its schema accepts:
@@ -339,9 +343,10 @@ and optional `goals`, add this under the caller's `with` and choose values its s
 ```
 
 The input must be a JSON object with string values. It cannot contain `name`, `email`, `elapsedMs` or the
-honeypot field `notes_extra`. Invalid input stops before any request, including the mode probe, without
-printing the supplied values. An empty object adds no site fields. The probe stays honeypot-only because
-the handler answers it before schema validation, without calling delivery or spending a throttle slot.
+honeypot field `notes_extra`, even with `ask-name: false`. Invalid input stops before any request, including
+the mode probe, without printing the supplied values. An empty object adds no site fields. The probe stays
+honeypot-only because the handler answers it before schema validation, without calling delivery or spending
+a throttle slot.
 
 ```bash
 gh workflow run live-throttle-check.yml --ref main -f site-url=https://<site hostname>
@@ -366,5 +371,5 @@ its schema, and `elapsedMs` clears the 3000 ms timing check. The handler checks 
 then timing, then the throttle, and only then answers 503 `enquiries-not-open` in off mode, so the throttle's
 429 still shows.
 
-Sites with different form fields use `enquiry-fields` to match their schema while keeping the core fields
-and the honeypot probe fixed.
+Sites with different form fields use `enquiry-fields` to match their schema and `ask-name: false` when no
+name is accepted. The honeypot probe stays fixed.
