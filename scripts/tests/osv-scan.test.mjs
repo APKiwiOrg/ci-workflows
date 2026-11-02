@@ -132,8 +132,10 @@ describe('the scan step reports results and fails on scan errors', () => {
   })
 })
 
-// The runner's GNU sha256sum takes --check --strict. The macOS one does not, so those cases run on CI.
-const gnuSha256sum = /GNU coreutils/u.test(spawnSync('sha256sum', ['--version'], { encoding: 'utf8' }).stdout ?? '')
+// The runner's sha256sum takes --check --strict. The macOS one does not, so those cases run on CI. The probe
+// checks the empty file's known digest in the same form the step uses.
+const checksumProbe = 'echo "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /dev/null" | sha256sum --check --strict'
+const strictSha256sum = spawnSync('sh', ['-c', checksumProbe], { stdio: 'ignore' }).status === 0
 
 describe('the install step checks the release binary', () => {
   const release = 'https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64'
@@ -185,14 +187,14 @@ describe('the install step checks the release binary', () => {
     assert.ok(check < script.indexOf('chmod +x'), 'the check comes first')
   })
 
-  test('a binary matching the pinned checksum is installed from the pinned release', { skip: !gnuSha256sum && 'needs GNU sha256sum' }, () => {
+  test('a binary matching the pinned checksum is installed from the pinned release', { skip: !strictSha256sum && 'needs sha256sum --check --strict' }, () => {
     const result = runInstall('release bytes')
     assert.equal(result.status, 0, result.stderr)
     assert.deepEqual(result.urls, [release])
     assert.ok(result.executable, 'the binary is executable')
   })
 
-  test('a binary that differs from the pinned checksum is refused', { skip: !gnuSha256sum && 'needs GNU sha256sum' }, () => {
+  test('a binary that differs from the pinned checksum is refused', { skip: !strictSha256sum && 'needs sha256sum --check --strict' }, () => {
     const result = runInstall('other bytes')
     assert.notEqual(result.status, 0)
     assert.equal(result.executable, false, 'the refused binary is never made executable')
