@@ -267,7 +267,7 @@ jobs:
 
       - name: Upload support cost artifacts
         if: always() && inputs.support-cost
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: support-cost
           path: ${{ runner.temp }}/stress/support-cost
@@ -278,7 +278,7 @@ jobs:
       # stands down rather than upload the same files twice.
       - name: Upload the stress artifacts
         if: always() && inputs.artifact-env != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: stress-artifacts
           path: ${{ runner.temp }}/stress
@@ -287,7 +287,7 @@ jobs:
 
       - name: Upload the failing runs
         if: failure() && inputs.artifact-env == ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: stress-test-results
           path: ${{ runner.temp }}/stress
