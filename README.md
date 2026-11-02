@@ -8,6 +8,9 @@ APKiwiOrg/site-template.
 Every workflow here runs on a GitHub-hosted runner, never a self-hosted one. The org's self-hosted runners
 are the dev Mac, and this repository is public.
 
+Because it is public, this repository holds generic steps only, with no site or client names, URLs, identifiers,
+secrets or site code. Secrets live in each private site repository and are passed by name at run time.
+
 ## stress-test
 
 Repeats one test selection many times, optionally under synthetic CPU load, and fails when any run fails or
