@@ -1,2 +1,6 @@
 .DS_Store
 .superpowers/
+
+# Local mirror of the GitHub Issues backlog (scripts/ledger.sh sync). Derived and per-checkout,
+# never a source of truth, so it stays out of git.
+.ledger/
