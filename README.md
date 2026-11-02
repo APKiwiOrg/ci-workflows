@@ -391,6 +391,10 @@ exit is a scan error, which fails the job and names the exit in the summary. A f
 report that reads as clean, so that report is never published and nothing is uploaded. A repository with no
 lockfile passes with no findings.
 
+The report sits beside the `site-ci` audit job and does not replace it. That job fails CI on a high or
+critical npm advisory, so the deploy never ships one. The weekly report also catches advisories published
+after a commit landed, lower severities and lockfiles npm audit does not read, without blocking anything.
+
 A site adds this caller as `.github/workflows/osv-scan.yml`, pinned to a commit of this repository. The
 schedule lands the report early on Monday in New Zealand:
 
