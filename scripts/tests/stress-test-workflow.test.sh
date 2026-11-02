@@ -61,7 +61,8 @@ open(out + '/repeat.sh', 'w').write(repeat['run'])
 EOF
 pass=$((pass + 1))
 
-# The stub reads one outcome per call from STUB_PLAN: pass, empty or fail:<exit>. It records what it saw of
+# The stub reads one outcome per call from STUB_PLAN: pass, empty, notrx or fail:<exit>. notrx exits zero
+# without writing a TRX. It records what it saw of
 # STUB_WATCH in STUB_SEEN and writes a condition file into that directory, as a caller's tests would.
 mkdir -p "$work/bin" "$work/repo/scripts"
 cat > "$work/bin/dotnet" <<'EOF'
@@ -89,6 +90,7 @@ fi
 case "$outcome" in
   pass) executed=1 code=0 ;;
   empty) executed=0 code=0 ;;
+  notrx) exit 0 ;;
   fail:*) executed=1 code=${outcome#fail:}; echo "[FAIL] Stub.Test"; echo "Error Message: stub failure $call" ;;
   *) echo "stub: no plan for call $call" >&2; exit 99 ;;
 esac
@@ -145,6 +147,13 @@ if grep -q 'stress-test: run' "$stress/run-2.log"; then fail 'default log gained
 says "$work/case/out" '::error::run 2 failed'
 run_step repeat.sh 1 'empty' ITERATIONS=1
 says "$work/case/out" '::error::run 1 selected no tests'
+# Issue #1: a test process that exits zero but writes no TRX counts as selecting nothing. It keeps its log,
+# and the later runs and the summary still happen.
+run_step repeat.sh 1 'notrx pass' ITERATIONS=2
+calls 2
+has run-1.log; lacks run-1.trx; lacks run-2.log; lacks run-2.trx
+says "$work/case/out" '::error::run 1 selected no tests'
+says "$work/case/summary" '1 passed, 0 failed, 1 selected nothing, of 2 runs'
 
 # Support-cost mode keeps its own protocol: the exit is finalized, passing logs still go.
 run_step repeat.sh 0 'pass' SUPPORT_COST=true

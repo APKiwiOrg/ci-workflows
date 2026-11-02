@@ -236,7 +236,9 @@ jobs:
               fi
             fi
             if [ "$status" -eq 0 ]; then
-              executed=$(grep -o '<Counters [^/]*' "$trx" 2>/dev/null | head -1 | grep -o ' executed="[0-9]*"' | grep -o '[0-9]*')
+              # A missing or unreadable TRX finds no count, which is an empty selection. The || true keeps the
+              # failed grep from ending the whole step under the runner's bash -e.
+              executed=$(grep -o '<Counters [^/]*' "$trx" 2>/dev/null | head -1 | grep -o ' executed="[0-9]*"' | grep -o '[0-9]*' || true)
               if [ "${executed:-0}" -gt 0 ]; then
                 passed=$((passed + 1))
                 if [ -z "$ARTIFACT_ENV" ]; then rm -f "$log" "$trx"; fi
