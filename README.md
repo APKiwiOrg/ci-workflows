@@ -2,7 +2,8 @@
 
 Shared reusable GitHub Actions workflows. One implementation lives here and each repository calls it with
 a small caller, so a fix lands once. The stress workflow serves APKiwiOrg repositories. The site workflows
-serve the owner's private site repositories, each one made from or synced with APKiwiOrg/site-template.
+and the osv-scan report serve the owner's private site repositories, each one made from or synced with
+APKiwiOrg/site-template.
 
 Every workflow here runs on a GitHub-hosted runner, never a self-hosted one. The org's self-hosted runners
 are the dev Mac, and this repository is public.
@@ -373,3 +374,48 @@ then timing, then the throttle, and only then answers 503 `enquiries-not-open` i
 
 Sites with different form fields use `enquiry-fields` to match their schema and `ask-name: false` when no
 name is accepted. The honeypot probe stays fixed.
+
+## osv-scan
+
+Reports known vulnerabilities in a repository's dependencies with osv-scanner, weekly and on demand. It is
+report only and never a required check. Dependabot alerts stay the record. It has no inputs or secrets, and
+its token reads contents only.
+
+The job installs the pinned osv-scanner release binary after checking it against the pinned SHA-256, then
+runs `osv-scanner scan source -r --allow-no-lockfiles` over the checkout twice, once for each format. The
+markdown report goes into the job summary and the JSON report into the `osv-scanner` artifact, kept 14 days.
+There is no code scanning upload, since the private site repositories lack it.
+
+Exit 0 is a clean scan and exit 1 is findings. Both pass, and findings also raise a warning. Every other
+exit is a scan error, which fails the job and names the exit in the summary. A failed scan still writes a
+report that reads as clean, so that report is never published and nothing is uploaded. A repository with no
+lockfile passes with no findings.
+
+A site adds this caller as `.github/workflows/osv-scan.yml`, pinned to a commit of this repository. The
+schedule lands the report early on Monday in New Zealand:
+
+```yaml
+name: OSV scan
+on:
+  schedule:
+    - cron: '23 19 * * 0'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scan:
+    uses: APKiwiOrg/ci-workflows/.github/workflows/osv-scan.yml@<full commit sha>
+```
+
+Run it by hand from a site, or from this repository to prove a change against its own checkout:
+
+```bash
+gh workflow run osv-scan.yml --ref main
+```
+
+osv-scanner reads `package-lock.json` and `uv.lock`, among others, and honours an `osv-scanner.toml` beside
+a lockfile. Every `[[IgnoredVulns]]` entry there carries an `ignoreUntil` date and a `reason` that links the
+dismissed Dependabot alert, so an ignore expires and the alert stays the record.
+
+To move to a new osv-scanner release, update `OSV_SCANNER_VERSION` and `OSV_SCANNER_SHA256` together, taking
+the `osv-scanner_linux_amd64` line from the release's `osv-scanner_SHA256SUMS`.

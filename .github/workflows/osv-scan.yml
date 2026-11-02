@@ -1,0 +1,80 @@
+name: osv-scan
+
+# A weekly dependency vulnerability report. A site calls it from a small scheduled caller of its own (see
+# README.md). This repository can also run it by hand to prove a change, scanning its own checkout.
+#
+# Report only, never a required check. Dependabot alerts stay the record. Findings pass with a warning and
+# a table in the job summary. A scan error fails the job, because osv-scanner then still writes a report
+# that reads as a clean scan, and that report is never published. The JSON report is a short-lived
+# artifact. There is no code scanning upload, since the private site repositories lack it.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  scan:
+    name: Dependency vulnerability report
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      OSV_SCANNER_VERSION: 2.7.0
+      # From the release's osv-scanner_SHA256SUMS, for osv-scanner_linux_amd64. Update both together.
+      OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The official action pins only a docker tag, so the release binary is checked against the pinned
+      # checksum instead. It lives outside the checkout so the scan never reads it.
+      - name: Install osv-scanner
+        run: |
+          bin="$RUNNER_TEMP/osv-scanner"
+          curl -sSfL -o "$bin" "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $bin" | sha256sum --check --strict
+          chmod +x "$bin"
+
+      # osv-scanner exits 0 with no findings and 1 with findings. Every other exit is a scan error. It
+      # writes one format per run, so the JSON report and the markdown summary are two scans.
+      - name: Scan the dependencies
+        run: |
+          report="$RUNNER_TEMP/osv-scan"
+          mkdir -p "$report"
+          findings=false
+          for format in json markdown; do
+            status=0
+            "$RUNNER_TEMP/osv-scanner" scan source -r --allow-no-lockfiles --format "$format" \
+              --output-file "$report/osv-scanner.$format" . || status=$?
+            case "$status" in
+              0) ;;
+              1) findings=true ;;
+              *)
+                echo "::error::osv-scanner $format scan failed with exit $status, so this run has no report"
+                printf '## osv-scanner %s\n\nThe %s scan failed with exit %s, so this run has no report. See the job log.\n' \
+                  "$OSV_SCANNER_VERSION" "$format" "$status" >> "$GITHUB_STEP_SUMMARY"
+                exit 1 ;;
+            esac
+          done
+          {
+            echo "## osv-scanner $OSV_SCANNER_VERSION"
+            echo ""
+            cat "$report/osv-scanner.markdown"
+            echo ""
+            echo "The full JSON report is the \`osv-scanner\` artifact. Dependabot alerts stay the record."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$findings" = true ]; then
+            echo "::warning::osv-scanner found known vulnerabilities, listed in the job summary"
+          fi
+
+      - name: Upload the JSON report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: osv-scanner
+          path: ${{ runner.temp }}/osv-scan/osv-scanner.json
+          retention-days: 14
+          if-no-files-found: error
