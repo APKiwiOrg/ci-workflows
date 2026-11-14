@@ -156,9 +156,10 @@ jobs:
           sql_password="Sql1!$sql_password"
           echo "::add-mask::$sql_password"
           export MSSQL_SA_PASSWORD="$sql_password"
+          # Pin the stored OCI manifest because MCR's converted Docker v2 digest cannot be pulled by digest.
           docker run -d --name accounts-sql -p 127.0.0.1:1433:1433 \
             --env ACCEPT_EULA=Y --env MSSQL_SA_PASSWORD \
-            mcr.microsoft.com/mssql/server@sha256:e10cd49443c94dbdcb7a050987db22ff4d8c87052ac53768abe1ed848d3fcef6 # 2022-latest
+            mcr.microsoft.com/mssql/server@sha256:4525e3efac9f3e241cb003bb2ff2a82818b502f37e12049d788b1a9fa7e13b7f # 2022-latest
           for attempt in $(seq 1 30); do
             if SQLCMDPASSWORD="$sql_password" docker exec --env SQLCMDPASSWORD accounts-sql \
               /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -l 2 -t 2 -Q 'SELECT 1' > /dev/null 2>&1; then
