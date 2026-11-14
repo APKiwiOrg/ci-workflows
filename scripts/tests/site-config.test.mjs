@@ -15,7 +15,7 @@ const workflows = [
 ]
 const folders = []
 const values = {
-  'app-location': 'out', 'has-form': 'false', 'has-theme': 'false', analytics: 'none',
+  'app-location': 'out', 'has-form': 'false', 'has-theme': 'false', 'has-accounts': 'false', analytics: 'none',
   'infra-params': '["infra/params/site.bicepparam","infra/params/preview.bicepparam"]',
 }
 
@@ -72,7 +72,7 @@ afterEach(() => {
 
 for (const [path, jobId] of workflows) {
   describe(`${path.split('/').at(-1)} config gate`, () => {
-    test('the fixture CLI exports all five validated job outputs', () => {
+    test('the fixture CLI exports all six validated job outputs', () => {
       const result = readConfig(path, jobId)
       assert.equal(result.status, 0, result.stderr)
       const implementation = calledWorkflowPath(path, jobId)
@@ -96,7 +96,7 @@ for (const [path, jobId] of workflows) {
 
     test('accepts the alternate framework and capability values', () => {
       assert.equal(readConfig(path, jobId, {
-        'app-location': 'build/client', 'has-form': 'true', 'has-theme': 'true', analytics: 'cloudflare',
+        'app-location': 'build/client', 'has-form': 'true', 'has-theme': 'true', 'has-accounts': 'true', analytics: 'cloudflare',
         'infra-params': '["infra/params/site.bicepparam"]',
       }).status, 0)
     })
@@ -122,7 +122,7 @@ for (const [path, jobId] of workflows) {
     }
 
     for (const [key, invalid] of [
-      ['app-location', 'dist'], ['has-form', 'TRUE'], ['has-theme', '0'], ['analytics', 'other'],
+      ['app-location', 'dist'], ['has-form', 'TRUE'], ['has-theme', '0'], ['has-accounts', 'TRUE'], ['analytics', 'other'],
       ['infra-params', 'not-json'], ['infra-params', '{}'], ['infra-params', '[]'],
       ['infra-params', '[null]'], ['infra-params', '["/tmp/site.bicepparam"]'],
       ['infra-params', '["../site.bicepparam"]'], ['infra-params', '["infra/../site.bicepparam"]'],
@@ -147,10 +147,21 @@ const [deployPath] = workflows[1]
 
 describe('capabilities control the consumer steps', () => {
   test('every CI job depends on validated config before any install', () => {
-    for (const id of ['checks', 'repo', 'secrets', 'infra', 'audit']) {
+    for (const id of ['checks', 'repo', 'secrets', 'infra', 'audit', 'sql']) {
       assert.match(jobBlock(ciPath, id), /^ {4}needs: config$/mu)
     }
     assert.match(jobBlock(ciPath, 'e2e'), /^ {4}needs: \[config, checks\]$/mu)
+  })
+
+  test('SQL runs only for accounts sites after config validation', () => {
+    const source = jobBlock(ciPath, 'sql').match(/^ {4}if: (.+)$/mu)?.[1]
+    assert.equal(source, "needs.config.outputs.has-accounts == 'true'")
+    for (const [capability, expected] of [['false', false], ['true', true]]) {
+      const outputs = fixtureOutputs(ciPath, 'config', { ...values, 'has-accounts': capability })
+      assert.equal(runInNewContext(source.replaceAll('outputs.has-accounts', "outputs['has-accounts']"), {
+        needs: { config: { outputs } },
+      }), expected)
+    }
   })
 
   test('theme and token builds only run for their capabilities', () => {

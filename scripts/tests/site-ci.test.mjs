@@ -12,7 +12,7 @@ import { jobBlock, stepBlock, stepScript } from './workflow-steps.mjs'
 const workflowPath = fileURLToPath(new URL('../../.github/workflows/site-ci.yml', import.meta.url))
 const workflow = () => readFileSync(workflowPath, 'utf8')
 const job = (id) => jobBlock(workflowPath, id)
-const jobIds = ['checks', 'repo', 'secrets', 'infra', 'e2e', 'audit']
+const jobIds = ['checks', 'repo', 'secrets', 'infra', 'e2e', 'audit', 'sql']
 const apiSteps = ['Install api', 'Typecheck api', 'Test api']
 const driftStep = 'Site template drift'
 const folders = []
@@ -88,9 +88,105 @@ describe('config controls the site layout', () => {
     assert.deepEqual(inputs.match(/^ {6}[a-z-]+:/gmu)?.map((line) => line.trim()), [
       'node-version-file:', 'analytics-test-token:', 'bicep-file:',
     ])
-    for (const id of ['checks', 'repo', 'infra', 'e2e', 'audit']) {
+    for (const id of ['checks', 'repo', 'infra', 'e2e', 'audit', 'sql']) {
       assert.match(job(id), /node-version-file: \$\{\{ inputs\.node-version-file \}\}/u)
     }
+  })
+})
+
+// Run the shipped startup script with Docker and sleep replaced at the process boundary.
+// Login outcomes are deterministic and no container or real wait is needed locally.
+function runSql({ readyAfter = 1, startExit = 0 } = {}) {
+  const folder = mkdtempSync(join(tmpdir(), 'ciwf-sql-'))
+  folders.push(folder)
+  const log = join(folder, 'docker-log')
+  const waits = join(folder, 'waits')
+  const githubEnv = join(folder, 'github-env')
+  writeFileSync(log, '')
+  writeFileSync(waits, '')
+  writeFileSync(githubEnv, '')
+  writeFileSync(join(folder, 'docker'), `#!${process.execPath}
+import { appendFileSync, readFileSync } from 'node:fs'
+const args = process.argv.slice(2)
+appendFileSync(process.env.DOCKER_LOG, JSON.stringify({
+  args, password: process.env.MSSQL_SA_PASSWORD, loginPassword: process.env.SQLCMDPASSWORD,
+}) + '\\n')
+if (args[0] === 'run') process.exit(Number(process.env.START_EXIT))
+if (args[0] !== 'exec') process.exit(2)
+const attempts = readFileSync(process.env.DOCKER_LOG, 'utf8').trim().split('\\n')
+  .map(JSON.parse).filter(({ args }) => args[0] === 'exec').length
+process.exit(attempts >= Number(process.env.READY_AFTER) ? 0 : 1)
+`, { mode: 0o700 })
+  writeFileSync(join(folder, 'sleep'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$WAITS"\n', { mode: 0o700 })
+  const result = spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'sql', 'Start SQL Server')], {
+    cwd: folder, encoding: 'utf8', env: {
+      PATH: `${folder}:${process.env.PATH}`, GITHUB_ENV: githubEnv, DOCKER_LOG: log, WAITS: waits,
+      READY_AFTER: String(readyAfter), START_EXIT: String(startExit),
+    },
+  })
+  return {
+    ...result,
+    events: readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
+    waits: readFileSync(waits, 'utf8').trim().split('\n').filter(Boolean),
+    environment: readFileSync(githubEnv, 'utf8'),
+  }
+}
+
+describe('accounts SQL integration job', () => {
+  test('starts a digest-pinned SQL Server 2022 with a masked random credential before publishing the connection', () => {
+    const result = runSql({ readyAfter: 3 })
+    assert.equal(result.status, 0, result.stderr)
+    const [start, ...logins] = result.events
+    assert.equal(start.args[0], 'run')
+    assert.ok(start.args.includes('-d'))
+    assert.ok(start.args.includes('ACCEPT_EULA=Y'))
+    assert.ok(start.args.includes('127.0.0.1:1433:1433'))
+    assert.match(start.args.at(-1), /^mcr\.microsoft\.com\/mssql\/server@sha256:[a-f0-9]{64}$/u)
+    assert.match(stepScript(workflowPath, 'sql', 'Start SQL Server'), /mcr\.microsoft\.com\/mssql\/server@sha256:[a-f0-9]{64} # 2022-latest$/mu)
+    assert.doesNotMatch(job('sql'), /^ {4}services:/mu)
+    assert.ok(start.password.length >= 8 && start.password.length <= 128)
+    for (const pattern of [/[A-Z]/u, /[a-z]/u, /[0-9]/u, /[^A-Za-z0-9]/u]) assert.match(start.password, pattern)
+    assert.match(stepScript(workflowPath, 'sql', 'Start SQL Server'), /openssl rand/u)
+    assert.equal(result.stdout, `::add-mask::${start.password}\n`)
+    assert.equal(result.stderr, '')
+    assert.equal(logins.length, 3)
+    for (const login of logins) {
+      assert.ok(login.args.includes('/opt/mssql-tools18/bin/sqlcmd'))
+      assert.ok(login.args.includes('-C'))
+      assert.ok(login.args.includes('-b'))
+      assert.ok(login.args.includes('SQLCMDPASSWORD'))
+      assert.equal(login.loginPassword, start.password)
+    }
+    assert.deepEqual(result.waits, ['2', '2'])
+    assert.equal(result.environment,
+      `ACCOUNTS_SQL_TEST_SERVER=Server=127.0.0.1,1433;User Id=sa;Password=${start.password};Encrypt=true;TrustServerCertificate=true\n`)
+  })
+
+  test('fails after 30 unanswered login attempts without publishing a connection', () => {
+    const result = runSql({ readyAfter: 31 })
+    assert.equal(result.status, 1)
+    assert.equal(result.events.filter(({ args }) => args[0] === 'exec').length, 30)
+    assert.deepEqual(result.waits, Array(29).fill('2'))
+    assert.equal(result.environment, '')
+    assert.equal(result.stdout, `::add-mask::${result.events[0].password}\n`)
+    assert.ok(!result.stderr.includes(result.events[0].password))
+  })
+
+  test('a container start failure stops before login or connection publication', () => {
+    const result = runSql({ startExit: 7 })
+    assert.equal(result.status, 7)
+    assert.equal(result.events.length, 1)
+    assert.deepEqual(result.waits, [])
+    assert.equal(result.environment, '')
+  })
+
+  test('SQL installs the api under npm policy and runs its SQL suite using the step environment', () => {
+    const sql = job('sql')
+    assert.match(sql, /permissions:\n {6}contents: read\n/u)
+    assert.ok(sql.indexOf('node scripts/check-npm-policy.mjs') < sql.indexOf('npm ci --prefix api'))
+    assert.match(step('sql', 'Install api'), /run: npm ci --prefix api/u)
+    assert.match(step('sql', 'SQL integration tests'), /run: npm run test:sql --prefix api/u)
+    assert.match(step('sql', 'SQL integration tests'), /ACCOUNTS_SQL_TEST_SERVER: \$\{\{ env\.ACCOUNTS_SQL_TEST_SERVER \}\}/u)
   })
 })
 

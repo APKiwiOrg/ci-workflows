@@ -154,6 +154,7 @@ selected tests. Check the retained TRX count before treating a run as evidence.
 Runs a site's CI. `config` validates the site config before any install. `checks` lints, typechecks, tests
 and builds, then holds the build to the asset budget. `audit` installs and audits the root and any api package.
 `repo` runs the repository convention checks, the site template drift check and the shell script tests.
+`sql` runs the api SQL integration tests only when `has-accounts` is true.
 `secrets` scans every commit with a checksum-verified gitleaks. `infra` compiles the Bicep template and
 parameters and checks the infrastructure policy. `e2e` builds and runs the browser smoke after `checks`
 passes. Every checkout drops its credentials.
@@ -189,13 +190,14 @@ site caller's existing pin. Its checkout reads the site repository. The optional
 selects the source commit to read, without changing the validation implementation's ref.
 
 The shared config job runs `node scripts/site-config.mjs --github-output` once from that checkout before
-any install. The CLI validates the config and appends these five `key=value` lines to `$GITHUB_OUTPUT`:
+any install. The CLI validates the config and appends these six `key=value` lines to `$GITHUB_OUTPUT`:
 
 | Key | Required value | Use |
 | --- | --- | --- |
 | `app-location` | `build/client` or `out` | Asset budget, artifact upload and deployment folder |
 | `has-form` | `true` or `false` | Exposed capability, independent of the api directory |
 | `has-theme` | `true` or `false` | Run the theme check only when true |
+| `has-accounts` | `true` or `false` | Run the SQL integration job only when true |
 | `analytics` | `cloudflare` or `none` | Pass a build token only for cloudflare |
 | `infra-params` | Compact JSON array such as `["infra/params/site.bicepparam"]` | Compile every params file |
 
@@ -203,6 +205,13 @@ The workflows reject a missing CLI, a failed CLI, missing or duplicate keys and 
 array must be nonempty and contain repo-relative `.bicepparam` paths without empty, `.` or `..` segments.
 Absolute paths, backslashes and control characters are refused. Every listed params file must exist.
 There are no default capabilities or output folders.
+
+The SQL job starts a digest-pinned SQL Server 2022 container on the hosted runner with a random, masked
+SA password. It tries up to 30 logins, two seconds apart, and fails if SQL never answers. After a login
+succeeds, it publishes an encrypted, local `ACCOUNTS_SQL_TEST_SERVER` connection string through
+`GITHUB_ENV`. It checks npm policy, runs `npm ci --prefix api`, then `npm run test:sql --prefix api` with
+that connection string in the test environment. Accounts sites must supply this api script. Sites with
+`has-accounts` set to `false` skip the whole job.
 
 This is a breaking caller contract. The `app-location`, `has-api`, `has-e2e`, `has-infra` and `bicep-params`
 inputs have been removed. The deploy workflow also removes `api-location`, since the checkout determines

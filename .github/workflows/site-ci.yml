@@ -3,7 +3,7 @@ name: site-ci
 # The shared CI for every site. A site calls it from a small caller of its own (see README.md) named CI in
 # .github/workflows/ci.yml, whose successful main-push runs are what site-deploy.yml accepts.
 #
-# Config validation gates every job. The site capabilities select the theme and analytics checks.
+# Config validation gates every job. The site capabilities select the theme, analytics and SQL checks.
 # The api steps run when the checkout has an api directory. Infrastructure and e2e are required.
 #
 # Inputs reach scripts only through env, never by expression interpolation into a run line.
@@ -124,6 +124,58 @@ jobs:
           if (result.error) console.error(result.error.message)
           process.exit(result.status ?? 1)
           NODE
+
+  sql:
+    needs: config
+    if: needs.config.outputs.has-accounts == 'true'
+    name: SQL integration tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: npm
+
+      - name: npm install policy
+        run: node scripts/check-npm-policy.mjs
+
+      - name: Install api
+        run: npm ci --prefix api
+
+      - name: Start SQL Server
+        run: |
+          set -eu
+          sql_password="$(openssl rand -hex 24)"
+          sql_password="Sql1!$sql_password"
+          echo "::add-mask::$sql_password"
+          export MSSQL_SA_PASSWORD="$sql_password"
+          docker run -d --name accounts-sql -p 127.0.0.1:1433:1433 \
+            --env ACCEPT_EULA=Y --env MSSQL_SA_PASSWORD \
+            mcr.microsoft.com/mssql/server@sha256:e10cd49443c94dbdcb7a050987db22ff4d8c87052ac53768abe1ed848d3fcef6 # 2022-latest
+          for attempt in $(seq 1 30); do
+            if SQLCMDPASSWORD="$sql_password" docker exec --env SQLCMDPASSWORD accounts-sql \
+              /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -l 2 -t 2 -Q 'SELECT 1' > /dev/null 2>&1; then
+              printf 'ACCOUNTS_SQL_TEST_SERVER=Server=127.0.0.1,1433;User Id=sa;Password=%s;Encrypt=true;TrustServerCertificate=true\n' "$sql_password" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            if [ "$attempt" -lt 30 ]; then
+              sleep 2
+            fi
+          done
+          echo 'SQL Server did not become ready after 30 login attempts.' >&2
+          exit 1
+
+      - name: SQL integration tests
+        env:
+          ACCOUNTS_SQL_TEST_SERVER: ${{ env.ACCOUNTS_SQL_TEST_SERVER }}
+        run: npm run test:sql --prefix api
 
   repo:
     needs: config

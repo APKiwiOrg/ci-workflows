@@ -20,6 +20,9 @@ on:
       has-theme:
         description: Validated theme capability
         value: ${{ jobs.config.outputs.has-theme }}
+      has-accounts:
+        description: Validated accounts capability
+        value: ${{ jobs.config.outputs.has-accounts }}
       analytics:
         description: Validated analytics provider
         value: ${{ jobs.config.outputs.analytics }}
@@ -39,6 +42,7 @@ jobs:
       app-location: ${{ steps.config.outputs.app-location }}
       has-form: ${{ steps.config.outputs.has-form }}
       has-theme: ${{ steps.config.outputs.has-theme }}
+      has-accounts: ${{ steps.config.outputs.has-accounts }}
       analytics: ${{ steps.config.outputs.analytics }}
       infra-params: ${{ steps.config.outputs.infra-params }}
     steps:
@@ -79,6 +83,7 @@ jobs:
             'app-location': ['build/client', 'out'],
             'has-form': ['true', 'false'],
             'has-theme': ['true', 'false'],
+            'has-accounts': ['true', 'false'],
             analytics: ['cloudflare', 'none'],
           })) {
             if (!allowed.includes(outputs.get(key))) fail(`${key} must be one of ${allowed.join(', ')}`)
