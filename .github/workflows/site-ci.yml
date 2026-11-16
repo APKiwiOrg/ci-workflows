@@ -173,9 +173,33 @@ jobs:
           echo 'SQL Server did not become ready after 30 login attempts.' >&2
           exit 1
 
+      # Blob integration tests run against the storage emulator. Only the blob service runs. The storage
+      # SDK can send a newer API version than the emulator knows, so the version check is off.
+      - name: Start Azurite
+        run: |
+          set -eu
+          # MCR stores this image as a Docker v2 manifest list, and that served digest pulls by digest.
+          azurite_image=mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5 # 3.37.0
+          docker run -d --name media-blob -p 127.0.0.1:10000:10000 "$azurite_image" \
+            azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
+          # Any HTTP status means the blob endpoint answers. curl prints 000 when nothing answers.
+          for attempt in $(seq 1 30); do
+            code="$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/devstoreaccount1 || true)"
+            if [ "$code" != 000 ]; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 30 ]; then
+              sleep 2
+            fi
+          done
+          echo 'Azurite did not answer on 127.0.0.1:10000 after 30 attempts.' >&2
+          exit 1
+
+      # UseDevelopmentStorage=true is the storage SDK's emulator shorthand, so no emulator key is written here.
       - name: SQL integration tests
         env:
           ACCOUNTS_SQL_TEST_SERVER: ${{ env.ACCOUNTS_SQL_TEST_SERVER }}
+          MEDIA_BLOB_TEST_CONNECTION: UseDevelopmentStorage=true
         run: npm run test:sql --prefix api
 
   repo:

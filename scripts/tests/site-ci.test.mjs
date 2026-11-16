@@ -188,6 +188,103 @@ describe('accounts SQL integration job', () => {
     assert.match(step('sql', 'SQL integration tests'), /run: npm run test:sql --prefix api/u)
     assert.match(step('sql', 'SQL integration tests'), /ACCOUNTS_SQL_TEST_SERVER: \$\{\{ env\.ACCOUNTS_SQL_TEST_SERVER \}\}/u)
   })
+
+  test('the integration tests receive the emulator shorthand and no emulator key', () => {
+    const tests = step('sql', 'SQL integration tests')
+    assert.match(tests, /^ {10}MEDIA_BLOB_TEST_CONNECTION: UseDevelopmentStorage=true$/mu)
+    assert.doesNotMatch(workflow(), /AccountKey|Eby8vdM02/u)
+  })
+
+  test('Azurite starts after SQL Server and before the integration tests', () => {
+    const sql = job('sql')
+    const order = ['Start SQL Server', 'Start Azurite', 'SQL integration tests']
+      .map((name) => sql.indexOf(`      - name: ${name}\n`))
+    assert.ok(order.every((index) => index >= 0), JSON.stringify(order))
+    assert.deepEqual([...order].sort((a, b) => a - b), order)
+  })
+})
+
+// Run the shipped Azurite step with Docker, curl and sleep replaced at the process boundary.
+// curl answers 000 until the given attempt, then the given HTTP status.
+function runAzurite({ readyAfter = 1, readyCode = '400', startExit = 0 } = {}) {
+  const folder = mkdtempSync(join(tmpdir(), 'ciwf-azurite-'))
+  folders.push(folder)
+  const log = join(folder, 'docker-log')
+  const probes = join(folder, 'probes')
+  const waits = join(folder, 'waits')
+  for (const file of [log, probes, waits]) writeFileSync(file, '')
+  writeFileSync(join(folder, 'docker'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$DOCKER_LOG"\nexit "$START_EXIT"\n',
+    { mode: 0o700 })
+  writeFileSync(join(folder, 'curl'), `#!${process.execPath}
+import { appendFileSync, readFileSync } from 'node:fs'
+appendFileSync(process.env.PROBES, JSON.stringify(process.argv.slice(2)) + '\\n')
+const attempts = readFileSync(process.env.PROBES, 'utf8').trim().split('\\n').length
+if (attempts < Number(process.env.READY_AFTER)) {
+  process.stdout.write('000')
+  process.exit(7)
+}
+process.stdout.write(process.env.READY_CODE)
+`, { mode: 0o700 })
+  writeFileSync(join(folder, 'sleep'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$WAITS"\n', { mode: 0o700 })
+  const result = spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'sql', 'Start Azurite')], {
+    cwd: folder, encoding: 'utf8', env: {
+      PATH: `${folder}:${process.env.PATH}`, DOCKER_LOG: log, PROBES: probes, WAITS: waits,
+      READY_AFTER: String(readyAfter), READY_CODE: readyCode, START_EXIT: String(startExit),
+    },
+  })
+  const lines = (file) => readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+  return { ...result, starts: lines(log), probes: lines(probes).map(JSON.parse), waits: lines(waits) }
+}
+
+describe('Azurite for blob integration tests', () => {
+  test('starts a digest-pinned blob-only Azurite on loopback and waits for any HTTP answer', () => {
+    const result = runAzurite({ readyAfter: 3 })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout, '')
+    assert.equal(result.stderr, '')
+    assert.equal(result.starts.length, 1)
+    const args = result.starts[0].split(' ')
+    assert.deepEqual(args.slice(0, 2), ['run', '-d'])
+    assert.equal(args[args.indexOf('-p') + 1], '127.0.0.1:10000:10000')
+    const image = args.findIndex((arg) => arg.startsWith('mcr.microsoft.com/azure-storage/azurite'))
+    assert.match(args[image], /^mcr\.microsoft\.com\/azure-storage\/azurite@sha256:[a-f0-9]{64}$/u)
+    assert.deepEqual(args.slice(image + 1),
+      ['azurite-blob', '--blobHost', '0.0.0.0', '--blobPort', '10000', '--skipApiVersionCheck'])
+    assert.match(stepScript(workflowPath, 'sql', 'Start Azurite'),
+      /mcr\.microsoft\.com\/azure-storage\/azurite@sha256:[a-f0-9]{64} # \d+\.\d+\.\d+$/mu)
+    assert.equal(result.probes.length, 3)
+    for (const probe of result.probes) {
+      assert.equal(probe.at(-1), 'http://127.0.0.1:10000/devstoreaccount1')
+      assert.equal(probe[probe.indexOf('-o') + 1], '/dev/null')
+      assert.equal(probe[probe.indexOf('-w') + 1], '%{http_code}')
+    }
+    assert.deepEqual(result.waits, ['2', '2'])
+  })
+
+  for (const code of ['200', '403', '500']) {
+    test(`an HTTP ${code} answer counts as ready`, () => {
+      const result = runAzurite({ readyCode: code })
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.probes.length, 1)
+      assert.deepEqual(result.waits, [])
+    })
+  }
+
+  test('fails after 30 unanswered probes with an error', () => {
+    const result = runAzurite({ readyAfter: 31 })
+    assert.equal(result.status, 1)
+    assert.equal(result.probes.length, 30)
+    assert.deepEqual(result.waits, Array(29).fill('2'))
+    assert.notEqual(result.stderr.trim(), '')
+  })
+
+  test('a container start failure stops before any probe', () => {
+    const result = runAzurite({ startExit: 7 })
+    assert.equal(result.status, 7)
+    assert.equal(result.starts.length, 1)
+    assert.deepEqual(result.probes, [])
+    assert.deepEqual(result.waits, [])
+  })
 })
 
 // Runs the drift step in a temp site under bash -e, the shell GitHub uses for a run step with no shell set.
