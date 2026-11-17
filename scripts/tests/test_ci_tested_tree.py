@@ -115,6 +115,16 @@ class FindPassTests(unittest.TestCase):
     def test_artifacts_answer_without_a_list_is_no_reuse(self):
         self.assertNoReuse(check(FakeFetch(raw={ARTIFACTS_PATH: {"total_count": 1}})))
 
+    def test_more_pass_markers_than_one_page_is_no_reuse(self):
+        answer = {"total_count": 101, "artifacts": [artifact()]}
+        reuse, reason, run_url = check(FakeFetch(runs=[run()], raw={ARTIFACTS_PATH: answer}))
+        self.assertIs(reuse, False)
+        self.assertIn("more ci-passed-full-%s markers than one page holds" % TREE, reason)
+        self.assertEqual(run_url, "")
+
+    def test_pass_marker_answer_without_a_count_is_no_reuse(self):
+        self.assertNoReuse(check(FakeFetch(runs=[run()], raw={ARTIFACTS_PATH: {"artifacts": [artifact()]}})))
+
     def test_run_still_going_is_no_reuse(self):
         self.assertNoReuse(check(FakeFetch([artifact()], [run(conclusion=None)])))
 
@@ -241,9 +251,11 @@ class NewerFailureTests(unittest.TestCase):
                                       failures=[failed(201)]))
         self.assertIs(reuse, True)
 
-    def test_failed_marker_of_a_run_still_going_changes_nothing(self):
-        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, None)], failures=[failed(201)]))
-        self.assertIs(reuse, True)
+    def test_failed_marker_of_a_run_still_going_is_no_reuse(self):
+        # Only a verdict that did not pass uploads a failed marker, so the run is failing as it completes.
+        reuse, reason, _ = check(FakeFetch([self.PASS], [run(101), run(201, None)], failures=[failed(201)]))
+        self.assertIs(reuse, False)
+        self.assertIn(RUN_URL % 201, reason)
 
     def test_expired_failed_marker_changes_nothing(self):
         reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure")],
@@ -282,6 +294,17 @@ class NewerFailureTests(unittest.TestCase):
 
     def test_failed_run_lookup_error_is_no_reuse(self):
         reuse, _, _ = check(FakeFetch([self.PASS], [run(101)], failures=[failed(201)]))
+        self.assertIs(reuse, False)
+
+    def test_more_failed_markers_than_one_page_is_no_reuse(self):
+        answer = {"total_count": 101, "artifacts": [failed(201, "2026-01-19T08:00:00Z")]}
+        reuse, reason, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure")], raw={FAILED_PATH: answer}))
+        self.assertIs(reuse, False)
+        self.assertIn("more ci-failed-full-%s markers than one page holds" % TREE, reason)
+
+    def test_failed_marker_answer_without_a_count_is_no_reuse(self):
+        answer = {"artifacts": []}
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101)], raw={FAILED_PATH: answer}))
         self.assertIs(reuse, False)
 
     def test_too_many_newer_failures_to_check_is_no_reuse(self):

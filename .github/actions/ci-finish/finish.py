@@ -2,14 +2,17 @@
 """Give a CI run one verdict and one summary, and prepare the tested-tree marker of a full run.
 
 The verdict starts from the calling job's `needs`: a job that failed or was cancelled fails the run, and
-input that is not a JSON object naming at least one job fails it. A skipped job fails it unless its id is in
-the always-allowed list, or in the segment list on a run that is not full, since a full run runs every
-segment. The jobs API can then only turn a pass into a fail: a finished job of this run that failed, timed
-out or was cancelled, and that `needs` does not report, fails the run. An API error leaves the verdict from
-`needs` as it is. The API otherwise supplies the summary's stage names and times, and the artifacts API its
-footer.
+input that is not a JSON object naming at least one job fails it, as does a `full` input other than true or
+false. A skipped job fails it unless its id is in the segment list on a run that is not full, or in the
+always-allowed list and not the segment list, since a full run runs every segment. The jobs API can then only
+turn a pass into a fail: a job of this run other than the finishing one that has not finished, or that
+finished as failed, timed out or cancelled, fails the run. `needs` reports neither, so the job is missing
+from `needs` or allowed to fail. A job that needs the finishing job is not listed by the API while the
+finishing job runs, so it is never counted. An API error leaves the verdict from `needs` as it is. The API
+otherwise supplies the summary's stage names and times, and the artifacts API its footer.
 
-A full run that passed prepares the ci-passed-full-TREE marker. A full run that failed with at least one job
+A full run that passed prepares the ci-passed-full-TREE marker, but only when the jobs API was read, since
+otherwise a job missing from `needs` could have failed unseen. A full run that failed with at least one job
 in `needs` reporting `failure` prepares ci-failed-full-TREE instead, so ci-tested-tree knows a newer full run
 of the tree failed. A run whose only problems are cancelled or wrongly skipped jobs prepares neither.
 
@@ -39,6 +42,7 @@ FAILED_MARKER_PREFIX = "ci-failed-full-"
 # Job conclusions from the API that fail the run when `needs` does not report the job.
 FAILING_CONCLUSIONS = ("failure", "timed_out", "cancelled")
 NOT_AN_OBJECT = "needs input is not a JSON object"
+BAD_FULL = "full input is not true or false"
 NOT_AFFECTED = "Not affected by this change"
 JOBS_PER_PAGE = 100
 JOB_PAGES = 3
@@ -106,7 +110,8 @@ def verdict(needs, allowed, always=(), full=False):
     if not parsed:
         return False, ["needs input names no jobs"]
     segment_jobs = set(allowed)
-    excused = set(always) | (set() if full else segment_jobs)
+    # The segment rule wins for an id in both lists, so a full run never passes with a segment job skipped.
+    excused = (set(always) - segment_jobs) | (set() if full else segment_jobs)
     problems = []
     for job_id, entry in parsed.items():
         result = entry.get("result") if isinstance(entry, dict) else None
@@ -128,16 +133,20 @@ def any_failure(needs):
     return any(isinstance(entry, dict) and entry.get("result") == "failure" for entry in parsed.values())
 
 
-def unreported_failures(jobs, own_job_name):
+def unreported_problems(jobs, own_job_name):
     # type: (Sequence[dict], str) -> List[str]
-    """A problem for each finished job of this run, other than the finishing one, that failed, timed out or
-    was cancelled. Called only when needs reported a pass, so needs does not report any of these: the job is
-    missing from needs or is allowed to fail. A job that has not finished never counts."""
+    """A problem for each job of this run, other than the finishing one, that has not finished, or that
+    finished as failed, timed out or cancelled. Called only when needs reported a pass, so needs does not
+    report any of these: the job is missing from needs or is allowed to fail. A job that needs the finishing
+    job is not listed while it runs, so a listed job that has not finished is one the verdict does not wait
+    for."""
     problems = []
     for job in jobs:
         if not isinstance(job, dict) or _is_own(job.get("name"), own_job_name):
             continue
-        if job.get("status") == "completed" and job.get("conclusion") in FAILING_CONCLUSIONS:
+        if job.get("status") != "completed":
+            problems.append("%s has not finished and needs does not wait for it" % job.get("name"))
+        elif job.get("conclusion") in FAILING_CONCLUSIONS:
             problems.append("%s: %s, not reported by needs (missing from needs or allowed to fail)"
                             % (job.get("name"), job.get("conclusion")))
     return problems
@@ -321,20 +330,37 @@ def _title(env):
     return env.get("CI_FINISH_TITLE") or "%s CI" % repo.rsplit("/", 1)[-1]
 
 
+def parse_full(text):
+    # type: (Any) -> Optional[bool]
+    """True or False for the `full` input, read after trimming and lower-casing, or None for anything else."""
+    value = text.strip().lower() if isinstance(text, str) else None
+    return {"true": True, "false": False}.get(value)
+
+
 def _full(env):
-    return env.get("CI_FINISH_FULL", "").strip().lower() == "true"
+    # Only a full run that says so is marked. An unreadable value fails the verdict anyway.
+    return parse_full(env.get("CI_FINISH_FULL")) is True
 
 
 def _verdict_from(env):
-    return verdict(env.get("CI_FINISH_NEEDS", ""), parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED", "")),
-                   parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED_ALWAYS", "")), _full(env))
+    full = parse_full(env.get("CI_FINISH_FULL"))
+    passed, problems = verdict(
+        env.get("CI_FINISH_NEEDS", ""), parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED", "")),
+        parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED_ALWAYS", "")), full is True)
+    if full is None:
+        # Read as partial, `allow-skipped` would excuse every segment skip, so the run cannot pass.
+        return False, [BAD_FULL] + problems
+    return passed, problems
 
 
-def marker_for(full, passed, needs, tree_of):
-    # type: (bool, bool, Any, Callable[[], Optional[str]]) -> Tuple[str, str, List[str]]
-    """Returns (artifact, tree, notes). The artifact is empty when no marker is due or the tree is unreadable."""
+def marker_for(full, passed, needs, tree_of, jobs_read=True):
+    # type: (bool, bool, Any, Callable[[], Optional[str]], bool) -> Tuple[str, str, List[str]]
+    """Returns (artifact, tree, notes). The artifact is empty when no marker is due or the tree is unreadable.
+    A pass is marked only when the jobs API was read, so no job missing from needs failed unseen."""
     if not full:
         return "", "", []
+    if passed and not jobs_read:
+        return "", "", ["Jobs API not read, so no tested-tree marker is uploaded."]
     if passed:
         prefix = MARKER_PREFIX
     elif any_failure(needs):
@@ -362,7 +388,7 @@ def finish(env, fetch, tree_of, now):
         jobs = None
     if passed and jobs is not None:
         # The API can only turn a pass into a fail, never the reverse.
-        unreported = unreported_failures(jobs, own_job_name)
+        unreported = unreported_problems(jobs, own_job_name)
         if unreported:
             passed, problems = False, problems + unreported
     all_rows = table(needs, jobs, own_job_name,
@@ -371,7 +397,7 @@ def finish(env, fetch, tree_of, now):
     starts = [github_api.parse_time(j.get("started_at")) for j in jobs or [] if isinstance(j, dict)]
     starts = [s for s in starts if s is not None]
     seconds = max(0.0, (now - min(starts)).total_seconds()) if starts else None
-    if full and passed:
+    if full and passed and jobs is not None:
         footer = "this run"
     else:
         try:
@@ -382,7 +408,7 @@ def finish(env, fetch, tree_of, now):
             notes.append("Artifacts API unavailable: %s" % error)
             footer = "not recorded"
     summary = render(_title(env), env.get("GITHUB_EVENT_NAME", ""), passed, all_rows, footer, seconds)
-    artifact, tree, marker_notes = marker_for(full, passed, needs, tree_of)
+    artifact, tree, marker_notes = marker_for(full, passed, needs, tree_of, jobs is not None)
     return Outcome(passed, problems, summary, bool(artifact), tree, notes + marker_notes, artifact)
 
 
@@ -394,7 +420,7 @@ def plain_outcome(env, note, tree_of):
     needs = env.get("CI_FINISH_NEEDS", "")
     plain = needs_rows(needs) + [Row(DEFAULT_JOB_NAME, "Passed" if passed else "Failed", None, "")]
     summary = render(_title(env), env.get("GITHUB_EVENT_NAME", ""), passed, plain, "not recorded")
-    artifact, tree, notes = marker_for(_full(env), False, needs, tree_of) if not passed else ("", "", [])
+    artifact, tree, notes = marker_for(_full(env), passed, needs, tree_of, jobs_read=False)
     return Outcome(passed, problems, summary, bool(artifact), tree, [note] + notes, artifact)
 
 

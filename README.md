@@ -463,8 +463,8 @@ with hyphens, for example `test-unit` for the job named `Test: unit`.
 | `CI passed` | The last job. Gives the run its one verdict and summary with `ci-finish`. |
 
 `CI passed` is the one status check to require in branch protection. It passes only when every job in its
-`needs` passed or was skipped as allowed, and no other job of the run failed, so the required check never
-changes when jobs are added, renamed or split. A `Test: SEGMENT` job may skip only on a partial run, when its
+`needs` passed or was skipped as allowed, and every other job of the run has finished without failing, so the
+required check never changes when jobs are added, renamed or split. A `Test: SEGMENT` job may skip only on a partial run, when its
 segment was not selected, and a job that does not test may skip when it is listed as always allowed to.
 
 ## Actions
@@ -485,13 +485,16 @@ job sets Python up first. A job in a container needs both in its image. Inputs r
 
 Decides which test segments a run needs from the files its change touched and a rules file.
 
-A push to a branch compares with the last passing run, not with the commit before the push. It reads the
-newest successful runs of the same workflow on the branch from the Actions API and takes the commit of the
-newest one that ran on `push`, `schedule` or `workflow_dispatch` in this repository and is an ancestor of
-`HEAD`. So a segment that failed, or a push whose run was cancelled, stays selected until a run passes, and a
-push never selects less than every change since the last run that passed. The reason names that commit, for
-example `3 files changed since the last passing run (1a2b3c4). Segments: unit`. A pull request compares
-three-dot with its base, so only the pull request's own changes count.
+A push to a branch compares with the last passing run, not with the commit before the push. It reads one
+page of the newest completed runs of the same workflow on the branch from the Actions API, counting only runs
+on `push`, `schedule` or `workflow_dispatch` in this repository, and walks them from newest to oldest. The
+first that passed and whose commit is an ancestor of `HEAD` is the base. So a push never selects less than
+every change since the last run that passed: the segments a failed or cancelled push run touched stay
+selected until a run passes. A `schedule` or `workflow_dispatch` run is full by its event, so when it fails
+no change in the diff explains it. When such a run failed or timed out after the base run started, the push is
+a full run until a run passes. The reason names the base, for example
+`3 files changed since the last passing run (1a2b3c4). Segments: unit`. A pull request compares three-dot
+with its base, so only the pull request's own changes count.
 
 | Input | Default | Meaning |
 | --- | --- | --- |
@@ -522,7 +525,7 @@ segment, `?` matches one character, `**` as a whole segment matches any number o
 is malformed.
 
 ```text
-full: .github/workflows/ci.yml .github/ci-scope.txt global.json
+full: global.json
 unit: src/** tests/unit/**
 api: src/Api/** tests/api/**
 ignore: docs/** **/*.md
@@ -531,9 +534,10 @@ ignore: docs/** **/*.md
 A changed file selects every segment whose globs match it. The run is full, with the reason in `reason`, on
 a schedule, a manual dispatch or a tag, when the rules file is missing or has a malformed line, when there is
 no base commit to compare (no passing run on the branch yet, an API error, or a base the clone cannot
-fetch), when the rules file itself changed, when a changed file matches `full`, and when a changed file
-matches no line at all. That last rule means a new folder is never silently untested, and the rules file
-rule means new rules never decide how much of their own change is tested. A file that matches only `ignore`
+fetch), when a schedule or dispatch run failed after the base run started, when the rules file or the workflow file
+itself changed, when a changed file matches `full`, and when a changed file matches no line at all. That last
+rule means a new folder is never silently untested. The rules file and workflow file rules mean new rules,
+pins or gates never decide how much of their own change is tested, whatever segment a glob puts them in. A file that matches only `ignore`
 needs no test. Only `push` and `pull_request` events compare, and every other event is a full run.
 
 ```yaml
@@ -575,9 +579,11 @@ failed run, a marker from another workflow file or repository, an expired marker
 `reuse` false with the reason.
 
 It also looks for `ci-failed-full-TREE`, which `ci-finish` uploads when a full run of the tree fails. When
-such a marker is unexpired, its run has completed and passes the same checks apart from the conclusion, and it
-is as new as the pass or newer, `reuse` is false and the reason links the failed run. The code did not change,
-so that failure is flakiness or a dependency outside the tree, and it is the newest evidence about the tree.
+such a marker is unexpired, its run passes the same origin and event checks, and it is as new as the pass or
+newer, `reuse` is false and the reason links the failed run. The run's status does not matter: only a verdict
+that did not pass uploads that marker, so a run still completing is failing. The code did not change, so that
+failure is flakiness or a dependency outside the tree, and it is the newest evidence about the tree. Each
+lookup reads one page of 100 markers, and more markers than that gives `reuse` false.
 
 ```yaml
 - uses: actions/checkout@<full commit sha>
@@ -602,36 +608,41 @@ as the last job, `CI passed`.
 | `needs` | required | The calling job's `${{ toJSON(needs) }}`. |
 | `allow-skipped` | empty | Job ids skipped when their segment is not selected, separated by spaces or commas. |
 | `allow-skipped-always` | empty | Job ids that may be skipped on any run, separated by spaces or commas. |
-| `full` | `false` | `true` when `ci-scope` made this a full run, so every segment job must run. |
+| `full` | required | `true` when `ci-scope` made this a full run, so every segment job must run, `false` otherwise. Any other value fails the run. |
 | `segments` | empty | The JSON list of segments `ci-scope` selected, used to explain skipped test segments. |
 | `scope-reason` | empty | The reason `ci-scope` gave, shown on the `Scope` row. |
 | `title` | empty | Summary heading. Empty means the repository's name followed by `CI`. |
-| `job-name` | `CI passed` | Display name of the job that runs the action, so its row is the verdict and comes last. |
+| `job-name` | `CI passed` | Display name of the job that runs the action, so its row is the verdict and comes last. It must match, or the job counts itself as unfinished and the run fails. |
 | `token` | `${{ github.token }}` | Token that can read the run's jobs and the repository's artifacts. |
 
-It has no outputs. The calling job runs under `if: always()`, lists every other job in `needs`, needs
-`actions: read` and `contents: read`, and checks the repository out first, since the marker names the
-checked-out tree. The marker upload uses the runner's own artifact token and needs no further permission.
+It has no outputs. The calling job runs under `if: always()`, needs `actions: read` and `contents: read`, and
+checks the repository out first, since the marker names the checked-out tree. Every job of the workflow that
+does not itself wait for the verdict must be in its `needs`. A job that runs after the verdict, with `needs`
+on the `CI passed` job, is not counted. The marker upload uses the runner's own artifact token and needs no further permission.
 
 The verdict starts from `needs`. A job that succeeded passes. A failed or cancelled job fails the run, and so
-does empty or malformed `needs`. A skipped job fails the run unless its id is listed:
+does empty or malformed `needs` or a `full` value other than `true` or `false`. A skipped job fails the run
+unless its id is listed:
 
 - `allow-skipped` names the `Test: SEGMENT` jobs, which are skipped when their segment is not selected. On a
-  full run every segment runs, so a skip of one of them fails the run.
+  full run every segment runs, so a skip of one of them fails the run, even when its id is in
+  `allow-skipped-always` too.
 - `allow-skipped-always` names jobs that do not test and may skip on any run, such as a deploy that runs
   only on the default branch.
 
-The jobs API can then only turn a pass into a fail, never the reverse. A finished job of the run that failed,
-timed out or was cancelled, and that `needs` does not report, fails the run. That catches a job missing from
-`needs`, and it means a job allowed to fail (`continue-on-error`) does not belong in the workflow whose
-verdict this is. An API error leaves the verdict from `needs` unchanged. The APIs otherwise supply the
+The jobs API can then only turn a pass into a fail, never the reverse. A job of the run that has not
+finished, or that failed, timed out or was cancelled, and that `needs` does not report, fails the run. That
+catches a job missing from `needs` whether it already failed or is still going, and it means a job allowed to
+fail (`continue-on-error`) does not belong in the workflow whose verdict this is. While `CI passed` runs, the
+jobs API does not list a job that needs it, so such a job never counts. An API error leaves the verdict from
+`needs` unchanged and withholds the pass marker, since a job missing from `needs` could have failed unseen. The APIs otherwise supply the
 summary's names, times and its `Full suite last passed` footer, which counts only markers from runs of this
 repository's own code. Text from git or the API is escaped in the summary, so a file or job name cannot
 render as a link or other Markdown.
 
 The action writes the summary first, then uploads a marker artifact holding the tree and the run's link, kept
 30 days, then fails the job when the run did not pass. A failed run still shows its summary. A full run that
-passed uploads `ci-passed-full-TREE`. A full run where a job in `needs` reports `failure` uploads
+passed, with the jobs API read, uploads `ci-passed-full-TREE`. A full run where a job in `needs` reports `failure` uploads
 `ci-failed-full-TREE`, so `ci-tested-tree` does not reuse an older pass of a tree whose newest full run
 failed. A run whose only problems are cancelled or wrongly skipped jobs, and a partial run, upload no
 marker. A job inside a reusable workflow is matched as `CALLER / NAME` when `job-name` is set to its name.
@@ -731,12 +742,14 @@ The wiring that matters:
   full run `segments` can be empty, for example when the rules file is missing, so the `full == 'true'` half
   of the gate is what makes a full run test everything.
 - `CI passed` needs every other job, runs under `if: always()` so it reports failures too, and grants
-  `actions: read`. `scope` is never listed as allowed to skip, so a failed `Scope` fails the run.
+  `actions: read`. A job left out of `needs` fails the run when it failed or is still going as the verdict is
+  given. `scope` is never listed as allowed to skip, so a failed `Scope` fails the run.
 - `allow-skipped` lists the `Test: SEGMENT` jobs, which skip when their segment is not selected. A skip of
   one of them fails a full run.
 - `allow-skipped-always` lists jobs that do not test and skip by design, such as a deploy that runs only on
   `main`. It is empty here because every job runs on every run.
 - `CI passed` passes `full` from `Scope`, so only a full run leaves the marker that `ci-tested-tree` reads.
+  The input is required, and an empty value, as when `Scope` failed, fails the run.
 - A job allowed to fail does not belong in this workflow: `CI passed` fails when any job of the run fails,
   listed in `needs` or not.
 - A manual dispatch is always a full run, so it needs no input to force one.
