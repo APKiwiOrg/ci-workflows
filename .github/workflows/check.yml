@@ -4,19 +4,21 @@ name: check
 # segments a change needs. Test: workflows keeps every workflow hosted and SHA-pinned, parses them, runs the
 # stress workflow's shell steps against a stub dotnet and runs the Node workflow tests. Test: actions keeps
 # every action SHA-pinned, parses them and runs the Python action tests. CI passed gives the run one verdict
-# and one summary, and marks the tree as tested after a full pass.
+# and one summary, and marks the tree as passed or failed after a full run. On a full run every test job runs,
+# whatever segments lists.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
-# A newer push to a pull request or a branch cancels the run it replaces. A run on main finishes, so every
-# commit that starts a run there gets its verdict and a full pass leaves its marker. CI passed always runs,
-# so a cancelled run would read as a failure.
+# One group per pull request, and one per commit for every other event. A pull request run covers the whole
+# pull request, so a newer push makes the older run redundant and cancels it. Every push to main has a group
+# of its own, so no newer push can cancel it or a run waiting behind it, and each commit keeps its own
+# verdict and marker.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -46,7 +48,7 @@ jobs:
   test-workflows:
     name: 'Test: workflows'
     needs: scope
-    if: contains(fromJSON(needs.scope.outputs.segments), 'workflows')
+    if: needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.segments), 'workflows')
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
@@ -70,7 +72,7 @@ jobs:
   test-actions:
     name: 'Test: actions'
     needs: scope
-    if: contains(fromJSON(needs.scope.outputs.segments), 'actions')
+    if: needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.segments), 'actions')
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

@@ -12,8 +12,9 @@ This file holds the rules for changing them.
   self-hosted runner, and the org's self-hosted runners are the dev Mac. `scripts/check-workflows.sh` enforces
   it in the pre-commit hook and in CI.
 - Every third-party action and reusable workflow, in a workflow or in an `action.yml` under
-  `.github/actions`, is pinned to a full commit SHA with its version in a trailing comment. The same check
-  enforces it.
+  `.github/actions`, is pinned to a full commit SHA with its version in a trailing comment. An `action.yml`
+  holds no relative `uses: ./` path, since inside a composite action that is the caller's workspace. The
+  same check enforces both. A new action adds its folder to `.github/dependabot.yml`.
 - Workflow and action inputs reach scripts only through `env`, never by expression interpolation into a
   `run` line.
 - A load or stress run needs the owner's explicit permission before it starts. Ask first, as its own message,

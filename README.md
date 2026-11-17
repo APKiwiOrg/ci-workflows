@@ -462,9 +462,10 @@ with hyphens, for example `test-unit` for the job named `Test: unit`.
 | `Deploy: ENVIRONMENT` | Deploys to one environment, for example `Deploy: staging`. |
 | `CI passed` | The last job. Gives the run its one verdict and summary with `ci-finish`. |
 
-`CI passed` is the one status check to require in branch protection. It passes only when every other job
-passed or was skipped because its segment was not needed, so the required check never changes when jobs are
-added, renamed or split.
+`CI passed` is the one status check to require in branch protection. It passes only when every job in its
+`needs` passed or was skipped as allowed, and no other job of the run failed, so the required check never
+changes when jobs are added, renamed or split. A `Test: SEGMENT` job may skip only on a partial run, when its
+segment was not selected, and a job that does not test may skip when it is listed as always allowed to.
 
 ## Actions
 
@@ -475,8 +476,9 @@ same way it pins a reusable workflow:
 uses: APKiwiOrg/ci-workflows/.github/actions/ci-scope@<full commit sha>
 ```
 
-Each action runs a standard library Python script with `python3` 3.8 or later and `bash`, which every
-GitHub-hosted runner has. A job in a container needs both in its image. Inputs reach the scripts through
+Each action runs a standard library Python script with `python3` 3.8 or later under `bash`. They need
+`python3` on the runner's `PATH` under `bash`, which GitHub-hosted Linux and macOS runners have, and a Windows
+job sets Python up first. A job in a container needs both in its image. Inputs reach the scripts through
 `env` only.
 
 ### ci-scope
@@ -660,8 +662,8 @@ on:
   pull_request:
   workflow_dispatch:
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -669,6 +671,9 @@ jobs:
     name: Scope
     runs-on: ubuntu-26.04
     timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
     outputs:
       full: ${{ steps.scope.outputs.full }}
       segments: ${{ steps.scope.outputs.segments }}
@@ -684,7 +689,7 @@ jobs:
   test-unit:
     name: 'Test: unit'
     needs: scope
-    if: contains(fromJSON(needs.scope.outputs.segments), 'unit')
+    if: needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.segments), 'unit')
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
@@ -709,7 +714,10 @@ jobs:
       - uses: APKiwiOrg/ci-workflows/.github/actions/ci-finish@<full commit sha>
         with:
           needs: ${{ toJSON(needs) }}
+          # The Test: SEGMENT jobs. They may skip only when their segment is not selected.
           allow-skipped: test-unit
+          # Jobs that do not test and skip by design, such as a deploy that runs only on main.
+          allow-skipped-always: ''
           full: ${{ needs.scope.outputs.full }}
           segments: ${{ needs.scope.outputs.segments }}
           scope-reason: ${{ needs.scope.outputs.reason }}
@@ -717,14 +725,21 @@ jobs:
 
 The wiring that matters:
 
-- `Scope` checks out with `fetch-depth: 0` and exposes `full`, `segments` and `reason` as job outputs.
-- Each `Test: SEGMENT` job needs `scope` and runs only when its segment is in `segments`. On a full run
-  every segment is listed.
-- `CI passed` needs every other job, runs under `if: always()` so it reports failures too, and lists in
-  `allow-skipped` exactly the jobs that are skipped when their segment is not needed. `scope` is never
-  listed, so a failed `Scope` fails the run.
-- `CI passed` passes `full` from `Scope`, so only a full pass leaves the marker that `ci-tested-tree` reads.
+- `Scope` checks out with `fetch-depth: 0`, grants `actions: read` so a push can find its last passing run,
+  and exposes `full`, `segments` and `reason` as job outputs.
+- Each `Test: SEGMENT` job needs `scope` and runs when the run is full or its segment is in `segments`. On a
+  full run `segments` can be empty, for example when the rules file is missing, so the `full == 'true'` half
+  of the gate is what makes a full run test everything.
+- `CI passed` needs every other job, runs under `if: always()` so it reports failures too, and grants
+  `actions: read`. `scope` is never listed as allowed to skip, so a failed `Scope` fails the run.
+- `allow-skipped` lists the `Test: SEGMENT` jobs, which skip when their segment is not selected. A skip of
+  one of them fails a full run.
+- `allow-skipped-always` lists jobs that do not test and skip by design, such as a deploy that runs only on
+  `main`. It is empty here because every job runs on every run.
+- `CI passed` passes `full` from `Scope`, so only a full run leaves the marker that `ci-tested-tree` reads.
+- A job allowed to fail does not belong in this workflow: `CI passed` fails when any job of the run fails,
+  listed in `needs` or not.
 - A manual dispatch is always a full run, so it needs no input to force one.
-- A newer push to a pull request or a branch cancels the run it replaces. A run on `main` is left to finish,
-  because `CI passed` always runs and a cancelled run would read as a failure, and because a full pass on
-  `main` leaves the marker a later release can reuse.
+- A pull request's newer push cancels its older run, since the newer run covers the whole pull request.
+  Every other run has a group of its own commit, so each push to `main` keeps its own verdict and marker,
+  and no newer push cancels a run on `main` that is waiting to start.

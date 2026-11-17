@@ -50,9 +50,18 @@ runs:
     - uses: actions/upload-artifact@$sha # v1.0.0
       with:
         name: marker
-    - uses: ./.github/actions/other
 EOF
-expect 0 'a pinned action with a local reference'
+expect 0 'a pinned action'
+
+# Inside a composite action `./` is the caller's workspace, not this repository's commit.
+cp .github/actions/pinned/action.yml pinned.yml
+printf '    - uses: ./.github/actions/other\n' >> .github/actions/pinned/action.yml
+expect 1 'a local reference inside an action'
+cp pinned.yml .github/actions/pinned/action.yml
+printf '    - name: Other\n      uses: ../other\n' >> .github/actions/pinned/action.yml
+expect 1 'a parent-relative reference inside an action'
+mv pinned.yml .github/actions/pinned/action.yml
+expect 0 'the local references removed'
 
 cat > .github/actions/nested/deeper/inner/action.yml <<EOF
 name: loose

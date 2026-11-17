@@ -1,12 +1,15 @@
 # Keeps the SHA-pinned actions in this repository's workflows and composite actions current. `/` covers
-# .github/workflows, and each folder under .github/actions holds one action.yml whose pins need the same
-# care. The cooldown lets a new release age a week before Dependabot proposes it.
+# .github/workflows, and each action folder is listed by name, so a new action adds its folder here.
+# _shared holds the actions' Python helper and no action. The cooldown lets a new release age a week before
+# Dependabot proposes it.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directories:
       - /
-      - /.github/actions/*
+      - /.github/actions/ci-finish
+      - /.github/actions/ci-scope
+      - /.github/actions/ci-tested-tree
     schedule:
       interval: weekly
     cooldown:

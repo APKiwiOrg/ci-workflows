@@ -4,8 +4,10 @@
 #      code on one, and the org's self-hosted runners are the dev Mac. An action has no runner of its own,
 #      it runs on its caller's, so this rule reads workflows only.
 #   2. Every third-party action and reusable workflow is pinned to a full commit SHA, in every workflow
-#      under .github/workflows and every action.yml or action.yaml under .github/actions. A local `./`
-#      reference is exempt, since it is the same commit.
+#      under .github/workflows and every action.yml or action.yaml under .github/actions. In a workflow a
+#      local `./` reference is exempt, since it is the same commit as the workflow.
+#   3. An action.yml or action.yaml holds no local `./` or `../` reference. Inside a composite action such a
+#      path is the caller's workspace, not this repository's commit, so it would run the caller's code.
 # Pure POSIX sh, grep and find, so it runs the same in the pre-commit hook, in CI and by hand.
 fail=0
 
@@ -17,6 +19,15 @@ has_unpinned() {
       *) echo "check-workflows: $1: not pinned to a full SHA: $line" >&2; echo x ;;
     esac
   done | grep -q x
+}
+
+# Exits 0 when the file has a `uses:` that is a relative path, naming each one.
+has_local() {
+  if grep -nE "^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[\"']?\." "$1" >&2; then
+    echo "check-workflows: $1: a relative uses: inside an action is the caller's workspace" >&2
+    return 0
+  fi
+  return 1
 }
 
 for f in .github/workflows/*.yml; do
@@ -36,12 +47,13 @@ if [ -d .github/actions ]; then
   set -f
   for f in $(find .github/actions -type f \( -name action.yml -o -name action.yaml \) | sort); do
     has_unpinned "$f" && fail=1
+    has_local "$f" && fail=1
   done
   set +f
   IFS=$saved_ifs
 fi
 
 if [ "$fail" -eq 0 ]; then
-  echo "check-workflows: every workflow is hosted and every workflow and action is SHA-pinned"
+  echo "check-workflows: every workflow is hosted, every workflow and action is SHA-pinned, and no action uses a relative path"
 fi
 exit $fail
