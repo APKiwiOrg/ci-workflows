@@ -3,10 +3,13 @@ description: Say whether the checked-out git tree already passed a full run of t
 
 # Looks for the ci-passed-full-TREE artifact that ci-finish uploads after a full pass, where TREE is
 # `git rev-parse HEAD^{tree}`. Reuse is true only when that artifact is unexpired and the run that made it
-# concluded success, ran the `workflow` file, and belongs to this repository with its head here too. A run
-# that is still going, a failed run, a marker from another workflow file or repository, an expired marker
-# and any API error each give reuse false with the reason. The calling job checks the repository out first
-# and grants `actions: read`.
+# concluded success, ran the `workflow` file on a push, pull_request, schedule, workflow_dispatch or
+# merge_group event, and belongs to this repository with its head here too. A pull_request_target or
+# workflow_run run can test code from a fork inside this repository, so it never vouches. Reuse is also
+# false when a ci-failed-full-TREE marker from a completed run that passes the same checks is as new as the
+# pass or newer, since the newest full run of the tree failed. A run that is still going, a failed run, a
+# marker from another workflow file or repository, an expired marker and any API error each give reuse false
+# with the reason. The calling job checks the repository out first and grants `actions: read`.
 
 inputs:
   workflow:

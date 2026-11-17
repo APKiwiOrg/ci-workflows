@@ -551,8 +551,16 @@ depth works.
 
 It looks for the `ci-passed-full-TREE` artifact that `ci-finish` uploads. `reuse` is true only when that
 artifact is unexpired and the run that made it concluded success, ran the `workflow` file, and belongs to
-this repository with its head here too. A run still going, a failed run, a marker from another workflow file
-or repository, an expired marker and any API error each give `reuse` false with the reason.
+this repository with its head here too. The run's event must be `push`, `pull_request`, `schedule`,
+`workflow_dispatch` or `merge_group`. A `pull_request_target` or `workflow_run` run executes in this
+repository while the code it tests can come from a fork, so it never vouches for a tree. A run still going, a
+failed run, a marker from another workflow file or repository, an expired marker and any API error each give
+`reuse` false with the reason.
+
+It also looks for `ci-failed-full-TREE`, which `ci-finish` uploads when a full run of the tree fails. When
+such a marker is unexpired, its run has completed and passes the same checks apart from the conclusion, and it
+is as new as the pass or newer, `reuse` is false and the reason links the failed run. The code did not change,
+so that failure is flakiness or a dependency outside the tree, and it is the newest evidence about the tree.
 
 ```yaml
 - uses: actions/checkout@<full commit sha>

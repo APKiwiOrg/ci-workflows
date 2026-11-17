@@ -32,6 +32,7 @@ WORKFLOW = ".github/workflows/ci.yml"
 NOW = datetime.datetime(2026, 1, 20, 12, 0, 0, tzinfo=datetime.timezone.utc)
 RUN_URL = "https://github.com/example-org/example-app/actions/runs/%d"
 ARTIFACTS_PATH = "/repos/%s/actions/artifacts?name=ci-passed-full-%s&per_page=100" % (REPO, TREE)
+FAILED_PATH = "/repos/%s/actions/artifacts?name=ci-failed-full-%s&per_page=100" % (REPO, TREE)
 
 
 def artifact(run_id=101, created="2026-01-19T10:00:00Z", expires="2026-02-18T10:00:00Z", expired=False,
@@ -45,10 +46,16 @@ def artifact(run_id=101, created="2026-01-19T10:00:00Z", expires="2026-02-18T10:
     }
 
 
-def run(run_id=101, conclusion="success", path=WORKFLOW, repo=REPO, head_repo=REPO):
+def failed(run_id=201, created="2026-01-19T12:00:00Z", **kwargs):
+    return artifact(run_id=run_id, created=created, name="ci-failed-full-" + TREE, **kwargs)
+
+
+def run(run_id=101, conclusion="success", path=WORKFLOW, repo=REPO, head_repo=REPO, event="push"):
     return {
         "id": run_id,
+        "status": "completed" if conclusion else "in_progress",
         "conclusion": conclusion,
+        "event": event,
         "path": path,
         "html_url": RUN_URL % run_id,
         "repository": {"full_name": repo},
@@ -59,8 +66,9 @@ def run(run_id=101, conclusion="success", path=WORKFLOW, repo=REPO, head_repo=RE
 class FakeFetch(object):
     """Answers API paths from a dictionary. A missing path or an exception value raises ApiError."""
 
-    def __init__(self, artifacts=None, runs=(), raw=None):
-        self.answers = dict(raw or {})
+    def __init__(self, artifacts=None, runs=(), raw=None, failures=()):
+        self.answers = {FAILED_PATH: {"total_count": len(failures), "artifacts": list(failures)}}
+        self.answers.update(raw or {})
         if artifacts is not None:
             self.answers[ARTIFACTS_PATH] = {"total_count": len(artifacts), "artifacts": artifacts}
         for item in runs:
@@ -164,6 +172,124 @@ class FindPassTests(unittest.TestCase):
         reuse, _, run_url = check(fetch)
         self.assertIs(reuse, True)
         self.assertEqual(run_url, RUN_URL % 101)
+
+
+    def test_runs_of_events_that_test_this_repository_are_reused(self):
+        for event in ("push", "pull_request", "schedule", "workflow_dispatch", "merge_group"):
+            with self.subTest(event=event):
+                reuse, _, _ = check(FakeFetch([artifact()], [run(event=event)]))
+                self.assertIs(reuse, True)
+
+    def test_pull_request_target_run_is_no_reuse(self):
+        self.assertNoReuse(check(FakeFetch([artifact()], [run(event="pull_request_target")])))
+
+    def test_workflow_run_run_is_no_reuse(self):
+        self.assertNoReuse(check(FakeFetch([artifact()], [run(event="workflow_run")])))
+
+    def test_run_without_an_event_is_no_reuse(self):
+        item = run()
+        del item["event"]
+        self.assertNoReuse(check(FakeFetch([artifact()], [item])))
+
+
+class NewerFailureTests(unittest.TestCase):
+    """A full run of the same tree that failed after the pass is newer evidence and stops reuse."""
+
+    PASS = artifact(run_id=101, created="2026-01-19T10:00:00Z")
+
+    def test_pass_then_fail_is_no_reuse(self):
+        reuse, reason, run_url = check(FakeFetch([self.PASS], [run(101), run(201, "failure")],
+                                                 failures=[failed(201, "2026-01-19T12:00:00Z")]))
+        self.assertIs(reuse, False)
+        self.assertEqual(run_url, "")
+        self.assertIn(RUN_URL % 201, reason)
+
+    def test_control_fail_then_pass_is_reused(self):
+        reuse, _, run_url = check(FakeFetch([self.PASS], [run(101), run(201, "failure")],
+                                            failures=[failed(201, "2026-01-19T08:00:00Z")]))
+        self.assertIs(reuse, True)
+        self.assertEqual(run_url, RUN_URL % 101)
+
+    def test_failure_at_the_same_time_as_the_pass_is_no_reuse(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure")],
+                                      failures=[failed(201, "2026-01-19T10:00:00Z")]))
+        self.assertIs(reuse, False)
+
+    def test_failure_whose_run_later_passed_on_a_rerun_still_counts(self):
+        # Only the pass checks a conclusion. A newer failed full run counts whatever its run became.
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "success")],
+                                      failures=[failed(201, "2026-01-19T12:00:00Z")]))
+        self.assertIs(reuse, False)
+
+    def test_failed_marker_from_a_fork_changes_nothing(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure", head_repo="someone/example-app")],
+                                      failures=[failed(201)]))
+        self.assertIs(reuse, True)
+
+    def test_failed_marker_from_another_repository_changes_nothing(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure", repo="someone/example-app")],
+                                      failures=[failed(201)]))
+        self.assertIs(reuse, True)
+
+    def test_failed_marker_from_another_workflow_changes_nothing(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure", path=".github/workflows/x.yml")],
+                                      failures=[failed(201)]))
+        self.assertIs(reuse, True)
+
+    def test_failed_marker_from_a_pull_request_target_run_changes_nothing(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure", event="pull_request_target")],
+                                      failures=[failed(201)]))
+        self.assertIs(reuse, True)
+
+    def test_failed_marker_of_a_run_still_going_changes_nothing(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, None)], failures=[failed(201)]))
+        self.assertIs(reuse, True)
+
+    def test_expired_failed_marker_changes_nothing(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure")],
+                                      failures=[failed(201, expired=True)]))
+        self.assertIs(reuse, True)
+
+    def test_failed_marker_without_a_creation_time_counts_as_newer(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101), run(201, "failure")],
+                                      failures=[failed(201, created=None)]))
+        self.assertIs(reuse, False)
+
+    def test_newest_counting_failure_is_found_past_ones_that_do_not_count(self):
+        failures = [failed(201, "2026-01-19T13:00:00Z"), failed(202, "2026-01-19T12:00:00Z")]
+        runs = [run(101), run(201, "failure", head_repo="someone/example-app"), run(202, "failure")]
+        reuse, reason, _ = check(FakeFetch([self.PASS], runs, failures=failures))
+        self.assertIs(reuse, False)
+        self.assertIn(RUN_URL % 202, reason)
+
+    def test_failure_between_an_older_pass_and_an_unfinished_newer_one_is_no_reuse(self):
+        older = artifact(run_id=101, created="2026-01-18T10:00:00Z")
+        newer = artifact(run_id=102, created="2026-01-19T10:00:00Z")
+        runs = [run(101), run(102, conclusion=None), run(201, "failure")]
+        reuse, _, _ = check(FakeFetch([newer, older], runs, failures=[failed(201, "2026-01-18T12:00:00Z")]))
+        self.assertIs(reuse, False)
+
+    def test_failed_marker_lookup_error_is_no_reuse(self):
+        reuse, reason, run_url = check(FakeFetch([self.PASS], [run(101)],
+                                                 raw={FAILED_PATH: github_api.ApiError("HTTP 500")}))
+        self.assertIs(reuse, False)
+        self.assertIn("HTTP 500", reason)
+        self.assertEqual(run_url, "")
+
+    def test_failed_marker_answer_without_a_list_is_no_reuse(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101)], raw={FAILED_PATH: {"total_count": 1}}))
+        self.assertIs(reuse, False)
+
+    def test_failed_run_lookup_error_is_no_reuse(self):
+        reuse, _, _ = check(FakeFetch([self.PASS], [run(101)], failures=[failed(201)]))
+        self.assertIs(reuse, False)
+
+    def test_too_many_newer_failures_to_check_is_no_reuse(self):
+        count = tested_tree.MAX_RUNS_CHECKED + 1
+        failures = [failed(300 + i, "2026-01-19T12:%02d:00Z" % i) for i in range(count)]
+        runs = [run(101)] + [run(300 + i, "failure", head_repo="someone/example-app") for i in range(count)]
+        reuse, _, _ = check(FakeFetch([self.PASS], runs, failures=failures))
+        self.assertIs(reuse, False)
 
 
 class OutputLinesTests(unittest.TestCase):
