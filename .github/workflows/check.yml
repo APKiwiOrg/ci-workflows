@@ -11,9 +11,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A newer push to a pull request or a branch cancels the run it replaces. A run on main finishes, so every
+# commit that starts a run there gets its verdict and a full pass leaves its marker. CI passed always runs,
+# so a cancelled run would read as a failure.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

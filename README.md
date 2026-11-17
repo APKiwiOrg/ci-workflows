@@ -624,7 +624,7 @@ on:
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 permissions:
   contents: read
 jobs:
@@ -688,3 +688,6 @@ The wiring that matters:
   listed, so a failed `Scope` fails the run.
 - `CI passed` passes `full` from `Scope`, so only a full pass leaves the marker that `ci-tested-tree` reads.
 - A manual dispatch is always a full run, so it needs no input to force one.
+- A newer push to a pull request or a branch cancels the run it replaces. A run on `main` is left to finish,
+  because `CI passed` always runs and a cancelled run would read as a failure, and because a full pass on
+  `main` leaves the marker a later release can reuse.
