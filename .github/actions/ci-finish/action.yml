@@ -49,7 +49,9 @@ inputs:
     required: false
     default: ''
   job-name:
-    description: Display name of the job that runs this action, so its row is the verdict and comes last
+    description: >-
+      Display name of the job that runs this action, so its row is the verdict and comes last. It must match,
+      or the job counts itself as a job that has not finished and the run fails.
     required: false
     default: CI passed
   token:

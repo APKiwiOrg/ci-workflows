@@ -612,7 +612,7 @@ as the last job, `CI passed`.
 | `segments` | empty | The JSON list of segments `ci-scope` selected, used to explain skipped test segments. |
 | `scope-reason` | empty | The reason `ci-scope` gave, shown on the `Scope` row. |
 | `title` | empty | Summary heading. Empty means the repository's name followed by `CI`. |
-| `job-name` | `CI passed` | Display name of the job that runs the action, so its row is the verdict and comes last. |
+| `job-name` | `CI passed` | Display name of the job that runs the action, so its row is the verdict and comes last. It must match, or the job counts itself as unfinished and the run fails. |
 | `token` | `${{ github.token }}` | Token that can read the run's jobs and the repository's artifacts. |
 
 It has no outputs. The calling job runs under `if: always()`, needs `actions: read` and `contents: read`, and

@@ -630,6 +630,19 @@ class FinishTests(unittest.TestCase):
         self.assertIs(outcome.passed, False)
         self.assertEqual(outcome.problems, ["test-unit: failure"])
 
+    def test_finishing_job_whose_name_is_not_job_name_counts_as_unfinished(self):
+        jobs = [job("Scope"), job("Verdict", None)]
+        outcome = finish.finish(settings(CI_FINISH_NEEDS=needs(scope="success")), FakeFetch(jobs, ARTIFACTS),
+                                good_tree, NOW)
+        self.assertIs(outcome.passed, False)
+        self.assertEqual(outcome.problems, ["Verdict has not finished and needs does not wait for it"])
+
+    def test_control_finishing_job_named_by_job_name_is_left_out(self):
+        jobs = [job("Scope"), job("Verdict", None)]
+        env = settings(CI_FINISH_NEEDS=needs(scope="success"), CI_FINISH_JOB_NAME="Verdict")
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertIs(outcome.passed, True)
+
     def test_own_job_is_never_counted_as_missing_from_needs(self):
         jobs = [job("Scope"), {"name": "CI passed", "status": "completed", "conclusion": "failure",
                                "started_at": None, "completed_at": None, "steps": []}]
