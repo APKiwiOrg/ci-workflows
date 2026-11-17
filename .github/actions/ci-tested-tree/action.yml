@@ -1,0 +1,43 @@
+name: ci-tested-tree
+description: Say whether the checked-out git tree already passed a full run of the CI workflow.
+
+# Looks for the ci-passed-full-TREE artifact that ci-finish uploads after a full pass, where TREE is
+# `git rev-parse HEAD^{tree}`. Reuse is true only when that artifact is unexpired and the run that made it
+# concluded success, ran the `workflow` file, and belongs to this repository with its head here too. A run
+# that is still going, a failed run, a marker from another workflow file or repository, an expired marker
+# and any API error each give reuse false with the reason. The calling job checks the repository out first
+# and grants `actions: read`.
+
+inputs:
+  workflow:
+    description: Path of the workflow file whose full passing run counts
+    required: false
+    default: .github/workflows/ci.yml
+  token:
+    description: Token that can read the repository's Actions artifacts and runs
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  reuse:
+    description: true when this tree already passed a full run of the workflow, false otherwise
+    value: ${{ steps.tested.outputs.reuse }}
+  tree:
+    description: The tree id of HEAD, empty when it cannot be read
+    value: ${{ steps.tested.outputs.tree }}
+  reason:
+    description: One line saying why the tree is or is not reused
+    value: ${{ steps.tested.outputs.reason }}
+  run-url:
+    description: Link to the run that passed, empty when reuse is false
+    value: ${{ steps.tested.outputs.run-url }}
+
+runs:
+  using: composite
+  steps:
+    - id: tested
+      shell: bash
+      env:
+        CI_TESTED_TREE_WORKFLOW: ${{ inputs.workflow }}
+        CI_API_TOKEN: ${{ inputs.token }}
+      run: python3 "$GITHUB_ACTION_PATH/tested_tree.py"

@@ -1,0 +1,74 @@
+name: ci-finish
+description: Give a CI run one verdict and one summary, and mark the tree as tested after a full pass.
+
+# Runs as the last job of a run, under `needs` for every other job and `if: always()`. The verdict comes
+# only from `needs`: a failed or cancelled job fails the run, and so does a skipped job whose id is not in
+# `allow-skipped`. The jobs and artifacts APIs supply only the summary's names, times and footer, so an API
+# error changes the summary's detail and never the verdict. The steps run in order: write the summary, upload
+# the ci-passed-full-TREE marker when a full run passed, then fail when the run did not pass, so a failed run
+# still shows its summary. The calling job checks the repository out and grants `actions: read`.
+
+inputs:
+  needs:
+    description: The calling job's toJSON(needs)
+    required: true
+  allow-skipped:
+    description: Job ids that may be skipped without failing the run, separated by spaces or commas
+    required: false
+    default: ''
+  full:
+    description: true when this run tested everything, so a pass leaves the tested-tree marker
+    required: false
+    default: 'false'
+  segments:
+    description: The JSON list of segments ci-scope selected, used to explain skipped test segments
+    required: false
+    default: ''
+  scope-reason:
+    description: The reason ci-scope gave, shown on the Scope row
+    required: false
+    default: ''
+  title:
+    description: Summary heading, empty for the repository's name followed by CI
+    required: false
+    default: ''
+  job-name:
+    description: Display name of the job that runs this action, so its row is the verdict and comes last
+    required: false
+    default: CI passed
+  token:
+    description: Token that can read the run's jobs and the repository's artifacts
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - id: finish
+      shell: bash
+      env:
+        CI_FINISH_NEEDS: ${{ inputs.needs }}
+        CI_FINISH_ALLOW_SKIPPED: ${{ inputs.allow-skipped }}
+        CI_FINISH_FULL: ${{ inputs.full }}
+        CI_FINISH_SEGMENTS: ${{ inputs.segments }}
+        CI_FINISH_SCOPE_REASON: ${{ inputs.scope-reason }}
+        CI_FINISH_TITLE: ${{ inputs.title }}
+        CI_FINISH_JOB_NAME: ${{ inputs.job-name }}
+        CI_API_TOKEN: ${{ inputs.token }}
+      run: python3 "$GITHUB_ACTION_PATH/finish.py"
+    - if: steps.finish.outputs.upload == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ci-passed-full-${{ steps.finish.outputs.tree }}
+        path: ${{ steps.finish.outputs.marker }}
+        overwrite: true
+        retention-days: 30
+        if-no-files-found: error
+    - shell: bash
+      env:
+        CI_FINISH_PASSED: ${{ steps.finish.outputs.passed }}
+      run: |
+        if [ "$CI_FINISH_PASSED" != true ]; then
+          echo "::error::CI did not pass. The run summary lists each stage."
+          exit 1
+        fi
