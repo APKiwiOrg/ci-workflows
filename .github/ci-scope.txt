@@ -9,3 +9,4 @@ workflows: .github/workflows/** scripts/tests/*.mjs scripts/tests/stress-test-wo
 
 # The composite actions and their Python tests.
 actions: .github/actions/** scripts/tests/test_ci_*.py
+# Probe. Touches the rules file so the run is full.

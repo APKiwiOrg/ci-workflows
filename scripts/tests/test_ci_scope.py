@@ -687,3 +687,8 @@ class MainEndToEndTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeFails(unittest.TestCase):
+    def test_probe_fails_on_purpose(self):
+        self.fail("probe: a full run that fails must leave a failed marker")
