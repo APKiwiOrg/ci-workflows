@@ -28,6 +28,7 @@ This file holds the rules for changing them.
 - `site-ci.yml` callers are every site repository on APKiwiOrg/site-template, the same list.
 - `site-live-throttle-check.yml` callers are the site repositories on the template enquiry api.
 - `osv-scan.yml` callers are every site repository on APKiwiOrg/site-template, the same list as `site-ci.yml`.
+- `site-maintenance.yml` callers are the site repositories on APKiwiOrg/site-template with the `accounts` profile.
 
 ## Work and finish
 

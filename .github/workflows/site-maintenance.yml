@@ -1,0 +1,69 @@
+name: site-maintenance
+
+# The daily maintenance run for a site with member accounts. A site calls it from a small scheduled caller of its own
+# (see README.md) that owns the schedule and the maintenance concurrency group.
+#
+# It runs the site's own scripts/run-maintenance.mjs from the caller's checkout, as site-deploy runs the smoke script,
+# so the call protocol ships with the site's api. The script calls the site's keyed maintenance route until every task
+# reports done, and fails the run when file work is overdue or the route cannot run, so GitHub emails the repository
+# owner. While the site origin or the key is empty the job skips with a notice and passes, so a repository before its
+# owner gate stays green.
+#
+# Inputs and the key reach scripts only through env, never by expression interpolation into a run line.
+
+on:
+  workflow_call:
+    inputs:
+      site-origin:
+        description: The site's https origin, empty to skip. Callers pass vars.SITE_ORIGIN
+        required: false
+        default: ''
+        type: string
+    secrets:
+      maintenance-key:
+        description: The bearer key the site's maintenance route accepts, empty to skip
+        required: false
+
+permissions: {}
+
+jobs:
+  maintain:
+    name: Run site maintenance
+    runs-on: ubuntu-26.04
+    # Twelve calls of at most a minute each, with the cold start retries between them.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      # A secret cannot appear in a job condition, so this step decides whether the rest run.
+      - name: Check the maintenance settings
+        id: settings
+        env:
+          SITE_ORIGIN: ${{ inputs.site-origin }}
+          MAINTENANCE_KEY: ${{ secrets.maintenance-key }}
+        run: |
+          if [ -z "$SITE_ORIGIN" ] || [ -z "$MAINTENANCE_KEY" ]; then
+            echo "::notice::Maintenance skipped: set the SITE_ORIGIN repository variable and the MAINTENANCE_KEY secret to run it"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The checkout supplies the maintenance script. Nothing is installed, since the script uses Node built-ins only.
+      - if: steps.settings.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - if: steps.settings.outputs.run == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Call the maintenance route
+        if: steps.settings.outputs.run == 'true'
+        env:
+          SITE_ORIGIN: ${{ inputs.site-origin }}
+          MAINTENANCE_KEY: ${{ secrets.maintenance-key }}
+        run: node scripts/run-maintenance.mjs

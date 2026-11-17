@@ -443,6 +443,57 @@ dismissed Dependabot alert, so an ignore expires and the alert stays the record.
 To move to a new osv-scanner release, update `OSV_SCANNER_VERSION` and `OSV_SCANNER_SHA256` together, taking
 the `osv-scanner_linux_amd64` line from the release's `osv-scanner_SHA256SUMS`.
 
+## site-maintenance
+
+Runs the daily maintenance of a site with member accounts: retention purges, file retries, photo rechecks and the
+moderation digest. The work lives in the site's api behind a keyed `POST /api/maintenance` route, so this workflow
+only calls it. Its token reads contents only.
+
+The job checks out the calling repository and runs its `scripts/run-maintenance.mjs` with Node from `.nvmrc`, as
+`site-deploy` runs the site's smoke script, so the call protocol ships with the api it calls. Nothing is installed.
+The script repeats the call until the site reports every task done, up to 12 calls, and retries a 404 or 5xx after
+10 seconds while the api starts or migrates. It fails the run when the finished call reports a deletion queued or a
+photo pending for more than a day, when no call finishes, or when the route refuses the key or is unset, so GitHub
+emails the repository owner. It prints the counts each call reports, never the key or any other part of a response.
+
+While the `site-origin` input or the `maintenance-key` secret is empty, the job skips with a notice and passes. A
+template repository and a site before its owner gate therefore stay green. A secret cannot appear in a job
+condition, so the first step makes that decision and the later steps read its output.
+
+A site adds this caller as `.github/workflows/maintenance.yml`, pinned to a commit of this repository. The
+schedule lands early in the morning in New Zealand:
+
+```yaml
+name: Maintenance
+on:
+  schedule:
+    - cron: '17 14 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: maintenance
+  cancel-in-progress: false
+jobs:
+  maintain:
+    uses: APKiwiOrg/ci-workflows/.github/workflows/site-maintenance.yml@<full commit sha>
+    with:
+      site-origin: ${{ vars.SITE_ORIGIN }}
+    secrets:
+      maintenance-key: ${{ secrets.MAINTENANCE_KEY }}
+```
+
+The caller owns the `maintenance` concurrency group, so a manual run never overlaps the scheduled one and the site's
+once-a-day digest cannot go twice. `SITE_ORIGIN` is a repository variable holding the site's https origin, and
+`MAINTENANCE_KEY` is a repository secret holding the same value as the site's `maintenance-key` Key Vault secret.
+Every caller passes the key by that name, since `secrets: inherit` does not cross organisations.
+
+Run it by hand from a site:
+
+```bash
+gh workflow run maintenance.yml --ref main
+```
+
 ## Stage names
 
 A CI workflow names each job, or each step of a job, with one of these stage names, exactly as written. The
