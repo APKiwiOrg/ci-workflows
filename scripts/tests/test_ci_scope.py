@@ -90,9 +90,11 @@ class FakeFetch(object):
 
 
 def passing_run(run_id=1, sha=BASE, created="2026-01-19T10:00:00Z", conclusion="success", event="push",
-                path=".github/workflows/ci.yml", repo=REPO, head_repo=REPO):
-    """A run as the list-runs-for-a-workflow endpoint returns it."""
-    return {"id": run_id, "head_sha": sha, "created_at": created, "status": "completed",
+                path=".github/workflows/ci.yml", repo=REPO, head_repo=REPO, updated=None):
+    """A run as the list-runs-for-a-workflow endpoint returns it. updated_at is when it completed, the same
+    as created_at unless given."""
+    return {"id": run_id, "head_sha": sha, "created_at": created, "updated_at": updated or created,
+            "status": "completed",
             "conclusion": conclusion, "event": event, "path": path,
             "html_url": "https://github.com/%s/actions/runs/%s" % (repo, run_id),
             "repository": {"full_name": repo}, "head_repository": {"full_name": head_repo}}
@@ -446,6 +448,26 @@ class DecideTests(unittest.TestCase):
         result, _ = self.push(fetch=FakeFetch(runs))
         self.assertEqual(result.segments, ["unit"])
         self.assertFalse(result.full)
+
+    def test_failed_full_run_that_finished_after_the_base_started_is_a_full_run(self):
+        # The base run started before the failure was known, so its scope could not have made it full.
+        runs = [passing_run(1, BASE, "2026-01-19T12:00:00Z", updated="2026-01-19T12:20:00Z"),
+                failed_full_run(created="2026-01-19T11:00:00Z", updated="2026-01-19T12:10:00Z")]
+        result, _ = self.push(fetch=FakeFetch(runs))
+        self.assertEqual(result, scope.Scope(True, ["api", "unit"], self.FAILED_FULL_REASON, None))
+
+    def test_control_failed_full_run_that_finished_before_the_base_started_does_not_force_a_full_run(self):
+        runs = [passing_run(1, BASE, "2026-01-19T12:00:00Z", updated="2026-01-19T12:20:00Z"),
+                failed_full_run(created="2026-01-19T11:00:00Z", updated="2026-01-19T11:50:00Z")]
+        result, _ = self.push(fetch=FakeFetch(runs))
+        self.assertFalse(result.full)
+        self.assertEqual(result.segments, ["unit"])
+
+    def test_base_with_no_readable_time_lets_any_failed_full_run_count(self):
+        runs = [passing_run(1, BASE, None, updated="2026-01-19T12:20:00Z"),
+                failed_full_run(created="2026-01-19T09:00:00Z", updated="2026-01-19T09:30:00Z")]
+        result, _ = self.push(fetch=FakeFetch(runs))
+        self.assertEqual(result.reason, self.FAILED_FULL_REASON)
 
     def test_failed_full_run_listed_out_of_order_is_still_newer_than_the_base(self):
         runs = [passing_run(1, BASE, "2026-01-19T10:00:00Z"), failed_full_run()]

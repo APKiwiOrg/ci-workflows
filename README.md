@@ -491,8 +491,8 @@ on `push`, `schedule` or `workflow_dispatch` in this repository, and walks them 
 first that passed and whose commit is an ancestor of `HEAD` is the base. So a push never selects less than
 every change since the last run that passed: the segments a failed or cancelled push run touched stay
 selected until a run passes. A `schedule` or `workflow_dispatch` run is full by its event, so when it fails
-no change in the diff explains it. When such a run failed or timed out after the base, the push is a full run
-until a run passes. The reason names the base, for example
+no change in the diff explains it. When such a run failed or timed out after the base run started, the push is
+a full run until a run passes. The reason names the base, for example
 `3 files changed since the last passing run (1a2b3c4). Segments: unit`. A pull request compares three-dot
 with its base, so only the pull request's own changes count.
 
@@ -534,7 +534,7 @@ ignore: docs/** **/*.md
 A changed file selects every segment whose globs match it. The run is full, with the reason in `reason`, on
 a schedule, a manual dispatch or a tag, when the rules file is missing or has a malformed line, when there is
 no base commit to compare (no passing run on the branch yet, an API error, or a base the clone cannot
-fetch), when a schedule or dispatch run failed since the base, when the rules file or the workflow file
+fetch), when a schedule or dispatch run failed after the base run started, when the rules file or the workflow file
 itself changed, when a changed file matches `full`, and when a changed file matches no line at all. That last
 rule means a new folder is never silently untested. The rules file and workflow file rules mean new rules,
 pins or gates never decide how much of their own change is tested, whatever segment a glob puts them in. A file that matches only `ignore`

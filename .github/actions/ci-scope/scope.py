@@ -11,8 +11,8 @@ A push to a branch is compared with the newest passing run of the same workflow 
 is an ancestor of HEAD, read from the Actions API. So a push never selects less than every change since the
 last run that passed: the segments a failed or cancelled push run touched stay selected until a run passes.
 A schedule or dispatch run is full by its event, so when it fails there is no change in the next diff to
-explain it. When the newest such run of this workflow on the branch failed after the base, the next push is
-a full run until a run passes. A pull request is compared three-dot with its base.
+explain it. When such a run of this workflow on the branch failed after the base run started, so the base
+run could not have seen it, the next push is a full run until a run passes. A pull request is compared three-dot with its base.
 
 A run is full when the event or ref asks for one, when the rules cannot be read, when there is no base
 commit to compare with (no passing run on the branch, an API error, a base the clone cannot fetch), when a
@@ -226,16 +226,30 @@ def _created(run):
     return github_api.parse_time(run.get("created_at")) or _NEWEST
 
 
+def _finished(run):
+    # A completed run was last updated when it finished. No readable time counts as just now.
+    return github_api.parse_time(run.get("updated_at")) or _NEWEST
+
+
+def _failed_full(run):
+    return run.get("conclusion") in FAILED and run.get("event") in FULL_EVENTS
+
+
 def _run_link(run):
     url = run.get("html_url")
     return url if isinstance(url, str) and url else "run %s" % run.get("id")
 
 
+def _failed_reason(workflow, run):
+    return "Full run: the last full run on %s failed (%s)" % (workflow.branch, _run_link(run))
+
+
 def last_passing_base(workflow, head, fetch, git):
     # type: (Workflow, str, github_api.Fetch, GitRunner) -> Tuple[Optional[str], str]
     """Walk the workflow's completed runs on the branch from newest to oldest. The first passing run whose
-    commit is in the clone and an ancestor of HEAD is the base. A schedule or dispatch run that failed before
-    it is met makes a full run. Returns (base, "") or (None, the full-run reason)."""
+    commit is in the clone and an ancestor of HEAD is the base. A schedule or dispatch run that failed and
+    either is met before the base or finished after the base run was created makes a full run, since the base
+    run's own scope could not have seen that failure. Returns (base, "") or (None, the full-run reason)."""
     if not (workflow.repo and workflow.path and workflow.branch):
         return None, "Full run: cannot tell which workflow and branch this run belongs to"
     # Completed only, so runs still going (this one among them) do not use up the page.
@@ -248,15 +262,21 @@ def last_passing_base(workflow, head, fetch, git):
             raise github_api.ApiError("the answer holds no run list")
     except Exception as error:  # noqa: BLE001 Any doubt about the base means a full run.
         return None, "Full run: the last passing run could not be read (%s)" % error
-    for run in sorted((run for run in runs if _counts(run, workflow)), key=_created, reverse=True):
-        conclusion = run.get("conclusion")
-        if conclusion in FAILED and run.get("event") in FULL_EVENTS:
-            # A failed push run needs nothing here: the change that broke it is still in the diff.
-            return None, "Full run: the last full run on %s failed (%s)" % (workflow.branch, _run_link(run))
+    counted = sorted((run for run in runs if _counts(run, workflow)), key=_created, reverse=True)
+    # A failed push run needs nothing here: the change that broke it is still in the diff.
+    failed = [run for run in counted if _failed_full(run)]
+    for run in counted:
+        if _failed_full(run):
+            return None, _failed_reason(workflow, run)
         sha = run.get("head_sha")
         # A commit the clone does not hold is passed over: it was force-pushed away or never fetched.
-        if (conclusion == "success" and _is_sha(sha) and git(["cat-file", "-e", sha + "^{commit}"])[0] == 0
+        if (run.get("conclusion") == "success" and _is_sha(sha)
+                and git(["cat-file", "-e", sha + "^{commit}"])[0] == 0
                 and git(["merge-base", "--is-ancestor", sha, head])[0] == 0):
+            started = github_api.parse_time(run.get("created_at"))
+            late = [other for other in failed if started is None or _finished(other) >= started]
+            if late:
+                return None, _failed_reason(workflow, late[0])
             return sha, ""
     return None, "Full run: no passing run of this workflow on %s to compare with" % workflow.branch
 
