@@ -9,10 +9,12 @@ this repository too. A pull_request_target or workflow_run run executes in this 
 tests can come from a fork, so it never vouches. A marker is uploaded before its run ends, so a run with no
 conclusion yet does not count.
 
-A full run that failed leaves ci-failed-full-TREE. When such a marker is unexpired, its run has completed and
-passes the same checks apart from the conclusion, and it was made at or after the pass that would be reused,
-the newest evidence is a failure and the tree is not reused. Any other answer, and any error, means no reuse
-with the reason stated.
+A full run that failed leaves ci-failed-full-TREE. When such a marker is unexpired, its run passes the same
+origin and event checks, and it was made at or after the pass that would be reused, the newest evidence is a
+failure and the tree is not reused. Its run's status and conclusion do not matter: only a verdict that did not
+pass uploads one, so a run still completing is failing. Each marker lookup reads one page, so a lookup with
+more markers than the page holds means no reuse. Any other answer, and any error, means no reuse with the
+reason stated.
 
 Inputs come from the environment: CI_TESTED_TREE_WORKFLOW (the workflow file whose full run counts),
 CI_API_TOKEN and the runner's GITHUB_REPOSITORY, GITHUB_API_URL and GITHUB_OUTPUT. Outputs are appended to
@@ -37,6 +39,7 @@ FAILED_MARKER_PREFIX = "ci-failed-full-"
 VOUCHING_EVENTS = ("push", "pull_request", "schedule", "workflow_dispatch", "merge_group")
 # Older markers are only consulted when newer ones fail a check. This bounds the API calls one check makes.
 MAX_RUNS_CHECKED = 10
+ARTIFACTS_PER_PAGE = 100
 _LATEST = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
 
 _TREE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -80,19 +83,19 @@ def _run_problem(run, repo, workflow):
     return _origin_problem(run, repo, workflow)
 
 
-def _failed_run_problem(run, repo, workflow):
-    """Why a failed marker's run does not count against the tree, or None when it does."""
-    if run.get("status") != "completed":
-        return "has not finished"
-    return _origin_problem(run, repo, workflow)
-
-
 def _artifacts(repo, name, fetch):
-    answer = fetch("/repos/%s/actions/artifacts?name=%s&per_page=100"
-                   % (repo, urllib.parse.quote(name, safe="")))
+    answer = fetch("/repos/%s/actions/artifacts?name=%s&per_page=%d"
+                   % (repo, urllib.parse.quote(name, safe=""), ARTIFACTS_PER_PAGE))
     artifacts = answer.get("artifacts")
     if not isinstance(artifacts, list):
         raise github_api.ApiError("the answer for %s holds no artifact list" % name)
+    total = answer.get("total_count")
+    if not isinstance(total, int):
+        raise github_api.ApiError("the answer for %s holds no count" % name)
+    if total > len(artifacts):
+        # A newer failed marker, or the pass that matters, could sit on a page not read.
+        raise github_api.ApiError("more %s markers than one page holds (%d of %d listed)"
+                                  % (name, len(artifacts), total))
     return artifacts
 
 
@@ -111,7 +114,7 @@ def newer_failure(repo, tree, workflow, since, fetch, now):
     candidates.sort(reverse=True)
     for _, run_id in candidates[:MAX_RUNS_CHECKED]:
         run = fetch("/repos/%s/actions/runs/%d" % (repo, run_id))
-        if _failed_run_problem(run, repo, workflow) is None:
+        if _origin_problem(run, repo, workflow) is None:
             return "Run %d failed %s in full on this tree after the pass: %s" % (
                 run_id, workflow, run.get("html_url") or "no link")
     if len(candidates) > MAX_RUNS_CHECKED:
