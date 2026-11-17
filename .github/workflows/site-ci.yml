@@ -424,6 +424,7 @@ jobs:
     name: Dependency audit
     needs: config
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -439,11 +440,17 @@ jobs:
       - name: npm install policy
         run: node scripts/check-npm-policy.mjs
 
+      # Production dependencies fail at high, every dependency at critical. A high advisory in dev tooling alone,
+      # such as a ReDoS in a build tool's glob matcher fed only repository paths, reaches no deployed code, so it
+      # waits for the weekly osv-scanner report instead of blocking every site. Critical ones, malware included,
+      # still fail here wherever they sit.
       - name: Install and audit
         run: |
           npm ci
-          npm audit --audit-level=high
+          npm audit --omit=dev --audit-level=high
+          npm audit --audit-level=critical
           if [ -d api ]; then
             npm ci --prefix api
-            npm audit --audit-level=high --prefix api
+            npm audit --omit=dev --audit-level=high --prefix api
+            npm audit --audit-level=critical --prefix api
           fi

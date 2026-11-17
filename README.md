@@ -244,7 +244,10 @@ directory. The output must parse as JSON with a `parameters` object before the c
 order, including the bandwidth alert policy. The checker uses the compiled parameters to skip resources
 that file disables. A missing params file, a compilation failure, an invalid output or a policy failure fails the job and
 names the params file. A failed policy check stops later checks. The audit job runs the npm policy check
-before `npm ci`, then `npm audit --audit-level=high` in the root and, when present, in `api/`.
+before `npm ci`, then two audits in the root and, when present, in `api/`: `npm audit --omit=dev
+--audit-level=high` for production dependencies and `npm audit --audit-level=critical` for every dependency. A high
+advisory in dev tooling alone reaches no deployed code, so it is left to the weekly osv-scanner report rather than
+failing every site, while a critical one, malware included, fails wherever it sits.
 
 ## site-deploy
 
