@@ -101,6 +101,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Probe. Print what the jobs API lists while this job runs.
+      - name: Probe the jobs API
+        env:
+          PROBE_TOKEN: ${{ github.token }}
+        run: |
+          curl -sS -H "Authorization: Bearer $PROBE_TOKEN" -H "Accept: application/vnd.github+json" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" | python3 -c 'import json,sys; [print("PROBE", j["name"], "|", j["status"], "|", j["conclusion"]) for j in json.load(sys.stdin)["jobs"]]'
       - uses: ./.github/actions/ci-finish
         with:
           needs: ${{ toJSON(needs) }}
@@ -108,3 +114,19 @@ jobs:
           full: ${{ needs.scope.outputs.full }}
           segments: ${{ needs.scope.outputs.segments }}
           scope-reason: ${{ needs.scope.outputs.reason }}
+
+  # Probe. A job that waits on the verdict, and one the verdict does not wait for.
+  after:
+    name: After the verdict
+    needs: ci-passed
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - run: echo after
+
+  unlisted:
+    name: Unlisted and slow
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - run: sleep 75
