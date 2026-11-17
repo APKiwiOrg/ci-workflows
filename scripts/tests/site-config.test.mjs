@@ -233,11 +233,12 @@ describe('capabilities control the consumer steps', () => {
     const env = { PATH: `${folder}:${process.env.PATH}`, NPM_LOG: log }
     const script = stepScript(ciPath, 'audit', 'Install and audit')
     assert.equal(run(folder, script, env).status, 0)
-    assert.equal(readFileSync(log, 'utf8'), 'ci\naudit --audit-level=high\n')
+    assert.equal(readFileSync(log, 'utf8'), 'ci\naudit --omit=dev --audit-level=high\naudit --audit-level=critical\n')
     mkdirSync(join(folder, 'api'))
     rmSync(log)
     assert.equal(run(folder, script, env).status, 0)
-    assert.equal(readFileSync(log, 'utf8'), 'ci\naudit --audit-level=high\nci --prefix api\naudit --audit-level=high --prefix api\n')
+    assert.equal(readFileSync(log, 'utf8'), 'ci\naudit --omit=dev --audit-level=high\naudit --audit-level=critical\n'
+      + 'ci --prefix api\naudit --omit=dev --audit-level=high --prefix api\naudit --audit-level=critical --prefix api\n')
     rmSync(log)
     assert.notEqual(run(folder, script, { ...env, NPM_EXIT: '1' }).status, 0)
     assert.equal(readFileSync(log, 'utf8'), 'ci\n')
