@@ -1,14 +1,16 @@
 name: ci-finish
 description: Give a CI run one verdict and one summary, and mark the tree after a full run.
 
-# Runs as the last job of a run, under `needs` for every other job and `if: always()`. The verdict starts
-# from `needs`: a failed or cancelled job fails the run. A skipped job fails it unless its id is in
-# `allow-skipped-always`, or in `allow-skipped` on a run that is not full, since a full run runs every
-# segment. The jobs API can then only turn a pass into a fail: a finished job of this run that failed, timed
-# out or was cancelled and that `needs` does not report fails the run. So a job allowed to fail does not
-# belong in the workflow whose verdict this is. An API error leaves the verdict from `needs` unchanged and
-# only thins the summary. The steps run in order: write the summary, upload the marker, then fail when the
-# run did not pass, so a failed run still shows its summary. A full run that passed uploads
+# Runs as the last job of a run, under `if: always()`. Every job of the workflow that does not itself wait
+# for the verdict must be in its `needs`. A job that runs after the verdict is not counted. The verdict
+# starts from `needs`: a failed or cancelled job fails the run, and so does a `full` input other than true or
+# false. A skipped job fails it unless its id is in `allow-skipped` on a run that is not full, or in
+# `allow-skipped-always` and not in `allow-skipped`, since a full run runs every segment. The jobs API can
+# then only turn a pass into a fail: a job of this run that has not finished, or that failed, timed out or
+# was cancelled, and that `needs` does not report, fails the run. So a job allowed to fail does not belong
+# in the workflow whose verdict this is. An API error leaves the verdict from `needs` unchanged, thins the
+# summary and withholds the pass marker. The steps run in order: write the summary, upload the marker, then
+# fail when the run did not pass, so a failed run still shows its summary. A full run that passed uploads
 # ci-passed-full-TREE. A full run with a job in `needs` that failed uploads ci-failed-full-TREE, so
 # ci-tested-tree does not reuse an older pass of that tree. The calling job checks the repository out and
 # grants `actions: read`.
@@ -30,9 +32,10 @@ inputs:
     required: false
     default: ''
   full:
-    description: true when ci-scope made this a full run, so every segment job must run and the tree is marked
-    required: false
-    default: 'false'
+    description: >-
+      true when ci-scope made this a full run, so every segment job must run and the tree is marked, false
+      otherwise. Any other value fails the run.
+    required: true
   segments:
     description: The JSON list of segments ci-scope selected, used to explain skipped test segments
     required: false
@@ -46,7 +49,9 @@ inputs:
     required: false
     default: ''
   job-name:
-    description: Display name of the job that runs this action, so its row is the verdict and comes last
+    description: >-
+      Display name of the job that runs this action, so its row is the verdict and comes last. It must match,
+      or the job counts itself as a job that has not finished and the run fails.
     required: false
     default: CI passed
   token:
