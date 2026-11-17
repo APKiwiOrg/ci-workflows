@@ -1,25 +1,34 @@
 name: ci-scope
 description: Decide which test segments a run needs from the files its change touched.
 
-# Reads a rules file of `NAME: GLOB GLOB ...` lines (`full` and `ignore` are reserved names) and compares
-# the commit under test with the push's previous commit or the pull request's base. A schedule, a manual
-# dispatch, a tag, a missing or malformed rules file, a base commit that cannot be found, a change to a
-# `full` file or a file no rule covers each make a full run, with the reason in the `reason` output.
-# The calling job checks the repository out first. A pull request compares three-dot, so its checkout
-# needs enough history to hold the merge base, or the run goes full.
+# Reads a rules file of `NAME: GLOB GLOB ...` lines (`full` and `ignore` are reserved names). A push to a
+# branch is compared with the commit of the newest passing run of the same workflow on that branch that is
+# an ancestor of HEAD, read from the Actions API, so a push never selects less than every change since the
+# last run that passed. A pull request is compared three-dot with its base. A schedule, a manual dispatch, a
+# tag, a missing or malformed rules file, no passing run to compare with, an API error, a base commit that
+# cannot be found, a change to the rules file, a change to a `full` file or a file no rule covers each make
+# a full run, with the reason in the `reason` output. On a full run every test job runs whatever `segments`
+# holds, and `segments` may be empty. The calling job checks the repository out with `fetch-depth: 0` first
+# and grants `actions: read` and `contents: read`.
 
 inputs:
   rules:
     description: Path to the rules file, relative to the workspace
     required: false
     default: .github/ci-scope.txt
+  token:
+    description: Token that can read the workflow's runs
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   full:
-    description: true when every segment runs, false when only the listed segments run
+    description: true when every test job runs whatever segments holds, false when only the listed segments run
     value: ${{ steps.scope.outputs.full }}
   segments:
-    description: JSON list of the segment names to run, sorted. A full run lists every segment.
+    description: >-
+      JSON list of segment names, sorted. On a partial run, the segments to run. On a full run, every segment
+      the rules name, which is empty when the rules file is missing or empty.
     value: ${{ steps.scope.outputs.segments }}
   reason:
     description: One line saying why the run is full or which segments it needs
@@ -35,4 +44,5 @@ runs:
       shell: bash
       env:
         CI_SCOPE_RULES: ${{ inputs.rules }}
+        CI_API_TOKEN: ${{ inputs.token }}
       run: python3 "$GITHUB_ACTION_PATH/scope.py"

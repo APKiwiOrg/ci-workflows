@@ -4,14 +4,17 @@ Run from the repository root:
     python3 -m unittest discover -s scripts/tests -p 'test_ci_*.py' -v
 
 Every refusal or full-run case sits beside a control that differs only in that one thing. Only the
-end to end test builds a git repository. The rest pass plain values and a fake git.
+end to end test builds a git repository and serves the API locally. The rest pass plain values, a fake git
+and a fake API.
 """
+import http.server
 import importlib.util
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +26,12 @@ _spec.loader.exec_module(scope)
 
 BASE = "a" * 40
 HEAD = "b" * 40
+OTHER = "d" * 40
 ZEROS = "0" * 40
+REPO = "example-org/example-app"
+RUN_ID = "900"
+WORKFLOW = scope.Workflow(REPO, ".github/workflows/ci.yml", "main", RUN_ID)
+RUNS_PATH = "/repos/%s/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=20" % REPO
 
 RULES_TEXT = """\
 # comment
@@ -37,9 +45,11 @@ ignore: docs/** **/*.md
 class FakeGit(object):
     """Stands in for git. Knows which commits the clone holds and which a fetch can bring in."""
 
-    def __init__(self, present=(), fetchable=(), diff=b"", diff_code=0):
+    def __init__(self, present=(), fetchable=(), diff=b"", diff_code=0, ancestors=()):
         self.present = set(present)
         self.fetchable = set(fetchable)
+        # Commits that are ancestors of HEAD, as `merge-base --is-ancestor` answers.
+        self.ancestors = set(ancestors)
         self.diff = diff
         self.diff_code = diff_code
         self.calls = []
@@ -56,7 +66,35 @@ class FakeGit(object):
             return 128, b""
         if args[0] == "diff":
             return self.diff_code, self.diff
+        if args[:2] == ["merge-base", "--is-ancestor"] and args[3] == HEAD:
+            return (0 if args[2] in self.ancestors else 1), b""
         raise AssertionError("unexpected git call: %r" % (args,))
+
+
+class FakeFetch(object):
+    """Stands in for the API. Answers the list of passing runs, or raises the given error."""
+
+    def __init__(self, runs=(), path=RUNS_PATH, answer=None, error=None):
+        self.path = path
+        self.answer = answer if answer is not None else {"total_count": len(runs), "workflow_runs": list(runs)}
+        self.error = error
+        self.calls = []
+
+    def __call__(self, path):
+        self.calls.append(path)
+        if self.error is not None:
+            raise self.error
+        if path != self.path:
+            raise scope.github_api.ApiError("HTTP 404 for " + path)
+        return self.answer
+
+
+def passing_run(run_id=1, sha=BASE, created="2026-01-19T10:00:00Z", conclusion="success", event="push",
+                path=".github/workflows/ci.yml", repo=REPO, head_repo=REPO):
+    """A run as the list-runs-for-a-workflow endpoint returns it."""
+    return {"id": run_id, "head_sha": sha, "created_at": created, "status": "completed",
+            "conclusion": conclusion, "event": event, "path": path,
+            "repository": {"full_name": repo}, "head_repository": {"full_name": head_repo}}
 
 
 def names(*paths):
@@ -143,6 +181,31 @@ class ParseRulesTests(unittest.TestCase):
         rules = scope.parse_rules("unit tests: src/**\n")
         self.assertEqual(rules.error, "Full run: rules file line 1 is not NAME: GLOBS")
 
+    def test_glob_with_a_leading_slash_is_an_error(self):
+        rules = scope.parse_rules("w: .github/workflows/**\nfull: /.github/**\n")
+        self.assertEqual(rules.error, "Full run: rules file line 2 has a glob that starts or ends with / or holds //")
+
+    def test_glob_with_a_trailing_slash_or_double_slash_is_an_error(self):
+        for glob in ("src/", "src//core/**", "/"):
+            with self.subTest(glob=glob):
+                self.assertIsNotNone(scope.parse_rules("unit: %s\n" % glob).error)
+
+    def test_control_glob_without_a_stray_slash(self):
+        self.assertIsNone(scope.parse_rules("w: .github/workflows/**\nfull: .github/**\n").error)
+
+    def test_reserved_name_in_another_case_is_an_error(self):
+        for name in ("Full", "FULL", "Ignore", "iGnOrE"):
+            with self.subTest(name=name):
+                rules = scope.parse_rules("unit: src/**\n%s: .github/**\n" % name)
+                self.assertEqual(rules.error, "Full run: rules file line 2 names a segment %s, which is reserved"
+                                 % name)
+                self.assertEqual(rules.segments, {"unit": ["src/**"]})
+
+    def test_control_reserved_names_in_lower_case(self):
+        rules = scope.parse_rules("full: .github/**\nignore: docs/**\n")
+        self.assertIsNone(rules.error)
+        self.assertEqual((rules.full, rules.ignore), ([".github/**"], ["docs/**"]))
+
     def test_first_bad_line_is_reported_and_later_segments_still_listed(self):
         rules = scope.parse_rules("bad\nworse\napi: src/api/**\n")
         self.assertEqual(rules.error, "Full run: rules file line 1 is not NAME: GLOBS")
@@ -208,112 +271,275 @@ class SelectTests(unittest.TestCase):
     def test_no_changed_files_affect_no_segment(self):
         self.assertEqual(scope.select(self.rules, []), (False, [], "0 files changed. No segment affected"))
 
+    def test_since_names_the_base(self):
+        self.assertEqual(scope.select(self.rules, ["src/api/a.py"], " since X"),
+                         (False, ["api"], "1 file changed since X. Segments: api"))
+        self.assertEqual(scope.select(self.rules, ["docs/a.md"], " since X"),
+                         (False, [], "1 file changed since X. No segment affected"))
 
-class BaseForTests(unittest.TestCase):
-    def test_push_compares_two_dot_from_before(self):
-        self.assertEqual(scope.base_for("push", {"before": BASE}, "branch"), (BASE, False, None))
 
-    def test_new_branch_push_has_no_base(self):
-        self.assertEqual(scope.base_for("push", {"before": ZEROS}, "branch"), (None, False, None))
-
-    def test_push_without_before_has_no_base(self):
-        self.assertEqual(scope.base_for("push", {}, "branch"), (None, False, None))
-
-    def test_before_that_is_not_a_sha_has_no_base(self):
-        self.assertEqual(scope.base_for("push", {"before": "--upload-pack=x"}, "branch"), (None, False, None))
-
-    def test_pull_request_compares_three_dot_from_base_sha(self):
-        event = {"pull_request": {"base": {"sha": BASE}}}
-        self.assertEqual(scope.base_for("pull_request", event, "branch"), (BASE, True, None))
-
+class FullEventTests(unittest.TestCase):
     def test_tag_is_a_full_run(self):
-        self.assertEqual(scope.base_for("push", {"before": BASE}, "tag"), (None, False, "Full run: tag"))
+        self.assertEqual(scope.full_event_reason("push", "tag"), "Full run: tag")
 
     def test_schedule_is_a_full_run(self):
-        self.assertEqual(scope.base_for("schedule", {}, "branch"), (None, False, "Full run: schedule"))
+        self.assertEqual(scope.full_event_reason("schedule", "branch"), "Full run: schedule")
 
     def test_dispatch_is_a_full_run(self):
-        self.assertEqual(
-            scope.base_for("workflow_dispatch", {}, "branch"), (None, False, "Full run: workflow_dispatch"))
+        self.assertEqual(scope.full_event_reason("workflow_dispatch", "branch"), "Full run: workflow_dispatch")
 
-    def test_other_event_has_no_base(self):
-        self.assertEqual(scope.base_for("merge_group", {"before": BASE}, "branch"), (None, False, None))
+    def test_control_branch_push_and_pull_request_compare(self):
+        self.assertIsNone(scope.full_event_reason("push", "branch"))
+        self.assertIsNone(scope.full_event_reason("pull_request", "branch"))
+
+
+class PullRequestBaseTests(unittest.TestCase):
+    def test_base_sha(self):
+        self.assertEqual(scope.pull_request_base({"pull_request": {"base": {"sha": BASE}}}), BASE)
+
+    def test_missing_base(self):
+        self.assertIsNone(scope.pull_request_base({}))
+
+    def test_base_that_is_not_a_sha(self):
+        self.assertIsNone(scope.pull_request_base({"pull_request": {"base": {"sha": "--upload-pack=x"}}}))
+
+    def test_all_zeros(self):
+        self.assertIsNone(scope.pull_request_base({"pull_request": {"base": {"sha": ZEROS}}}))
+
+
+class WorkflowFromEnvTests(unittest.TestCase):
+    def test_reads_the_workflow_path_branch_and_run(self):
+        env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF_NAME": "main", "GITHUB_RUN_ID": RUN_ID,
+               "GITHUB_WORKFLOW_REF": REPO + "/.github/workflows/ci.yml@refs/heads/main"}
+        self.assertEqual(scope.workflow_from_env(env), WORKFLOW)
+
+    def test_ref_of_another_repository_gives_no_path(self):
+        env = {"GITHUB_REPOSITORY": REPO, "GITHUB_REF_NAME": "main", "GITHUB_RUN_ID": RUN_ID,
+               "GITHUB_WORKFLOW_REF": "someone/else/.github/workflows/ci.yml@refs/heads/main"}
+        self.assertEqual(scope.workflow_from_env(env).path, "")
+
+    def test_empty_environment(self):
+        self.assertEqual(scope.workflow_from_env({}), scope.Workflow("", "", "", ""))
 
 
 class DecideTests(unittest.TestCase):
-    """The table rows that need the event, the rules file and git together."""
+    """The table rows that need the event, the rules file, the API and git together."""
 
-    def push(self, rules_text=RULES_TEXT, event_name="push", before=BASE, ref_type="branch", git=None):
-        git = git if git is not None else FakeGit(present=[BASE], diff=names("src/core/a.py"))
-        return scope.decide(event_name, {"before": before}, ref_type, rules_text, HEAD, git), git
+    def push(self, rules_text=RULES_TEXT, event_name="push", ref_type="branch", git=None, fetch=None,
+             workflow=WORKFLOW, rules_path=".github/ci-scope.txt", event=None):
+        git = git if git is not None else FakeGit(present=[BASE], ancestors=[BASE], diff=names("src/core/a.py"))
+        fetch = fetch if fetch is not None else FakeFetch([passing_run()])
+        event = event if event is not None else {"before": OTHER}
+        return scope.decide(event_name, event, ref_type, rules_text, HEAD, git, fetch, workflow,
+                            rules_path), git
 
-    def test_control_push_selects_segments(self):
+    def test_control_push_selects_segments_since_the_last_passing_run(self):
         result, git = self.push()
-        self.assertEqual(result, scope.Scope(False, ["unit"], "1 file changed. Segments: unit", 1))
+        self.assertEqual(result, scope.Scope(
+            False, ["unit"], "1 file changed since the last passing run (aaaaaaa). Segments: unit", 1))
         self.assertEqual(git.calls[-1], ["diff", "--name-only", "-z", "--no-renames", BASE + ".." + HEAD])
+
+    def test_push_reads_one_page_of_passing_runs_of_this_workflow_on_the_branch(self):
+        fetch = FakeFetch([passing_run()])
+        self.push(fetch=fetch)
+        self.assertEqual(fetch.calls, [RUNS_PATH])
+
+    def test_branch_name_is_quoted_in_the_api_path(self):
+        workflow = WORKFLOW._replace(branch="feature/x y")
+        fetch = FakeFetch([passing_run()], path=RUNS_PATH.replace("branch=main", "branch=feature%2Fx%20y"))
+        result, _ = self.push(fetch=fetch, workflow=workflow)
+        self.assertFalse(result.full)
+
+    def test_diff_is_taken_from_the_base_and_not_from_before(self):
+        git = FakeGit(present=[BASE, OTHER], ancestors=[BASE, OTHER], diff=names("src/core/a.py"))
+        self.push(git=git, event={"before": OTHER})
+        diffs = [c for c in git.calls if c[0] == "diff"]
+        self.assertEqual(diffs, [["diff", "--name-only", "-z", "--no-renames", BASE + ".." + HEAD]])
+
+    def test_newest_passing_run_is_the_base(self):
+        runs = [passing_run(1, BASE, "2026-01-18T10:00:00Z"), passing_run(2, OTHER, "2026-01-19T10:00:00Z")]
+        git = FakeGit(present=[BASE, OTHER], ancestors=[BASE, OTHER], diff=names("src/core/a.py"))
+        result, _ = self.push(git=git, fetch=FakeFetch(runs))
+        self.assertEqual(git.calls[-1][-1], OTHER + ".." + HEAD)
+        self.assertIn("(%s)" % OTHER[:7], result.reason)
+
+    def test_newer_run_that_is_not_an_ancestor_is_passed_over(self):
+        runs = [passing_run(2, OTHER, "2026-01-19T10:00:00Z"), passing_run(1, BASE, "2026-01-18T10:00:00Z")]
+        git = FakeGit(present=[BASE, OTHER], ancestors=[BASE], diff=names("src/core/a.py"))
+        self.push(git=git, fetch=FakeFetch(runs))
+        self.assertEqual(git.calls[-1][-1], BASE + ".." + HEAD)
+
+    def test_run_whose_commit_is_not_in_the_clone_is_passed_over(self):
+        runs = [passing_run(2, OTHER, "2026-01-19T10:00:00Z"), passing_run(1, BASE, "2026-01-18T10:00:00Z")]
+        git = FakeGit(present=[BASE], ancestors=[BASE, OTHER], diff=names("src/core/a.py"))
+        self.push(git=git, fetch=FakeFetch(runs))
+        self.assertEqual(git.calls[-1][-1], BASE + ".." + HEAD)
+        self.assertFalse([c for c in git.calls if c[0] == "fetch"])
+
+    def test_runs_that_cannot_be_a_base_are_passed_over(self):
+        refused = [
+            passing_run(int(RUN_ID), OTHER),
+            passing_run(3, OTHER, head_repo="someone/example-app"),
+            passing_run(4, OTHER, repo="someone/example-app"),
+            passing_run(5, OTHER, path=".github/workflows/nightly.yml"),
+            passing_run(6, OTHER, event="pull_request"),
+            passing_run(7, OTHER, event="pull_request_target"),
+            passing_run(8, OTHER, event="workflow_run"),
+            passing_run(9, OTHER, conclusion="failure"),
+            passing_run(10, "not-a-sha"),
+        ]
+        for item in refused:
+            with self.subTest(run=item["id"], event=item["event"]):
+                git = FakeGit(present=[BASE, OTHER], ancestors=[BASE, OTHER], diff=names("src/core/a.py"))
+                older = passing_run(1, BASE, "2026-01-18T10:00:00Z")
+                self.push(git=git, fetch=FakeFetch([item, older]))
+                self.assertEqual(git.calls[-1][-1], BASE + ".." + HEAD)
+
+    def test_control_schedule_and_dispatch_runs_can_be_a_base(self):
+        for event in ("schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                git = FakeGit(present=[BASE, OTHER], ancestors=[BASE, OTHER], diff=names("src/core/a.py"))
+                runs = [passing_run(2, OTHER, event=event), passing_run(1, BASE, "2026-01-18T10:00:00Z")]
+                self.push(git=git, fetch=FakeFetch(runs))
+                self.assertEqual(git.calls[-1][-1], OTHER + ".." + HEAD)
+
+    def test_no_passing_run_is_a_full_run(self):
+        result, git = self.push(fetch=FakeFetch([]))
+        self.assertEqual(result, scope.Scope(
+            True, ["api", "unit"], "Full run: no passing run of this workflow on main to compare with", None))
+        self.assertFalse([c for c in git.calls if c[0] == "diff"])
+
+    def test_only_runs_that_do_not_count_is_a_full_run(self):
+        result, _ = self.push(fetch=FakeFetch([passing_run(3, BASE, head_repo="someone/example-app")]))
+        self.assertTrue(result.full)
+        self.assertEqual(result.reason, "Full run: no passing run of this workflow on main to compare with")
+
+    def test_api_error_is_a_full_run(self):
+        result, git = self.push(fetch=FakeFetch(error=scope.github_api.ApiError("HTTP 403 for /x")))
+        self.assertEqual(result, scope.Scope(
+            True, ["api", "unit"], "Full run: the last passing run could not be read (HTTP 403 for /x)", None))
+        self.assertFalse([c for c in git.calls if c[0] == "diff"])
+
+    def test_answer_without_a_run_list_is_a_full_run(self):
+        result, _ = self.push(fetch=FakeFetch(answer={"total_count": 1}))
+        self.assertTrue(result.full)
+        self.assertTrue(result.reason.startswith("Full run: the last passing run could not be read"))
+
+    def test_unknown_workflow_is_a_full_run_without_an_api_call(self):
+        fetch = FakeFetch([passing_run()])
+        result, _ = self.push(fetch=fetch, workflow=scope.Workflow(REPO, "", "main", RUN_ID))
+        self.assertTrue(result.full)
+        self.assertEqual(fetch.calls, [])
 
     def test_schedule_is_a_full_run_listing_every_segment(self):
         result, git = self.push(event_name="schedule")
         self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: schedule", None))
         self.assertEqual(git.calls, [])
 
-    def test_tag_is_a_full_run(self):
-        result, _ = self.push(ref_type="tag")
+    def test_tag_is_a_full_run_without_an_api_call(self):
+        fetch = FakeFetch([passing_run()])
+        result, _ = self.push(ref_type="tag", fetch=fetch)
         self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: tag", None))
+        self.assertEqual(fetch.calls, [])
 
-    def test_missing_rules_file_is_a_full_run(self):
+    def test_missing_rules_file_is_a_full_run_with_no_known_segments(self):
         result, _ = self.push(rules_text=None)
         self.assertEqual(result, scope.Scope(True, [], "Full run: no rules file", None))
+
+    def test_missing_rules_file_on_a_dispatch_is_a_full_run_with_no_known_segments(self):
+        result, _ = self.push(rules_text=None, event_name="workflow_dispatch")
+        self.assertEqual(result, scope.Scope(True, [], "Full run: workflow_dispatch", None))
+
+    def test_empty_rules_file_is_a_full_run_with_no_known_segments(self):
+        result, _ = self.push(rules_text="# nothing yet\n")
+        self.assertEqual(result, scope.Scope(True, [], "Full run: src/core/a.py matches no rule", 1))
 
     def test_bad_rules_line_is_a_full_run(self):
         result, _ = self.push(rules_text=RULES_TEXT + "broken\n")
         self.assertEqual(
             result, scope.Scope(True, ["api", "unit"], "Full run: rules file line 6 is not NAME: GLOBS", None))
 
-    def test_new_branch_push_is_a_full_run(self):
-        result, git = self.push(before=ZEROS)
-        self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: no base commit to compare", None))
-        self.assertEqual(git.calls, [])
+    def test_changed_rules_file_is_a_full_run(self):
+        rules = RULES_TEXT + "ignore: **/*.txt\n"
+        git = FakeGit(present=[BASE], ancestors=[BASE], diff=names("src/core/a.py", "rules/scope.txt"))
+        result, _ = self.push(rules_text=rules, git=git, rules_path="rules/scope.txt")
+        self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: rules/scope.txt changes the rules", 2))
 
-    def test_base_missing_and_unfetchable_is_a_full_run(self):
-        git = FakeGit(present=[], diff=names("src/core/a.py"))
+    def test_changed_rules_file_given_with_a_leading_dot_slash_is_a_full_run(self):
+        git = FakeGit(present=[BASE], ancestors=[BASE], diff=names("src/core/a.py", "rules/scope.txt"))
+        result, _ = self.push(rules_text=RULES_TEXT + "ignore: **/*.txt\n", git=git,
+                              rules_path="./rules/scope.txt")
+        self.assertTrue(result.full)
+
+    def test_control_rules_file_unchanged_is_partial(self):
+        git = FakeGit(present=[BASE], ancestors=[BASE], diff=names("src/core/a.py", "rules/other.txt"))
+        result, _ = self.push(rules_text=RULES_TEXT + "ignore: **/*.txt\n", git=git, rules_path="rules/scope.txt")
+        self.assertFalse(result.full)
+
+    def test_failed_diff_is_a_full_run(self):
+        git = FakeGit(present=[BASE], ancestors=[BASE], diff=b"", diff_code=128)
         result, _ = self.push(git=git)
+        self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: no base commit to compare", None))
+
+    def test_full_glob_change_counts_files(self):
+        git = FakeGit(present=[BASE], ancestors=[BASE], diff=names("global.json", "src/core/a.py"))
+        result, _ = self.push(git=git)
+        self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: global.json changes shared files", 2))
+
+    def test_odd_file_names_survive(self):
+        git = FakeGit(present=[BASE], ancestors=[BASE], diff=names("src/core/odd name\n.py", "docs/x.md"))
+        result, _ = self.push(git=git)
+        self.assertEqual(result.segments, ["unit"])
+        self.assertEqual(result.changed, 2)
+
+    def pull_request(self, git, event=None):
+        event = event if event is not None else {"pull_request": {"base": {"sha": BASE}}}
+        fetch = FakeFetch([passing_run()])
+        result = scope.decide("pull_request", event, "branch", RULES_TEXT, HEAD, git, fetch, WORKFLOW,
+                              ".github/ci-scope.txt")
+        self.assertEqual(fetch.calls, [])
+        return result
+
+    def test_pull_request_diffs_three_dot_without_the_api(self):
+        git = FakeGit(present=[BASE], diff=names("src/api/a.py"))
+        result = self.pull_request(git)
+        self.assertEqual(result, scope.Scope(False, ["api"], "1 file changed. Segments: api", 1))
+        self.assertEqual(git.calls[-1], ["diff", "--name-only", "-z", "--no-renames", BASE + "..." + HEAD])
+
+    def test_pull_request_base_missing_and_unfetchable_is_a_full_run(self):
+        git = FakeGit(present=[], diff=names("src/core/a.py"))
+        result = self.pull_request(git)
         self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: no base commit to compare", None))
         fetches = [c for c in git.calls if c[0] == "fetch"]
         self.assertEqual(fetches, [["fetch", "--no-tags", "--depth=1", "origin", BASE]])
         self.assertFalse([c for c in git.calls if c[0] == "diff"])
 
-    def test_control_base_missing_but_fetchable(self):
+    def test_control_pull_request_base_missing_but_fetchable(self):
         git = FakeGit(present=[], fetchable=[BASE], diff=names("src/core/a.py"))
-        result, _ = self.push(git=git)
-        self.assertEqual(result, scope.Scope(False, ["unit"], "1 file changed. Segments: unit", 1))
+        self.assertEqual(self.pull_request(git),
+                         scope.Scope(False, ["unit"], "1 file changed. Segments: unit", 1))
 
-    def test_base_present_is_not_fetched(self):
+    def test_pull_request_base_present_is_not_fetched(self):
         git = FakeGit(present=[BASE], diff=names("src/core/a.py"))
-        self.push(git=git)
+        self.pull_request(git)
         self.assertFalse([c for c in git.calls if c[0] == "fetch"])
 
-    def test_failed_diff_is_a_full_run(self):
-        git = FakeGit(present=[BASE], diff=b"", diff_code=128)
-        result, _ = self.push(git=git)
+    def test_pull_request_without_a_base_is_a_full_run(self):
+        git = FakeGit(present=[BASE], diff=names("src/core/a.py"))
+        result = self.pull_request(git, event={})
         self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: no base commit to compare", None))
 
-    def test_full_glob_change_counts_files(self):
-        git = FakeGit(present=[BASE], diff=names("global.json", "src/core/a.py"))
-        result, _ = self.push(git=git)
-        self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: global.json changes shared files", 2))
+    def test_other_event_has_no_base(self):
+        git = FakeGit(present=[BASE], diff=names("src/core/a.py"))
+        result = scope.decide("merge_group", {"before": BASE}, "branch", RULES_TEXT, HEAD, git,
+                              FakeFetch([passing_run()]), WORKFLOW, ".github/ci-scope.txt")
+        self.assertEqual(result, scope.Scope(True, ["api", "unit"], "Full run: no base commit to compare", None))
 
-    def test_pull_request_diffs_three_dot(self):
-        git = FakeGit(present=[BASE], diff=names("src/api/a.py"))
-        event = {"pull_request": {"base": {"sha": BASE}}}
-        result = scope.decide("pull_request", event, "branch", RULES_TEXT, HEAD, git)
-        self.assertEqual(result, scope.Scope(False, ["api"], "1 file changed. Segments: api", 1))
-        self.assertEqual(git.calls[-1], ["diff", "--name-only", "-z", "--no-renames", BASE + "..." + HEAD])
 
-    def test_odd_file_names_survive(self):
-        git = FakeGit(present=[BASE], diff=names("src/core/odd name\n.py", "docs/x.md"))
-        result, _ = self.push(git=git)
-        self.assertEqual(result, scope.Scope(False, ["unit"], "2 files changed. Segments: unit", 2))
+class SharedImportTests(unittest.TestCase):
+    def test_helper_comes_from_the_shared_folder_beside_the_action(self):
+        self.assertEqual(os.path.dirname(os.path.abspath(scope.github_api.__file__)),
+                         os.path.join(ROOT, ".github", "actions", "_shared"))
 
 
 class OutputLineTests(unittest.TestCase):
@@ -336,8 +562,40 @@ class OutputLineTests(unittest.TestCase):
         ])
 
 
+class RunsServer(object):
+    """A local HTTP server that answers the list of passing runs, so the script's real API path runs."""
+
+    def __init__(self, answers):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                answer = answers.get(self.path)
+                body = json.dumps(answer if answer is not None else {"message": "Not Found"}).encode()
+                self.send_response(200 if answer is not None else 404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        return False
+
+
 class MainEndToEndTest(unittest.TestCase):
-    """One real run of the script against a temporary git repository with two commits."""
+    """One real run of the script against a temporary git repository and a local API."""
 
     def git(self, *args):
         return subprocess.run(
@@ -351,7 +609,12 @@ class MainEndToEndTest(unittest.TestCase):
         with open(full, "w") as handle:
             handle.write(text)
 
-    def test_push_selects_the_changed_segment(self):
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def test_push_selects_what_changed_since_the_last_passing_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.repo = os.path.join(tmp, "example-app")
             os.makedirs(self.repo)
@@ -364,44 +627,61 @@ class MainEndToEndTest(unittest.TestCase):
             self.write(".github/ci-scope.txt", RULES_TEXT)
             self.write("src/core/a.py", "one\n")
             self.write("src/api/b.py", "one\n")
-            self.git("add", "-A")
-            self.git("commit", "-q", "-m", "first")
-            before = self.git("rev-parse", "HEAD")
+            passed = self.commit("first, passed")
+            # The run of this commit failed in api, so the next push must still test api.
+            self.write("src/api/b.py", "two\n")
+            failed = self.commit("second, failed")
             self.write("src/core/a.py", "two\n")
             self.write("docs/odd name.md", "notes\n")
-            self.git("add", "-A")
-            self.git("commit", "-q", "-m", "second")
-            after = self.git("rev-parse", "HEAD")
+            after = self.commit("third")
+            # A passing run on another line of history is never a base.
+            self.git("checkout", "-q", "-b", "elsewhere", passed)
+            self.write("src/elsewhere.py", "x\n")
+            unrelated = self.commit("unrelated")
+            self.git("checkout", "-q", after)
 
+            runs = {"workflow_runs": [
+                passing_run(3, unrelated, "2026-01-19T12:00:00Z"),
+                passing_run(2, failed, "2026-01-19T11:00:00Z", conclusion="failure"),
+                passing_run(1, passed, "2026-01-19T10:00:00Z"),
+            ]}
             event_path = os.path.join(tmp, "event.json")
             with open(event_path, "w") as handle:
-                json.dump({"before": before, "after": after}, handle)
+                json.dump({"before": failed, "after": after}, handle)
             output_path = os.path.join(tmp, "output")
             with open(output_path, "w") as handle:
                 handle.write("earlier=kept\n")
 
-            env = dict(self.env)
-            env.pop("CI_SCOPE_RULES", None)
-            env.update({
-                "GITHUB_EVENT_NAME": "push",
-                "GITHUB_EVENT_PATH": event_path,
-                "GITHUB_REF_TYPE": "branch",
-                "GITHUB_SHA": after,
-                "GITHUB_OUTPUT": output_path,
-            })
-            run = subprocess.run(
-                [sys.executable, SCRIPT], cwd=self.repo, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
+            with RunsServer({RUNS_PATH: runs}) as api:
+                env = dict(self.env)
+                env.pop("CI_SCOPE_RULES", None)
+                env.update({
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_EVENT_PATH": event_path,
+                    "GITHUB_REF_TYPE": "branch",
+                    "GITHUB_REF_NAME": "main",
+                    "GITHUB_REPOSITORY": REPO,
+                    "GITHUB_RUN_ID": RUN_ID,
+                    "GITHUB_WORKFLOW_REF": REPO + "/.github/workflows/ci.yml@refs/heads/main",
+                    "GITHUB_SHA": after,
+                    "GITHUB_OUTPUT": output_path,
+                    "GITHUB_API_URL": api.url,
+                    "CI_API_TOKEN": "secret-token",
+                })
+                run = subprocess.run(
+                    [sys.executable, SCRIPT], cwd=self.repo, env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
             self.assertEqual(run.returncode, 0, run.stderr.decode("utf-8", "replace"))
+            self.assertNotIn(b"secret-token", run.stdout + run.stderr)
             with open(output_path) as handle:
                 written = handle.read().splitlines()
             self.assertEqual(written, [
                 "earlier=kept",
                 "full=false",
-                'segments=["unit"]',
-                "reason=2 files changed. Segments: unit",
-                "changed=2",
+                'segments=["api","unit"]',
+                "reason=3 files changed since the last passing run (%s). Segments: api, unit" % passed[:7],
+                "changed=3",
             ])
 
 

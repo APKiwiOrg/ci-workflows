@@ -481,29 +481,43 @@ GitHub-hosted runner has. A job in a container needs both in its image. Inputs r
 
 ### ci-scope
 
-Decides which test segments a run needs from the files its change touched and a rules file. A push compares
-with the push's previous commit, and a pull request compares three-dot with its base, so only the pull
-request's own changes count.
+Decides which test segments a run needs from the files its change touched and a rules file.
+
+A push to a branch compares with the last passing run, not with the commit before the push. It reads the
+newest successful runs of the same workflow on the branch from the Actions API and takes the commit of the
+newest one that ran on `push`, `schedule` or `workflow_dispatch` in this repository and is an ancestor of
+`HEAD`. So a segment that failed, or a push whose run was cancelled, stays selected until a run passes, and a
+push never selects less than every change since the last run that passed. The reason names that commit, for
+example `3 files changed since the last passing run (1a2b3c4). Segments: unit`. A pull request compares
+three-dot with its base, so only the pull request's own changes count.
 
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `rules` | `.github/ci-scope.txt` | Path to the rules file, relative to the workspace. |
+| `token` | `${{ github.token }}` | Token that can read the workflow's runs. |
 
 | Output | Meaning |
 | --- | --- |
-| `full` | `true` when every segment runs, `false` when only the listed segments run. |
-| `segments` | JSON list of the segment names to run, sorted. A full run lists every segment. |
+| `full` | `true` when every test job runs, whatever `segments` holds. `false` when only the listed segments run. |
+| `segments` | JSON list of segment names, sorted. On a full run, every segment the rules name, which may be none. |
 | `reason` | One line saying why the run is full or which segments it needs. |
 | `changed` | How many files the change touched, empty when the run went full before comparing. |
 
-The calling job needs `contents: read` and checks the repository out with `fetch-depth: 0` first. A pull
-request's base and head share history only through their merge base, and the default shallow clone does not
-hold it, so without full history every pull request run is a full run.
+On a full run every test job runs, so callers gate each test job on
+`needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.segments), 'NAME')`. `segments`
+is empty on a full run when the rules file is missing or names no segment, and a gate on `segments` alone
+would then skip every test.
 
-The rules file holds one `NAME: GLOB GLOB ...` line per segment. `full` and `ignore` are reserved names.
-Blank lines and lines starting with `#` are skipped, and a name given twice adds globs. Globs match the whole
-repository-relative path: `*` matches within one path segment, `?` matches one character, `**` as a whole
-segment matches any number of segments, and a glob with no `/` matches the file name at any depth.
+The calling job needs `actions: read` and `contents: read`, and checks the repository out with
+`fetch-depth: 0` first. The last passing run's commit and a pull request's merge base are only in a full
+clone, so without full history every run is a full run.
+
+The rules file holds one `NAME: GLOB GLOB ...` line per segment. `full` and `ignore` are reserved names, and
+the same names in other letter cases are malformed. Blank lines and lines starting with `#` are skipped, and a
+name given twice adds globs. Globs match the whole repository-relative path: `*` matches within one path
+segment, `?` matches one character, `**` as a whole segment matches any number of segments, and a glob with no
+`/` matches the file name at any depth. A glob that starts or ends with `/` or holds `//` can never match, so it
+is malformed.
 
 ```text
 full: .github/workflows/ci.yml .github/ci-scope.txt global.json
@@ -514,10 +528,11 @@ ignore: docs/** **/*.md
 
 A changed file selects every segment whose globs match it. The run is full, with the reason in `reason`, on
 a schedule, a manual dispatch or a tag, when the rules file is missing or has a malformed line, when there is
-no base commit to compare (a new branch, or a base the clone cannot fetch), when a changed file matches
-`full`, and when a changed file matches no line at all. That last rule means a new folder is never silently
-untested. A file that matches only `ignore` needs no test. Only `push` and `pull_request` events compare, and
-every other event is a full run.
+no base commit to compare (no passing run on the branch yet, an API error, or a base the clone cannot
+fetch), when the rules file itself changed, when a changed file matches `full`, and when a changed file
+matches no line at all. That last rule means a new folder is never silently untested, and the rules file
+rule means new rules never decide how much of their own change is tested. A file that matches only `ignore`
+needs no test. Only `push` and `pull_request` events compare, and every other event is a full run.
 
 ```yaml
 - uses: actions/checkout@<full commit sha>

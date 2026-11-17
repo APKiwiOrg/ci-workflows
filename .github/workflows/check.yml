@@ -26,6 +26,10 @@ jobs:
     name: Scope
     runs-on: ubuntu-26.04
     timeout-minutes: 5
+    # ci-scope reads this workflow's passing runs to find what a push is compared with.
+    permissions:
+      actions: read
+      contents: read
     outputs:
       full: ${{ steps.scope.outputs.full }}
       segments: ${{ steps.scope.outputs.segments }}
