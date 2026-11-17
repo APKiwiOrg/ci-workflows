@@ -4,3 +4,6 @@
 # Local mirror of the GitHub Issues backlog (scripts/ledger.sh sync). Derived and per-checkout,
 # never a source of truth, so it stays out of git.
 .ledger/
+
+# Bytecode the Python action tests leave beside the scripts they import.
+__pycache__/

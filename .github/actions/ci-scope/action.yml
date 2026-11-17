@@ -1,0 +1,38 @@
+name: ci-scope
+description: Decide which test segments a run needs from the files its change touched.
+
+# Reads a rules file of `NAME: GLOB GLOB ...` lines (`full` and `ignore` are reserved names) and compares
+# the commit under test with the push's previous commit or the pull request's base. A schedule, a manual
+# dispatch, a tag, a missing or malformed rules file, a base commit that cannot be found, a change to a
+# `full` file or a file no rule covers each make a full run, with the reason in the `reason` output.
+# The calling job checks the repository out first. A pull request compares three-dot, so its checkout
+# needs enough history to hold the merge base, or the run goes full.
+
+inputs:
+  rules:
+    description: Path to the rules file, relative to the workspace
+    required: false
+    default: .github/ci-scope.txt
+
+outputs:
+  full:
+    description: true when every segment runs, false when only the listed segments run
+    value: ${{ steps.scope.outputs.full }}
+  segments:
+    description: JSON list of the segment names to run, sorted. A full run lists every segment.
+    value: ${{ steps.scope.outputs.segments }}
+  reason:
+    description: One line saying why the run is full or which segments it needs
+    value: ${{ steps.scope.outputs.reason }}
+  changed:
+    description: How many files the change touched, empty when the run went full before comparing
+    value: ${{ steps.scope.outputs.changed }}
+
+runs:
+  using: composite
+  steps:
+    - id: scope
+      shell: bash
+      env:
+        CI_SCOPE_RULES: ${{ inputs.rules }}
+      run: python3 "$GITHUB_ACTION_PATH/scope.py"
