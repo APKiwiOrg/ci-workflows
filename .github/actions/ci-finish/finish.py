@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""Give a CI run one verdict and one summary, and prepare the tested-tree marker after a full pass.
+"""Give a CI run one verdict and one summary, and prepare the tested-tree marker of a full run.
 
-The verdict comes only from the calling job's `needs`: a job that failed or was cancelled fails the run, a
-skipped job fails it unless its id is allowed to skip, and input that is not a JSON object naming at least
-one job fails it. The jobs API supplies only the summary's stage names and times, and the artifacts API its
-footer, so an API error changes the summary's detail and never the verdict.
+The verdict starts from the calling job's `needs`: a job that failed or was cancelled fails the run, and
+input that is not a JSON object naming at least one job fails it. A skipped job fails it unless its id is in
+the always-allowed list, or in the segment list on a run that is not full, since a full run runs every
+segment. The jobs API can then only turn a pass into a fail: a finished job of this run that failed, timed
+out or was cancelled, and that `needs` does not report, fails the run. An API error leaves the verdict from
+`needs` as it is. The API otherwise supplies the summary's stage names and times, and the artifacts API its
+footer.
 
-Inputs come from the environment: CI_FINISH_NEEDS, CI_FINISH_ALLOW_SKIPPED, CI_FINISH_FULL,
-CI_FINISH_SEGMENTS, CI_FINISH_SCOPE_REASON, CI_FINISH_TITLE, CI_FINISH_JOB_NAME, CI_API_TOKEN and the
-runner's GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_EVENT_NAME, GITHUB_SERVER_URL, GITHUB_API_URL,
-GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and RUNNER_TEMP. The summary is appended to GITHUB_STEP_SUMMARY and the
-outputs passed, upload, tree and marker to GITHUB_OUTPUT. The script itself always exits 0, so the action's
-upload and verdict steps still run. Python 3.8 or later, standard library only.
+A full run that passed prepares the ci-passed-full-TREE marker. A full run that failed with at least one job
+in `needs` reporting `failure` prepares ci-failed-full-TREE instead, so ci-tested-tree knows a newer full run
+of the tree failed. A run whose only problems are cancelled or wrongly skipped jobs prepares neither.
+
+Inputs come from the environment: CI_FINISH_NEEDS, CI_FINISH_ALLOW_SKIPPED, CI_FINISH_ALLOW_SKIPPED_ALWAYS,
+CI_FINISH_FULL, CI_FINISH_SEGMENTS, CI_FINISH_SCOPE_REASON, CI_FINISH_TITLE, CI_FINISH_JOB_NAME,
+CI_API_TOKEN and the runner's GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_EVENT_NAME, GITHUB_SERVER_URL,
+GITHUB_API_URL, GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and RUNNER_TEMP. The summary is appended to
+GITHUB_STEP_SUMMARY and the outputs passed, upload, tree, artifact and marker to GITHUB_OUTPUT. The script
+itself always exits 0, so the action's upload and verdict steps still run. Python 3.8 or later, standard
+library only.
 """
 import datetime
 import json
@@ -27,6 +35,9 @@ import github_api  # noqa: E402
 
 DEFAULT_JOB_NAME = "CI passed"
 MARKER_PREFIX = "ci-passed-full-"
+FAILED_MARKER_PREFIX = "ci-failed-full-"
+# Job conclusions from the API that fail the run when `needs` does not report the job.
+FAILING_CONCLUSIONS = ("failure", "timed_out", "cancelled")
 NOT_AN_OBJECT = "needs input is not a JSON object"
 NOT_AFFECTED = "Not affected by this change"
 JOBS_PER_PAGE = 100
@@ -35,6 +46,9 @@ JOB_PAGES = 3
 _STAGE = re.compile(r"(?:Scope|Build|Build and test|Test|Package|CI passed|(?:Test|Package|Deploy): \S.*)")
 _TREE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+# Every ASCII punctuation character. CommonMark shows a backslash-escaped one as itself, so text from git
+# or the API cannot form a link, image, emphasis, HTML, entity or autolink in a summary cell.
+_PUNCTUATION = re.compile(r"([!-/:-@\[-`{-~])")
 
 WORDS = {"success": "Passed", "failure": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"}
 ICONS = {
@@ -57,11 +71,13 @@ class Outcome(NamedTuple):
     passed: bool
     problems: List[str]
     summary: str
-    # True when the marker for `tree` should be uploaded: a full run that passed with a readable tree.
+    # True when the marker named `artifact` for `tree` should be uploaded.
     upload: bool
     tree: str
     # Lines for the step log saying which summary detail could not be read.
     notes: List[str]
+    # ci-passed-full-TREE or ci-failed-full-TREE when upload is true, otherwise empty.
+    artifact: str = ""
 
 
 def parse_needs(needs):
@@ -80,25 +96,51 @@ def parse_allowed(text):
     return {name for name in re.split(r"[\s,]+", text or "") if name}
 
 
-def verdict(needs, allowed):
-    # type: (Any, Iterable[str]) -> Tuple[bool, List[str]]
-    """Returns (passed, problems). Passed only when every job in needs succeeded or was an allowed skip."""
+def verdict(needs, allowed, always=(), full=False):
+    # type: (Any, Iterable[str], Iterable[str], bool) -> Tuple[bool, List[str]]
+    """Returns (passed, problems). Passed only when every job in needs succeeded or was an allowed skip.
+    `allowed` excuses a skip only on a run that is not full, `always` on any run."""
     parsed = parse_needs(needs)
     if parsed is None:
         return False, [NOT_AN_OBJECT]
     if not parsed:
         return False, ["needs input names no jobs"]
-    allowed = set(allowed)
+    segment_jobs = set(allowed)
+    excused = set(always) | (set() if full else segment_jobs)
     problems = []
     for job_id, entry in parsed.items():
         result = entry.get("result") if isinstance(entry, dict) else None
-        if result == "success" or (result == "skipped" and job_id in allowed):
+        if result == "success" or (result == "skipped" and job_id in excused):
             continue
-        if result in ("failure", "cancelled", "skipped"):
+        if result == "skipped" and job_id in segment_jobs:
+            problems.append("%s was skipped on a full run" % job_id)
+        elif result in ("failure", "cancelled", "skipped"):
             problems.append("%s: %s" % (job_id, result))
         else:
             problems.append("%s: no recognised result" % job_id)
     return not problems, problems
+
+
+def any_failure(needs):
+    # type: (Any) -> bool
+    """True when at least one job in needs reports `failure`, as opposed to only cancelled or skipped."""
+    parsed = parse_needs(needs) or {}
+    return any(isinstance(entry, dict) and entry.get("result") == "failure" for entry in parsed.values())
+
+
+def unreported_failures(jobs, own_job_name):
+    # type: (Sequence[dict], str) -> List[str]
+    """A problem for each finished job of this run, other than the finishing one, that failed, timed out or
+    was cancelled. Called only when needs reported a pass, so needs does not report any of these: the job is
+    missing from needs or is allowed to fail. A job that has not finished never counts."""
+    problems = []
+    for job in jobs:
+        if not isinstance(job, dict) or _is_own(job.get("name"), own_job_name):
+            continue
+        if job.get("status") == "completed" and job.get("conclusion") in FAILING_CONCLUSIONS:
+            problems.append("%s: %s, not reported by needs (missing from needs or allowed to fail)"
+                            % (job.get("name"), job.get("conclusion")))
+    return problems
 
 
 def stage_of(name):
@@ -207,10 +249,16 @@ def duration(seconds):
 
 def last_full_pass(artifacts, now):
     # type: (Sequence[dict], datetime.datetime) -> str
-    """The UTC date of the newest unexpired full-pass marker, or "not recorded"."""
+    """The UTC date of the newest unexpired full-pass marker from a run of this repository's own code, or
+    "not recorded"."""
     newest = None
     for artifact in artifacts:
         if not isinstance(artifact, dict) or not str(artifact.get("name", "")).startswith(MARKER_PREFIX):
+            continue
+        # A fork's pull request run uploads to this repository too, and no trusted run made its marker.
+        run = artifact.get("workflow_run")
+        if (not isinstance(run, dict) or not isinstance(run.get("repository_id"), int)
+                or run.get("head_repository_id") != run.get("repository_id")):
             continue
         expires = github_api.parse_time(artifact.get("expires_at"))
         created = github_api.parse_time(artifact.get("created_at"))
@@ -221,7 +269,7 @@ def last_full_pass(artifacts, now):
 
 
 def _cell(text):
-    return _CONTROL.sub(" ", str(text)).replace("|", "\\|")
+    return _PUNCTUATION.sub(r"\\\1", _CONTROL.sub(" ", str(text)))
 
 
 def render(title, event, passed, rows, footer, seconds=None):
@@ -273,23 +321,51 @@ def _title(env):
     return env.get("CI_FINISH_TITLE") or "%s CI" % repo.rsplit("/", 1)[-1]
 
 
+def _full(env):
+    return env.get("CI_FINISH_FULL", "").strip().lower() == "true"
+
+
 def _verdict_from(env):
-    return verdict(env.get("CI_FINISH_NEEDS", ""), parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED", "")))
+    return verdict(env.get("CI_FINISH_NEEDS", ""), parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED", "")),
+                   parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED_ALWAYS", "")), _full(env))
+
+
+def marker_for(full, passed, needs, tree_of):
+    # type: (bool, bool, Any, Callable[[], Optional[str]]) -> Tuple[str, str, List[str]]
+    """Returns (artifact, tree, notes). The artifact is empty when no marker is due or the tree is unreadable."""
+    if not full:
+        return "", "", []
+    if passed:
+        prefix = MARKER_PREFIX
+    elif any_failure(needs):
+        prefix = FAILED_MARKER_PREFIX
+    else:
+        return "", "", []
+    tree = tree_of() or ""
+    if not _TREE.fullmatch(tree):
+        return "", "", ["Cannot read the tree of HEAD, so no tested-tree marker is uploaded."]
+    return prefix + tree, tree, []
 
 
 def finish(env, fetch, tree_of, now):
     # type: (dict, github_api.Fetch, Callable[[], Optional[str]], datetime.datetime) -> Outcome
     needs = env.get("CI_FINISH_NEEDS", "")
     passed, problems = _verdict_from(env)
-    full = env.get("CI_FINISH_FULL", "").strip().lower() == "true"
+    full = _full(env)
     repo = env.get("GITHUB_REPOSITORY", "")
+    own_job_name = env.get("CI_FINISH_JOB_NAME") or DEFAULT_JOB_NAME
     notes = []
     try:
         jobs = fetch_jobs(repo, env.get("GITHUB_RUN_ID", ""), fetch)  # type: Optional[List[dict]]
-    except Exception as error:  # noqa: BLE001 The summary falls back to needs. The verdict is already set.
+    except Exception as error:  # noqa: BLE001 The summary falls back to needs. The verdict stays as needs set it.
         notes.append("Jobs API unavailable, summary built from needs: %s" % error)
         jobs = None
-    all_rows = table(needs, jobs, env.get("CI_FINISH_JOB_NAME") or DEFAULT_JOB_NAME,
+    if passed and jobs is not None:
+        # The API can only turn a pass into a fail, never the reverse.
+        unreported = unreported_failures(jobs, own_job_name)
+        if unreported:
+            passed, problems = False, problems + unreported
+    all_rows = table(needs, jobs, own_job_name,
                      _segments(env.get("CI_FINISH_SEGMENTS", "")), env.get("CI_FINISH_SCOPE_REASON", ""),
                      passed, now)
     starts = [github_api.parse_time(j.get("started_at")) for j in jobs or [] if isinstance(j, dict)]
@@ -306,21 +382,20 @@ def finish(env, fetch, tree_of, now):
             notes.append("Artifacts API unavailable: %s" % error)
             footer = "not recorded"
     summary = render(_title(env), env.get("GITHUB_EVENT_NAME", ""), passed, all_rows, footer, seconds)
-    tree = (tree_of() or "") if full and passed else ""
-    upload = bool(full and passed and _TREE.fullmatch(tree))
-    if full and passed and not upload:
-        notes.append("Cannot read the tree of HEAD, so no tested-tree marker is uploaded.")
-    return Outcome(passed, problems, summary, upload, tree if upload else "", notes)
+    artifact, tree, marker_notes = marker_for(full, passed, needs, tree_of)
+    return Outcome(passed, problems, summary, bool(artifact), tree, notes + marker_notes, artifact)
 
 
-def plain_outcome(env, note):
-    # type: (dict, str) -> Outcome
-    """The verdict with a summary built from needs alone, for when building the full summary crashed."""
+def plain_outcome(env, note, tree_of):
+    # type: (dict, str, Callable[[], Optional[str]]) -> Outcome
+    """The verdict with a summary built from needs alone, for when building the full summary crashed. It
+    never prepares a pass marker, since the jobs API check did not run, but still prepares a failed one."""
     passed, problems = _verdict_from(env)
-    plain = needs_rows(env.get("CI_FINISH_NEEDS", "")) + [
-        Row(DEFAULT_JOB_NAME, "Passed" if passed else "Failed", None, "")]
+    needs = env.get("CI_FINISH_NEEDS", "")
+    plain = needs_rows(needs) + [Row(DEFAULT_JOB_NAME, "Passed" if passed else "Failed", None, "")]
     summary = render(_title(env), env.get("GITHUB_EVENT_NAME", ""), passed, plain, "not recorded")
-    return Outcome(passed, problems, summary, False, "", [note])
+    artifact, tree, notes = marker_for(_full(env), False, needs, tree_of) if not passed else ("", "", [])
+    return Outcome(passed, problems, summary, bool(artifact), tree, [note] + notes, artifact)
 
 
 def head_tree():
@@ -335,8 +410,9 @@ def head_tree():
 
 def write_marker(env, tree):
     # type: (dict, str) -> str
-    """Writes the marker file the upload step sends and returns its path."""
-    folder = os.path.join(env.get("RUNNER_TEMP") or tempfile.gettempdir(), "ci-passed-full")
+    """Writes the marker file the upload step sends, the same for a passed and a failed marker, and returns
+    its path."""
+    folder = os.path.join(env.get("RUNNER_TEMP") or tempfile.gettempdir(), "ci-tree-marker")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "marker.txt")
     run_url = "%s/%s/actions/runs/%s" % (
@@ -354,7 +430,7 @@ def main():
         outcome = finish(env, github_api.fetch_from_env(env), head_tree,
                          datetime.datetime.now(datetime.timezone.utc))
     except Exception as error:  # noqa: BLE001 Keep the verdict and a plain summary whatever went wrong.
-        outcome = plain_outcome(env, "Summary detail failed: " + type(error).__name__)
+        outcome = plain_outcome(env, "Summary detail failed: " + type(error).__name__, head_tree)
     for note in outcome.notes:
         print(note)
     for problem in outcome.problems:
@@ -370,6 +446,7 @@ def main():
         "passed=" + ("true" if outcome.passed else "false"),
         "upload=" + ("true" if outcome.upload else "false"),
         "tree=" + outcome.tree,
+        "artifact=" + outcome.artifact,
         "marker=" + marker,
     ]
     output = env.get("GITHUB_OUTPUT")

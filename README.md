@@ -569,14 +569,15 @@ or repository, an expired marker and any API error each give `reuse` false with 
 
 ### ci-finish
 
-Gives a CI run one verdict and one summary, and after a full pass marks the tree as tested. It runs as the
-last job, `CI passed`.
+Gives a CI run one verdict and one summary, and after a full run marks the tree as passed or failed. It runs
+as the last job, `CI passed`.
 
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `needs` | required | The calling job's `${{ toJSON(needs) }}`. |
-| `allow-skipped` | empty | Job ids that may be skipped without failing the run, separated by spaces or commas. |
-| `full` | `false` | `true` when this run tested everything, so a pass leaves the tested-tree marker. |
+| `allow-skipped` | empty | Job ids skipped when their segment is not selected, separated by spaces or commas. |
+| `allow-skipped-always` | empty | Job ids that may be skipped on any run, separated by spaces or commas. |
+| `full` | `false` | `true` when `ci-scope` made this a full run, so every segment job must run. |
 | `segments` | empty | The JSON list of segments `ci-scope` selected, used to explain skipped test segments. |
 | `scope-reason` | empty | The reason `ci-scope` gave, shown on the `Scope` row. |
 | `title` | empty | Summary heading. Empty means the repository's name followed by `CI`. |
@@ -587,15 +588,28 @@ It has no outputs. The calling job runs under `if: always()`, lists every other 
 `actions: read` and `contents: read`, and checks the repository out first, since the marker names the
 checked-out tree. The marker upload uses the runner's own artifact token and needs no further permission.
 
-The verdict comes only from `needs`. A job that succeeded passes. A skipped job passes only when its id is in
-`allow-skipped`. A failed or cancelled job fails the run, and so does empty or malformed `needs`. The jobs and
-artifacts APIs supply only the summary's names, times and its `Full suite last passed` footer, so an API
-error changes the summary's detail and never the verdict.
+The verdict starts from `needs`. A job that succeeded passes. A failed or cancelled job fails the run, and so
+does empty or malformed `needs`. A skipped job fails the run unless its id is listed:
 
-The action writes the summary first, then uploads the `ci-passed-full-TREE` marker artifact, kept 30 days,
-when `full` is true and the run passed, then fails the job when the run did not pass. A failed run still shows
-its summary, and a partial run that passes leaves no marker. A job inside a reusable workflow is matched as
-`CALLER / NAME` when `job-name` is set to its name.
+- `allow-skipped` names the `Test: SEGMENT` jobs, which are skipped when their segment is not selected. On a
+  full run every segment runs, so a skip of one of them fails the run.
+- `allow-skipped-always` names jobs that do not test and may skip on any run, such as a deploy that runs
+  only on the default branch.
+
+The jobs API can then only turn a pass into a fail, never the reverse. A finished job of the run that failed,
+timed out or was cancelled, and that `needs` does not report, fails the run. That catches a job missing from
+`needs`, and it means a job allowed to fail (`continue-on-error`) does not belong in the workflow whose
+verdict this is. An API error leaves the verdict from `needs` unchanged. The APIs otherwise supply the
+summary's names, times and its `Full suite last passed` footer, which counts only markers from runs of this
+repository's own code. Text from git or the API is escaped in the summary, so a file or job name cannot
+render as a link or other Markdown.
+
+The action writes the summary first, then uploads a marker artifact holding the tree and the run's link, kept
+30 days, then fails the job when the run did not pass. A failed run still shows its summary. A full run that
+passed uploads `ci-passed-full-TREE`. A full run where a job in `needs` reports `failure` uploads
+`ci-failed-full-TREE`, so `ci-tested-tree` does not reuse an older pass of a tree whose newest full run
+failed. A run whose only problems are cancelled or wrongly skipped jobs, and a partial run, upload no
+marker. A job inside a reusable workflow is matched as `CALLER / NAME` when `job-name` is set to its name.
 
 ```yaml
 - uses: actions/checkout@<full commit sha>

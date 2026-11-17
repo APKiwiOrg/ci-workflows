@@ -1,23 +1,36 @@
 name: ci-finish
-description: Give a CI run one verdict and one summary, and mark the tree as tested after a full pass.
+description: Give a CI run one verdict and one summary, and mark the tree after a full run.
 
-# Runs as the last job of a run, under `needs` for every other job and `if: always()`. The verdict comes
-# only from `needs`: a failed or cancelled job fails the run, and so does a skipped job whose id is not in
-# `allow-skipped`. The jobs and artifacts APIs supply only the summary's names, times and footer, so an API
-# error changes the summary's detail and never the verdict. The steps run in order: write the summary, upload
-# the ci-passed-full-TREE marker when a full run passed, then fail when the run did not pass, so a failed run
-# still shows its summary. The calling job checks the repository out and grants `actions: read`.
+# Runs as the last job of a run, under `needs` for every other job and `if: always()`. The verdict starts
+# from `needs`: a failed or cancelled job fails the run. A skipped job fails it unless its id is in
+# `allow-skipped-always`, or in `allow-skipped` on a run that is not full, since a full run runs every
+# segment. The jobs API can then only turn a pass into a fail: a finished job of this run that failed, timed
+# out or was cancelled and that `needs` does not report fails the run. So a job allowed to fail does not
+# belong in the workflow whose verdict this is. An API error leaves the verdict from `needs` unchanged and
+# only thins the summary. The steps run in order: write the summary, upload the marker, then fail when the
+# run did not pass, so a failed run still shows its summary. A full run that passed uploads
+# ci-passed-full-TREE. A full run with a job in `needs` that failed uploads ci-failed-full-TREE, so
+# ci-tested-tree does not reuse an older pass of that tree. The calling job checks the repository out and
+# grants `actions: read`.
 
 inputs:
   needs:
     description: The calling job's toJSON(needs)
     required: true
   allow-skipped:
-    description: Job ids that may be skipped without failing the run, separated by spaces or commas
+    description: >-
+      Job ids that may be skipped because their segment was not selected, separated by spaces or commas.
+      A skip of one of them fails a full run.
+    required: false
+    default: ''
+  allow-skipped-always:
+    description: >-
+      Job ids that may be skipped on any run, separated by spaces or commas, for a job that does not test,
+      such as a deploy that runs only on the default branch
     required: false
     default: ''
   full:
-    description: true when this run tested everything, so a pass leaves the tested-tree marker
+    description: true when ci-scope made this a full run, so every segment job must run and the tree is marked
     required: false
     default: 'false'
   segments:
@@ -49,6 +62,7 @@ runs:
       env:
         CI_FINISH_NEEDS: ${{ inputs.needs }}
         CI_FINISH_ALLOW_SKIPPED: ${{ inputs.allow-skipped }}
+        CI_FINISH_ALLOW_SKIPPED_ALWAYS: ${{ inputs.allow-skipped-always }}
         CI_FINISH_FULL: ${{ inputs.full }}
         CI_FINISH_SEGMENTS: ${{ inputs.segments }}
         CI_FINISH_SCOPE_REASON: ${{ inputs.scope-reason }}
@@ -59,7 +73,7 @@ runs:
     - if: steps.finish.outputs.upload == 'true'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: ci-passed-full-${{ steps.finish.outputs.tree }}
+        name: ${{ steps.finish.outputs.artifact }}
         path: ${{ steps.finish.outputs.marker }}
         overwrite: true
         retention-days: 30
