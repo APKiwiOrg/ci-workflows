@@ -1,12 +1,14 @@
 # ci-workflows
 
-Shared reusable GitHub Actions workflows. One implementation lives here and each repository calls it with
-a small caller, so a fix lands once. The stress workflow serves APKiwiOrg repositories. The site workflows
-and the osv-scan report serve the owner's private site repositories, each one made from or synced with
-APKiwiOrg/site-template.
+Shared reusable GitHub Actions workflows and composite actions. One implementation lives here and each
+repository calls it with a small caller, so a fix lands once. The stress workflow serves APKiwiOrg
+repositories. The site workflows and the osv-scan report serve the owner's private site repositories, each
+one made from or synced with APKiwiOrg/site-template.
 
-Every workflow here runs on a GitHub-hosted runner, never a self-hosted one. The org's self-hosted runners
-are the dev Mac, and this repository is public.
+Every reusable workflow here runs on a GitHub-hosted runner, never a self-hosted one. The org's self-hosted
+runners are the dev Mac, and this repository is public. An action runs on its caller's runner. The
+[actions](#actions) give any repository's CI the [stage names](#stage-names) below, one verdict and one
+summary.
 
 Because it is public, this repository holds generic steps only, with no site or client names, URLs, identifiers,
 secrets or site code. Secrets live in each private site repository and are passed by name at run time.
@@ -440,3 +442,249 @@ dismissed Dependabot alert, so an ignore expires and the alert stays the record.
 
 To move to a new osv-scanner release, update `OSV_SCANNER_VERSION` and `OSV_SCANNER_SHA256` together, taking
 the `osv-scanner_linux_amd64` line from the release's `osv-scanner_SHA256SUMS`.
+
+## Stage names
+
+A CI workflow names each job, or each step of a job, with one of these stage names, exactly as written. The
+summary that `ci-finish` writes has one row per stage. A job whose name is not a stage shows
+its stage-named steps as rows, and a job with neither shows as one `Other: NAME` row. Job ids are lowercase
+with hyphens, for example `test-unit` for the job named `Test: unit`.
+
+| Stage | Purpose |
+| --- | --- |
+| `Scope` | Decides which test segments the change needs, with `ci-scope`. |
+| `Build` | Compiles the code without running tests. |
+| `Build and test` | Builds and runs every test in one job, when the two cannot be split. |
+| `Test` | Runs every test in one job. |
+| `Test: SEGMENT` | Runs one test segment named in the rules file, for example `Test: unit` or `Test: api`. |
+| `Package` | Produces the release artifact. |
+| `Package: TARGET` | Produces the package for one target, for example `Package: linux-x64`. |
+| `Deploy: ENVIRONMENT` | Deploys to one environment, for example `Deploy: staging`. |
+| `CI passed` | The last job. Gives the run its one verdict and summary with `ci-finish`. |
+
+`CI passed` is the one status check to require in branch protection. It passes only when every other job
+passed or was skipped because its segment was not needed, so the required check never changes when jobs are
+added, renamed or split.
+
+## Actions
+
+Three composite actions under `.github/actions/`. A caller pins each one to a commit of this repository, the
+same way it pins a reusable workflow:
+
+```yaml
+uses: APKiwiOrg/ci-workflows/.github/actions/ci-scope@<full commit sha>
+```
+
+Each action runs a standard library Python script with `python3` 3.8 or later and `bash`, which every
+GitHub-hosted runner has. A job in a container needs both in its image. Inputs reach the scripts through
+`env` only.
+
+### ci-scope
+
+Decides which test segments a run needs from the files its change touched and a rules file. A push compares
+with the push's previous commit, and a pull request compares three-dot with its base, so only the pull
+request's own changes count.
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `rules` | `.github/ci-scope.txt` | Path to the rules file, relative to the workspace. |
+
+| Output | Meaning |
+| --- | --- |
+| `full` | `true` when every segment runs, `false` when only the listed segments run. |
+| `segments` | JSON list of the segment names to run, sorted. A full run lists every segment. |
+| `reason` | One line saying why the run is full or which segments it needs. |
+| `changed` | How many files the change touched, empty when the run went full before comparing. |
+
+The calling job needs `contents: read` and checks the repository out with `fetch-depth: 0` first. A pull
+request's base and head share history only through their merge base, and the default shallow clone does not
+hold it, so without full history every pull request run is a full run.
+
+The rules file holds one `NAME: GLOB GLOB ...` line per segment. `full` and `ignore` are reserved names.
+Blank lines and lines starting with `#` are skipped, and a name given twice adds globs. Globs match the whole
+repository-relative path: `*` matches within one path segment, `?` matches one character, `**` as a whole
+segment matches any number of segments, and a glob with no `/` matches the file name at any depth.
+
+```text
+full: .github/workflows/ci.yml .github/ci-scope.txt global.json
+unit: src/** tests/unit/**
+api: src/Api/** tests/api/**
+ignore: docs/** **/*.md
+```
+
+A changed file selects every segment whose globs match it. The run is full, with the reason in `reason`, on
+a schedule, a manual dispatch or a tag, when the rules file is missing or has a malformed line, when there is
+no base commit to compare (a new branch, or a base the clone cannot fetch), when a changed file matches
+`full`, and when a changed file matches no line at all. That last rule means a new folder is never silently
+untested. A file that matches only `ignore` needs no test. Only `push` and `pull_request` events compare, and
+every other event is a full run.
+
+```yaml
+- uses: actions/checkout@<full commit sha>
+  with:
+    fetch-depth: 0
+    persist-credentials: false
+- id: scope
+  uses: APKiwiOrg/ci-workflows/.github/actions/ci-scope@<full commit sha>
+```
+
+### ci-tested-tree
+
+Says whether the checked-out git tree already passed a full run of the CI workflow, so a release or deploy
+workflow can skip tests that already passed on the same code. The tree is `git rev-parse HEAD^{tree}`, so a
+commit counts as tested when its content matches a commit that passed, whatever its history.
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `workflow` | `.github/workflows/ci.yml` | Path of the workflow file whose full passing run counts. |
+| `token` | `${{ github.token }}` | Token that can read the repository's Actions artifacts and runs. |
+
+| Output | Meaning |
+| --- | --- |
+| `reuse` | `true` when this tree already passed a full run of the workflow, `false` otherwise. |
+| `tree` | The tree id of `HEAD`, empty when it cannot be read. |
+| `reason` | One line saying why the tree is or is not reused. |
+| `run-url` | Link to the run that passed, empty when `reuse` is false. |
+
+The calling job needs `actions: read` and `contents: read`, and checks the repository out first. Any history
+depth works.
+
+It looks for the `ci-passed-full-TREE` artifact that `ci-finish` uploads. `reuse` is true only when that
+artifact is unexpired and the run that made it concluded success, ran the `workflow` file, and belongs to
+this repository with its head here too. A run still going, a failed run, a marker from another workflow file
+or repository, an expired marker and any API error each give `reuse` false with the reason.
+
+```yaml
+- uses: actions/checkout@<full commit sha>
+  with:
+    persist-credentials: false
+- id: tested
+  uses: APKiwiOrg/ci-workflows/.github/actions/ci-tested-tree@<full commit sha>
+  with:
+    workflow: .github/workflows/ci.yml
+- name: Test
+  if: steps.tested.outputs.reuse != 'true'
+  run: make test
+```
+
+### ci-finish
+
+Gives a CI run one verdict and one summary, and after a full pass marks the tree as tested. It runs as the
+last job, `CI passed`.
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `needs` | required | The calling job's `${{ toJSON(needs) }}`. |
+| `allow-skipped` | empty | Job ids that may be skipped without failing the run, separated by spaces or commas. |
+| `full` | `false` | `true` when this run tested everything, so a pass leaves the tested-tree marker. |
+| `segments` | empty | The JSON list of segments `ci-scope` selected, used to explain skipped test segments. |
+| `scope-reason` | empty | The reason `ci-scope` gave, shown on the `Scope` row. |
+| `title` | empty | Summary heading. Empty means the repository's name followed by `CI`. |
+| `job-name` | `CI passed` | Display name of the job that runs the action, so its row is the verdict and comes last. |
+| `token` | `${{ github.token }}` | Token that can read the run's jobs and the repository's artifacts. |
+
+It has no outputs. The calling job runs under `if: always()`, lists every other job in `needs`, needs
+`actions: read` and `contents: read`, and checks the repository out first, since the marker names the
+checked-out tree. The marker upload uses the runner's own artifact token and needs no further permission.
+
+The verdict comes only from `needs`. A job that succeeded passes. A skipped job passes only when its id is in
+`allow-skipped`. A failed or cancelled job fails the run, and so does empty or malformed `needs`. The jobs and
+artifacts APIs supply only the summary's names, times and its `Full suite last passed` footer, so an API
+error changes the summary's detail and never the verdict.
+
+The action writes the summary first, then uploads the `ci-passed-full-TREE` marker artifact, kept 30 days,
+when `full` is true and the run passed, then fails the job when the run did not pass. A failed run still shows
+its summary, and a partial run that passes leaves no marker. A job inside a reusable workflow is matched as
+`CALLER / NAME` when `job-name` is set to its name.
+
+```yaml
+- uses: actions/checkout@<full commit sha>
+  with:
+    persist-credentials: false
+- uses: APKiwiOrg/ci-workflows/.github/actions/ci-finish@<full commit sha>
+  with:
+    needs: ${{ toJSON(needs) }}
+    allow-skipped: test-unit test-api
+    full: ${{ needs.scope.outputs.full }}
+    segments: ${{ needs.scope.outputs.segments }}
+    scope-reason: ${{ needs.scope.outputs.reason }}
+```
+
+### Example workflow
+
+A complete `.github/workflows/ci.yml` for `example-app` with one test segment, `unit`. This repository's own
+`check.yml` has the same shape with two segments.
+
+```yaml
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  scope:
+    name: Scope
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+      segments: ${{ steps.scope.outputs.segments }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@<full commit sha>
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: scope
+        uses: APKiwiOrg/ci-workflows/.github/actions/ci-scope@<full commit sha>
+
+  test-unit:
+    name: 'Test: unit'
+    needs: scope
+    if: contains(fromJSON(needs.scope.outputs.segments), 'unit')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@<full commit sha>
+        with:
+          persist-credentials: false
+      - run: make test-unit
+
+  ci-passed:
+    name: CI passed
+    needs: [scope, test-unit]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@<full commit sha>
+        with:
+          persist-credentials: false
+      - uses: APKiwiOrg/ci-workflows/.github/actions/ci-finish@<full commit sha>
+        with:
+          needs: ${{ toJSON(needs) }}
+          allow-skipped: test-unit
+          full: ${{ needs.scope.outputs.full }}
+          segments: ${{ needs.scope.outputs.segments }}
+          scope-reason: ${{ needs.scope.outputs.reason }}
+```
+
+The wiring that matters:
+
+- `Scope` checks out with `fetch-depth: 0` and exposes `full`, `segments` and `reason` as job outputs.
+- Each `Test: SEGMENT` job needs `scope` and runs only when its segment is in `segments`. On a full run
+  every segment is listed.
+- `CI passed` needs every other job, runs under `if: always()` so it reports failures too, and lists in
+  `allow-skipped` exactly the jobs that are skipped when their segment is not needed. `scope` is never
+  listed, so a failed `Scope` fails the run.
+- `CI passed` passes `full` from `Scope`, so only a full pass leaves the marker that `ci-tested-tree` reads.
+- A manual dispatch is always a full run, so it needs no input to force one.

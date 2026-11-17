@@ -1,9 +1,12 @@
-# Keeps the SHA-pinned actions in this repository's workflows current. The cooldown lets a new release
-# age a week before Dependabot proposes it.
+# Keeps the SHA-pinned actions in this repository's workflows and composite actions current. `/` covers
+# .github/workflows, and each folder under .github/actions holds one action.yml whose pins need the same
+# care. The cooldown lets a new release age a week before Dependabot proposes it.
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
     cooldown:

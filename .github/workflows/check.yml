@@ -1,16 +1,45 @@
 name: check
 
-# Keeps every workflow in this public repository hosted and SHA-pinned, parses them, runs the stress
-# workflow's shell steps against a stub dotnet, and runs the Node workflow tests.
+# This repository's own checks, in the standard stages. Scope reads .github/ci-scope.txt to decide which test
+# segments a change needs. Test: workflows keeps every workflow hosted and SHA-pinned, parses them, runs the
+# stress workflow's shell steps against a stub dotnet and runs the Node workflow tests. Test: actions keeps
+# every action SHA-pinned, parses them and runs the Python action tests. CI passed gives the run one verdict
+# and one summary, and marks the tree as tested after a full pass.
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  workflows:
+  scope:
+    name: Scope
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+      segments: ${{ steps.scope.outputs.segments }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      # Full history, so a pull request's merge base is in the clone and the run can be partial.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/ci-scope
+
+  test-workflows:
+    name: 'Test: workflows'
+    needs: scope
+    if: contains(fromJSON(needs.scope.outputs.segments), 'workflows')
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
@@ -19,6 +48,8 @@ jobs:
           persist-credentials: false
       - name: Hosted and pinned
         run: sh scripts/check-workflows.sh
+      - name: Hosted and pinned check tests
+        run: sh scripts/tests/check-workflows.test.sh
       - name: Every workflow parses
         run: for f in .github/workflows/*.yml; do python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" || exit 1; done
       - name: Stress workflow shell steps
@@ -28,3 +59,43 @@ jobs:
           node-version: 24
       - name: Node workflow tests
         run: node --test 'scripts/tests/*.test.mjs'
+
+  test-actions:
+    name: 'Test: actions'
+    needs: scope
+    if: contains(fromJSON(needs.scope.outputs.segments), 'actions')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The pin check reads every workflow and action, so a change to an action alone is still checked.
+      - name: Pinned
+        run: sh scripts/check-workflows.sh
+      - name: Every action parses
+        run: find .github/actions -type f \( -name action.yml -o -name action.yaml \) -print0 | xargs -0 -n 1 python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))"
+      - name: Python action tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_ci_*.py' -v
+
+  ci-passed:
+    name: CI passed
+    needs: [scope, test-workflows, test-actions]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # ci-finish reads the tree id and its shared helper from the checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-finish
+        with:
+          needs: ${{ toJSON(needs) }}
+          allow-skipped: test-workflows test-actions
+          full: ${{ needs.scope.outputs.full }}
+          segments: ${{ needs.scope.outputs.segments }}
+          scope-reason: ${{ needs.scope.outputs.reason }}

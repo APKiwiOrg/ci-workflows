@@ -1,0 +1,11 @@
+# Test segments for .github/workflows/check.yml, read by the ci-scope action. A changed file that matches
+# no line here makes a full run, so a new folder is never silently untested.
+
+# The workflow, these rules and the pin check every test job runs.
+full: .github/workflows/check.yml .github/ci-scope.txt scripts/check-workflows.sh scripts/tests/check-workflows.test.sh
+
+# The reusable workflows and their tests. The Node tests read the README's caller examples.
+workflows: .github/workflows/** scripts/tests/*.mjs scripts/tests/stress-test-workflow.test.sh README.md
+
+# The composite actions and their Python tests.
+actions: .github/actions/** scripts/tests/test_ci_*.py
