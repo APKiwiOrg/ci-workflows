@@ -4,10 +4,11 @@ description: Decide which test segments a run needs from the files its change to
 # Reads a rules file of `NAME: GLOB GLOB ...` lines (`full` and `ignore` are reserved names). A push to a
 # branch is compared with the commit of the newest passing run of the same workflow on that branch that is
 # an ancestor of HEAD, read from the Actions API, so a push never selects less than every change since the
-# last run that passed. A pull request is compared three-dot with its base. A schedule, a manual dispatch, a
-# tag, a missing or malformed rules file, no passing run to compare with, an API error, a base commit that
-# cannot be found, a change to the rules file, a change to a `full` file or a file no rule covers each make
-# a full run, with the reason in the `reason` output. On a full run every test job runs whatever `segments`
+# last run that passed. A schedule or dispatch run that failed since that run keeps the push full, since no
+# change in the diff explains it. A pull request is compared three-dot with its base. A schedule, a manual
+# dispatch, a tag, a missing or malformed rules file, no passing run to compare with, an API error, a base
+# commit that cannot be found, a change to the rules file or the workflow file, a change to a `full` file or
+# a file no rule covers each make a full run, with the reason in the `reason` output. On a full run every test job runs whatever `segments`
 # holds, and `segments` may be empty. The calling job checks the repository out with `fetch-depth: 0` first
 # and grants `actions: read` and `contents: read`.
 

@@ -8,14 +8,17 @@ The rules file lists segments and the globs that select them:
     ignore: docs/** **/*.md
 
 A push to a branch is compared with the newest passing run of the same workflow on that branch whose commit
-is an ancestor of HEAD, read from the Actions API. So a segment that failed, or a push whose run was
-cancelled, stays selected until a run passes, and a push never selects less than every change since the last
-run that passed. A pull request is compared three-dot with its base.
+is an ancestor of HEAD, read from the Actions API. So a push never selects less than every change since the
+last run that passed: the segments a failed or cancelled push run touched stay selected until a run passes.
+A schedule or dispatch run is full by its event, so when it fails there is no change in the next diff to
+explain it. When the newest such run of this workflow on the branch failed after the base, the next push is
+a full run until a run passes. A pull request is compared three-dot with its base.
 
 A run is full when the event or ref asks for one, when the rules cannot be read, when there is no base
-commit to compare with (no passing run on the branch, an API error, a base the clone cannot fetch), when the
-rules file itself changed, when a changed file matches a `full` glob, or when a changed file matches no rule
-at all, so a new folder is never silently left untested. Otherwise the run needs the segments whose globs
+commit to compare with (no passing run on the branch, an API error, a base the clone cannot fetch), when a
+schedule or dispatch run failed since the base, when the rules file or the workflow file itself changed, when
+a changed file matches a `full` glob, or when a changed file matches no rule at all, so a new folder is never
+silently left untested. Otherwise the run needs the segments whose globs
 match a changed file. On a full run every test job runs, whatever `segments` lists. `segments` then holds the
 segments the rules name, which is empty when the rules file is missing or empty.
 
@@ -45,12 +48,15 @@ NO_BASE = "Full run: no base commit to compare"
 # Events whose passing run tested this branch's own commit, so its commit can be a push's base. A pull
 # request run tested a merge commit, which is not on the branch.
 BASE_EVENTS = ("push", "schedule", "workflow_dispatch")
+# Conclusions of a run full by its event that keep the next push full. Cancelled and skipped runs found
+# nothing red.
+FAILED = ("failure", "timed_out")
 RUNS_PER_PAGE = 20
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
-_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+_NEWEST = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
 
 # A git runner takes the arguments after `git` and returns the exit code and standard output.
 GitRunner = Callable[[Sequence[str]], Tuple[int, bytes]]
@@ -201,33 +207,39 @@ def pull_request_base(event):
     return base if _is_sha(base) else None
 
 
-def _base_candidate(run, workflow):
-    """The run's commit when the run is a pass of this workflow on this repository's own code, else None."""
-    if not isinstance(run, dict) or run.get("conclusion") != "success":
-        return None
+def _counts(run, workflow):
+    """True when the run is of this workflow on this repository's own code, by an event that tested the
+    branch, and is not this run."""
+    if not isinstance(run, dict):
+        return False
     if run.get("path") != workflow.path or str(run.get("id")) == workflow.run_id:
-        return None
+        return False
     if ((run.get("repository") or {}).get("full_name") != workflow.repo
             or (run.get("head_repository") or {}).get("full_name") != workflow.repo):
-        return None
-    if run.get("event") not in BASE_EVENTS:
-        return None
-    sha = run.get("head_sha")
-    return sha if _is_sha(sha) else None
+        return False
+    return run.get("event") in BASE_EVENTS
 
 
 def _created(run):
-    # Runs with no readable time sort as oldest.
-    return github_api.parse_time(run.get("created_at") if isinstance(run, dict) else None) or _EPOCH
+    # Runs with no readable time sort as newest, so a failed full run among them is never passed over, and
+    # any passing ancestor is a sound base whatever its place.
+    return github_api.parse_time(run.get("created_at")) or _NEWEST
+
+
+def _run_link(run):
+    url = run.get("html_url")
+    return url if isinstance(url, str) and url else "run %s" % run.get("id")
 
 
 def last_passing_base(workflow, head, fetch, git):
     # type: (Workflow, str, github_api.Fetch, GitRunner) -> Tuple[Optional[str], str]
-    """The commit of the newest passing run of the workflow on the branch that is in the clone and an
-    ancestor of HEAD. Returns (base, "") or (None, the full-run reason)."""
+    """Walk the workflow's completed runs on the branch from newest to oldest. The first passing run whose
+    commit is in the clone and an ancestor of HEAD is the base. A schedule or dispatch run that failed before
+    it is met makes a full run. Returns (base, "") or (None, the full-run reason)."""
     if not (workflow.repo and workflow.path and workflow.branch):
         return None, "Full run: cannot tell which workflow and branch this run belongs to"
-    path = "/repos/%s/actions/workflows/%s/runs?branch=%s&status=success&per_page=%d" % (
+    # Completed only, so runs still going (this one among them) do not use up the page.
+    path = "/repos/%s/actions/workflows/%s/runs?branch=%s&status=completed&per_page=%d" % (
         workflow.repo, urllib.parse.quote(posixpath.basename(workflow.path), safe=""),
         urllib.parse.quote(workflow.branch, safe=""), RUNS_PER_PAGE)
     try:
@@ -236,10 +248,14 @@ def last_passing_base(workflow, head, fetch, git):
             raise github_api.ApiError("the answer holds no run list")
     except Exception as error:  # noqa: BLE001 Any doubt about the base means a full run.
         return None, "Full run: the last passing run could not be read (%s)" % error
-    for run in sorted(runs, key=_created, reverse=True):
-        sha = _base_candidate(run, workflow)
+    for run in sorted((run for run in runs if _counts(run, workflow)), key=_created, reverse=True):
+        conclusion = run.get("conclusion")
+        if conclusion in FAILED and run.get("event") in FULL_EVENTS:
+            # A failed push run needs nothing here: the change that broke it is still in the diff.
+            return None, "Full run: the last full run on %s failed (%s)" % (workflow.branch, _run_link(run))
+        sha = run.get("head_sha")
         # A commit the clone does not hold is passed over: it was force-pushed away or never fetched.
-        if (sha and git(["cat-file", "-e", sha + "^{commit}"])[0] == 0
+        if (conclusion == "success" and _is_sha(sha) and git(["cat-file", "-e", sha + "^{commit}"])[0] == 0
                 and git(["merge-base", "--is-ancestor", sha, head])[0] == 0):
             return sha, ""
     return None, "Full run: no passing run of this workflow on %s to compare with" % workflow.branch
@@ -294,6 +310,9 @@ def decide(event_name, event, ref_type, rules_text, head, git, fetch, workflow, 
     if _repo_path(rules_path) in files:
         # New rules must not decide how much of their own change is tested.
         return Scope(True, every, "Full run: %s changes the rules" % _repo_path(rules_path), len(files))
+    if workflow.path and workflow.path in files:
+        # Nor may a new workflow, whose pins and gates decide what every job runs.
+        return Scope(True, every, "Full run: %s changes the workflow" % workflow.path, len(files))
     full, segments, reason = select(rules, files, since)
     return Scope(full, segments, reason, len(files))
 

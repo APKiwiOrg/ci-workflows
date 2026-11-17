@@ -31,7 +31,7 @@ ZEROS = "0" * 40
 REPO = "example-org/example-app"
 RUN_ID = "900"
 WORKFLOW = scope.Workflow(REPO, ".github/workflows/ci.yml", "main", RUN_ID)
-RUNS_PATH = "/repos/%s/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=20" % REPO
+RUNS_PATH = "/repos/%s/actions/workflows/ci.yml/runs?branch=main&status=completed&per_page=20" % REPO
 
 RULES_TEXT = """\
 # comment
@@ -72,7 +72,7 @@ class FakeGit(object):
 
 
 class FakeFetch(object):
-    """Stands in for the API. Answers the list of passing runs, or raises the given error."""
+    """Stands in for the API. Answers the list of completed runs, or raises the given error."""
 
     def __init__(self, runs=(), path=RUNS_PATH, answer=None, error=None):
         self.path = path
@@ -94,7 +94,14 @@ def passing_run(run_id=1, sha=BASE, created="2026-01-19T10:00:00Z", conclusion="
     """A run as the list-runs-for-a-workflow endpoint returns it."""
     return {"id": run_id, "head_sha": sha, "created_at": created, "status": "completed",
             "conclusion": conclusion, "event": event, "path": path,
+            "html_url": "https://github.com/%s/actions/runs/%s" % (repo, run_id),
             "repository": {"full_name": repo}, "head_repository": {"full_name": head_repo}}
+
+
+def failed_full_run(run_id=2, sha=BASE, created="2026-01-19T11:00:00Z", conclusion="failure", event="schedule",
+                    **fields):
+    """A run that was full by its event and did not pass."""
+    return passing_run(run_id, sha, created, conclusion, event, **fields)
 
 
 def names(*paths):
@@ -339,7 +346,7 @@ class DecideTests(unittest.TestCase):
             False, ["unit"], "1 file changed since the last passing run (aaaaaaa). Segments: unit", 1))
         self.assertEqual(git.calls[-1], ["diff", "--name-only", "-z", "--no-renames", BASE + ".." + HEAD])
 
-    def test_push_reads_one_page_of_passing_runs_of_this_workflow_on_the_branch(self):
+    def test_push_reads_one_page_of_completed_runs_of_this_workflow_on_the_branch(self):
         fetch = FakeFetch([passing_run()])
         self.push(fetch=fetch)
         self.assertEqual(fetch.calls, [RUNS_PATH])
@@ -402,6 +409,105 @@ class DecideTests(unittest.TestCase):
                 runs = [passing_run(2, OTHER, event=event), passing_run(1, BASE, "2026-01-18T10:00:00Z")]
                 self.push(git=git, fetch=FakeFetch(runs))
                 self.assertEqual(git.calls[-1][-1], OTHER + ".." + HEAD)
+
+    # A run full by its event that failed has no change in the next diff to explain it, so it keeps the
+    # next push full until a run passes.
+    FAILED_FULL_REASON = "Full run: the last full run on main failed (https://github.com/%s/actions/runs/2)" % REPO
+
+    def test_failed_schedule_run_newer_than_the_base_is_a_full_run(self):
+        runs = [failed_full_run(), passing_run(1, BASE, "2026-01-19T10:00:00Z")]
+        result, git = self.push(fetch=FakeFetch(runs))
+        self.assertEqual(result, scope.Scope(True, ["api", "unit"], self.FAILED_FULL_REASON, None))
+        self.assertFalse([c for c in git.calls if c[0] == "diff"])
+
+    def test_control_passing_schedule_run_newer_than_the_base_selects_the_segment(self):
+        runs = [failed_full_run(conclusion="success"), passing_run(1, BASE, "2026-01-19T10:00:00Z")]
+        result, _ = self.push(fetch=FakeFetch(runs))
+        self.assertEqual(result, scope.Scope(
+            False, ["unit"], "1 file changed since the last passing run (aaaaaaa). Segments: unit", 1))
+
+    def test_failed_or_timed_out_dispatch_and_schedule_runs_are_a_full_run(self):
+        for event in ("schedule", "workflow_dispatch"):
+            for conclusion in ("failure", "timed_out"):
+                with self.subTest(event=event, conclusion=conclusion):
+                    runs = [failed_full_run(event=event, conclusion=conclusion),
+                            passing_run(1, BASE, "2026-01-19T10:00:00Z")]
+                    result, _ = self.push(fetch=FakeFetch(runs))
+                    self.assertEqual(result, scope.Scope(True, ["api", "unit"], self.FAILED_FULL_REASON, None))
+
+    def test_failed_push_run_newer_than_the_base_does_not_force_a_full_run(self):
+        runs = [failed_full_run(event="push"), passing_run(1, BASE, "2026-01-19T10:00:00Z")]
+        result, git = self.push(fetch=FakeFetch(runs))
+        self.assertFalse(result.full)
+        self.assertEqual(git.calls[-1][-1], BASE + ".." + HEAD)
+
+    def test_failed_full_run_older_than_the_base_does_not_force_a_full_run(self):
+        runs = [passing_run(1, BASE, "2026-01-19T12:00:00Z"), failed_full_run()]
+        result, _ = self.push(fetch=FakeFetch(runs))
+        self.assertEqual(result.segments, ["unit"])
+        self.assertFalse(result.full)
+
+    def test_failed_full_run_listed_out_of_order_is_still_newer_than_the_base(self):
+        runs = [passing_run(1, BASE, "2026-01-19T10:00:00Z"), failed_full_run()]
+        result, _ = self.push(fetch=FakeFetch(runs))
+        self.assertEqual(result.reason, self.FAILED_FULL_REASON)
+
+    def test_failed_full_run_with_no_readable_time_counts_as_newest(self):
+        runs = [passing_run(1, BASE, "2026-01-19T12:00:00Z"), failed_full_run(created=None)]
+        result, _ = self.push(fetch=FakeFetch(runs))
+        self.assertEqual(result.reason, self.FAILED_FULL_REASON)
+
+    def test_newer_passing_run_that_is_not_an_ancestor_does_not_hide_a_failed_full_run(self):
+        runs = [passing_run(3, OTHER, "2026-01-19T12:00:00Z"), failed_full_run(),
+                passing_run(1, BASE, "2026-01-19T10:00:00Z")]
+        git = FakeGit(present=[BASE, OTHER], ancestors=[BASE], diff=names("src/core/a.py"))
+        result, _ = self.push(git=git, fetch=FakeFetch(runs))
+        self.assertEqual(result.reason, self.FAILED_FULL_REASON)
+
+    def test_failed_full_runs_that_do_not_count_change_nothing(self):
+        refused = [
+            failed_full_run(head_repo="someone/example-app"),
+            failed_full_run(repo="someone/example-app"),
+            failed_full_run(path=".github/workflows/nightly.yml"),
+            failed_full_run(event="workflow_run"),
+            failed_full_run(event="pull_request"),
+            failed_full_run(conclusion=None),
+            failed_full_run(conclusion="cancelled"),
+            failed_full_run(conclusion="skipped"),
+        ]
+        for item in refused:
+            with self.subTest(run=item):
+                runs = [item, passing_run(1, BASE, "2026-01-19T10:00:00Z")]
+                result, _ = self.push(fetch=FakeFetch(runs))
+                self.assertEqual(result.segments, ["unit"])
+                self.assertFalse(result.full)
+
+    def test_failed_full_run_without_a_link_names_its_id(self):
+        failed = failed_full_run()
+        del failed["html_url"]
+        result, _ = self.push(fetch=FakeFetch([failed, passing_run(1, BASE, "2026-01-19T10:00:00Z")]))
+        self.assertEqual(result.reason, "Full run: the last full run on main failed (run 2)")
+
+    def test_changed_workflow_file_is_a_full_run(self):
+        rules = "unit: src/core/**\nworkflows: .github/workflows/**\n"
+        git = FakeGit(present=[BASE], ancestors=[BASE], diff=names("src/core/a.py", ".github/workflows/ci.yml"))
+        result, _ = self.push(rules_text=rules, git=git)
+        self.assertEqual(result, scope.Scope(
+            True, ["unit", "workflows"], "Full run: .github/workflows/ci.yml changes the workflow", 2))
+
+    def test_control_another_workflow_file_changed_is_partial(self):
+        rules = "unit: src/core/**\nworkflows: .github/workflows/**\n"
+        git = FakeGit(present=[BASE], ancestors=[BASE], diff=names("src/core/a.py", ".github/workflows/other.yml"))
+        result, _ = self.push(rules_text=rules, git=git)
+        self.assertEqual(result.segments, ["unit", "workflows"])
+        self.assertFalse(result.full)
+
+    def test_changed_workflow_file_on_a_pull_request_is_a_full_run(self):
+        rules = "unit: src/core/**\nworkflows: .github/workflows/**\n"
+        git = FakeGit(present=[BASE], diff=names(".github/workflows/ci.yml"))
+        result = scope.decide("pull_request", {"pull_request": {"base": {"sha": BASE}}}, "branch", rules, HEAD,
+                              git, FakeFetch(), WORKFLOW, ".github/ci-scope.txt")
+        self.assertEqual(result.reason, "Full run: .github/workflows/ci.yml changes the workflow")
 
     def test_no_passing_run_is_a_full_run(self):
         result, git = self.push(fetch=FakeFetch([]))
@@ -563,7 +669,7 @@ class OutputLineTests(unittest.TestCase):
 
 
 class RunsServer(object):
-    """A local HTTP server that answers the list of passing runs, so the script's real API path runs."""
+    """A local HTTP server that answers the list of completed runs, so the script's real API path runs."""
 
     def __init__(self, answers):
         class Handler(http.server.BaseHTTPRequestHandler):
