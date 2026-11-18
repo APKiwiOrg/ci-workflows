@@ -2,21 +2,7 @@ name: agent-instructions
 on:
   push:
     branches: [main]
-    paths:
-      - 'AGENTS.md'
-      - 'AGENTS.override.md'
-      - 'CLAUDE.md'
-      - 'scripts/check-agent-instructions.sh'
-      - 'scripts/tests/check-agent-instructions.test.sh'
-      - '.github/workflows/agent-instructions.yml'
   pull_request:
-    paths:
-      - 'AGENTS.md'
-      - 'AGENTS.override.md'
-      - 'CLAUDE.md'
-      - 'scripts/check-agent-instructions.sh'
-      - 'scripts/tests/check-agent-instructions.test.sh'
-      - '.github/workflows/agent-instructions.yml'
 concurrency:
   group: agent-instructions-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

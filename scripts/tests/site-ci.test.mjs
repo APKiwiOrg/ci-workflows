@@ -79,10 +79,10 @@ describe('site work is selected without repeating installs or builds', () => {
     for (const id of ['config', 'repo', 'secrets']) assert.doesNotMatch(job(id), /^ {4}if:/mu)
   })
 
-  test('the instruction checks run for a matching PR and only main pushes', () => {
+  test('the instruction checks run for every PR and only main pushes', () => {
     const source = readFileSync(new URL('../../.github/workflows/agent-instructions.yml', import.meta.url), 'utf8')
-    assert.match(source, /^  push:\n    branches: \[main\]\n    paths:/mu)
-    assert.match(source, /^  pull_request:\n    paths:/mu)
+    const triggers = source.match(/^on:\n([\s\S]*?)^concurrency:/mu)?.[1].trimEnd()
+    assert.equal(triggers, '  push:\n    branches: [main]\n  pull_request:')
     assert.match(source, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/u)
   })
 })
