@@ -576,15 +576,22 @@ gh workflow run maintenance.yml --ref main
 
 ## site-catalog-refresh
 
-Refreshes the static catalog nightly using the source commit already deployed. If `enabled` is false,
-`site-origin` is empty or any run of the caller's `deploy.yml` is still active, the job skips with a
-notice. An active deployment rebuilds the catalog and keeps its place in `deploy-main`.
+Refreshes the static catalog nightly using the source commit already deployed. The job skips with
+a notice when `enabled` is false or `site-origin` is empty.
 
-The job reads `/_catalog/snapshot.json` at the site's https origin and dispatches `deploy.yml` on `main`
-with the published `deployedSha` and `refresh=true` using the caller's `actions: write` token. The guard
-requires green main-push CI and rechecks the published SHA once the deploy run enters `deploy-main`.
-Both snapshot reads require HTTP 200 from the configured origin, refuse redirects and time out after
-30 seconds. A failed fetch or a SHA other than exactly 40 lowercase hexadecimal characters fails the run.
+The job reads `/_catalog/snapshot.json` at the site's https origin and validates the published
+`deployedSha`. Both snapshot reads require HTTP 200 from the configured origin, refuse redirects and
+time out after 30 seconds. A failed fetch or a SHA other than exactly 40 lowercase hexadecimal
+characters fails the run.
+
+The job checks the caller's `deploy.yml` runs immediately before dispatch and skips with a notice if
+any is active. When the check finds no active run, the job dispatches `deploy.yml` on `main` with the
+published SHA and `refresh=true` using the caller's `actions: write` token.
+
+One API round trip remains between the last active-run query and dispatch. If two deploys arrive
+in that gap, the refresh can replace a pending run in `deploy-main`. The guard requires green
+main-push CI and rechecks the live SHA inside `deploy-main`, so the refresh keeps the deployed
+code in place. A displaced CI deploy can wait until the next push.
 
 A catalog site adds this caller as `.github/workflows/catalog-refresh.yml`, pinned to a commit of this
 repository. The schedule lands early in the morning in New Zealand:

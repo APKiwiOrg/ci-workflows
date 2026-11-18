@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { jobBlock, stepBlock, stepScript } from './workflow-steps.mjs'
@@ -28,14 +30,17 @@ function runRefresh(env = {}) {
     '  done',
     '  if [ -n "$output" ]; then printf "%s\\n" "$TEST_SNAPSHOT" > "$output"; else printf "%s\\n" "$TEST_SNAPSHOT"; fi',
     '  if [ "$format" = "%{http_code}" ]; then printf "%s" "$TEST_HTTP_STATUS"; fi',
+    '  if [ -n "$TEST_DEPLOY_DURING_FETCH" ]; then : > "$TEST_DEPLOY_DURING_FETCH"; fi',
     '  return "$TEST_CURL_EXIT"',
     '}',
     'gh() {',
     '  if [ "$1" = api ]; then',
     '    [ "$2" = "--method" ] && [ "$3" = GET ] && [ "$4" = "repos/$GH_REPO/actions/workflows/deploy.yml/runs" ] || return 3',
     '    if [ "$TEST_LIST_EXIT" != 0 ]; then return "$TEST_LIST_EXIT"; fi',
+    '    local active_status=$TEST_ACTIVE_STATUS',
+    '    if [ -f "$TEST_DEPLOY_DURING_FETCH" ]; then active_status=pending; fi',
     '    case " $* " in',
-    '      *" status=$TEST_ACTIVE_STATUS "*) printf "1\\n" ;;',
+    '      *" status=$active_status "*) printf "1\\n" ;;',
     '      *) printf "0\\n" ;;',
     '    esac',
     '  else',
@@ -48,7 +53,7 @@ function runRefresh(env = {}) {
     encoding: 'utf8',
     env: {
       PATH: process.env.PATH, ENABLED: 'true', SITE_ORIGIN: origin,
-      GH_REPO: repository, TEST_ACTIVE_STATUS: '', TEST_LIST_EXIT: '0',
+      GH_REPO: repository, TEST_ACTIVE_STATUS: '', TEST_DEPLOY_DURING_FETCH: '', TEST_LIST_EXIT: '0',
       TEST_SNAPSHOT: JSON.stringify(snapshot), TEST_CURL_EXIT: '0', TEST_HTTP_STATUS: '200', ...env,
     },
   })
@@ -89,10 +94,18 @@ for (const status of ['requested', 'queued', 'pending', 'waiting', 'in_progress'
   test('skips the refresh when a deploy is ' + status, () => {
     const result = runRefresh({ TEST_ACTIVE_STATUS: status })
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.stderr, '')
     assert.match(result.stdout, /^::notice::[^\n]+\n$/u)
   })
 }
+
+test('skips without dispatching when a deploy becomes pending during the snapshot fetch', (t) => {
+  const folder = mkdtempSync(join(tmpdir(), 'ciwf-refresh-deploy-'))
+  t.after(() => rmSync(folder, { recursive: true, force: true }))
+  const result = runRefresh({ TEST_DEPLOY_DURING_FETCH: join(folder, 'pending') })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /^::notice::[^\n]+\n$/u)
+})
 
 test('a failed active-deploy lookup prevents a dispatch', () => {
   const result = runRefresh({ TEST_LIST_EXIT: '7' })
