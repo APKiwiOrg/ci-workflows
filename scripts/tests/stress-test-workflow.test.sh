@@ -7,6 +7,11 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/stress-workflow.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 pass=0
+# The fixtures bring their own git filters. A host's system or user git configuration, such as an installed Git LFS
+# filter on a hosted runner, must not rewrite fixture files on add, clone or checkout.
+GIT_CONFIG_NOSYSTEM=1
+GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 
 fail() {
   echo "FAIL: $*" >&2
@@ -174,6 +179,7 @@ run_case_step() {
   [ -f "$work/$script" ] || fail "missing workflow step $script"
   actual=0
   (cd "$checkout_dir" && env -i PATH="$work/bin:$PATH" HOME="$work/case" \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
     RUNNER_TEMP="$work/case/temp" GITHUB_STEP_SUMMARY="$work/case/summary" \
     GITHUB_REF=refs/heads/primary GITHUB_SHA=runner-sha GITHUB_EVENT_NAME=workflow_dispatch \
     STUB_PLAN="$work/case/plan" STUB_COUNT="$work/case/count" STUB_SEEN="$work/case/seen" \
