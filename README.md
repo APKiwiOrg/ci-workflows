@@ -632,11 +632,10 @@ repository while the code it tests can come from a fork, so it never vouches for
 failed run, a marker from another workflow file or repository, an expired marker and any API error each give
 `reuse` false with the reason.
 
-For a marker produced by a `push`, `schedule` or `workflow_dispatch` run, the action reads that run's
-head commit through the GitHub API and verifies that its tree matches the marker. A mismatch or failed
+For a marker produced by a `push`, `schedule`, `workflow_dispatch` or `merge_group` run, the action
+reads the run's head commit through the GitHub API and verifies that its tree matches the marker. A mismatch or failed
 lookup gives `reuse` false. A `pull_request` run normally tests GitHub's merge commit. The run API does
 not name that commit, so the action still relies on the marker name for the tested tree of a pull request.
-`merge_group` keeps the existing marker checks.
 
 It also looks for `ci-failed-full-TREE`, which `ci-finish` uploads when a full run of the tree fails. When
 such a marker is unexpired, its run passes the same origin and event checks, and it is as new as the pass or

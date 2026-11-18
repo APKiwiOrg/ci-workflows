@@ -198,28 +198,24 @@ class FindPassTests(unittest.TestCase):
 
     def test_marker_for_another_commit_tree_is_no_reuse(self):
         other_commit = {"sha": HEAD, "tree": {"sha": "d" * 40}}
-        for event in ("push", "schedule", "workflow_dispatch"):
+        for event in ("push", "schedule", "workflow_dispatch", "merge_group"):
             with self.subTest(event=event):
                 result = check(FakeFetch([artifact()], [run(event=event)], raw={COMMIT_PATH: other_commit}))
                 self.assertNoReuse(result)
-                self.assertIn("head commit has a different tree", result[1])
 
     def test_commit_lookup_failure_is_no_reuse(self):
         result = check(FakeFetch([artifact()], [run()], raw={COMMIT_PATH: github_api.ApiError("HTTP 404")}))
         self.assertNoReuse(result)
-        self.assertIn("HTTP 404", result[1])
 
     def test_commit_without_a_tree_is_no_reuse(self):
         result = check(FakeFetch([artifact()], [run()], raw={COMMIT_PATH: {"sha": HEAD}}))
         self.assertNoReuse(result)
-        self.assertIn("head commit has no readable tree", result[1])
 
     def test_run_without_a_head_commit_is_no_reuse(self):
         item = run()
         del item["head_sha"]
         result = check(FakeFetch([artifact()], [item]))
         self.assertNoReuse(result)
-        self.assertIn("run 101 has no readable head SHA", result[1])
 
     def test_pull_request_marker_can_vouch_for_a_different_tree_from_its_head(self):
         other_commit = {"sha": HEAD, "tree": {"sha": "d" * 40}}

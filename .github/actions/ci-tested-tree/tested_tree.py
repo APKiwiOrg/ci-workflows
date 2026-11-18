@@ -7,8 +7,8 @@ The tree counts as tested only when such an artifact is unexpired and the run th
 pull_request, schedule, workflow_dispatch or merge_group), and belongs to this repository with its head in
 this repository too. A pull_request_target or workflow_run run executes in this repository while the code it
 tests can come from a fork, so it never vouches. A marker is uploaded before its run ends, so a run with no
-conclusion yet does not count. For push, schedule and workflow_dispatch runs, the run's head commit
-must have the marker's tree. A pull request normally tests the merge commit, which the run API does
+conclusion yet does not count. For push, schedule, workflow_dispatch and merge_group runs,
+the run's head commit must have the marker's tree. A pull request normally tests the merge commit, which the run API does
 not name, so its marker still supplies the tree.
 
 A full run that failed leaves ci-failed-full-TREE. When such a marker is unexpired, its run passes the same
@@ -37,8 +37,8 @@ DEFAULT_WORKFLOW = ".github/workflows/ci.yml"
 MARKER_PREFIX = "ci-passed-full-"
 FAILED_MARKER_PREFIX = "ci-failed-full-"
 # Events whose runs can vouch for this repository's own code. Fork runs are refused separately.
-HEAD_TREE_EVENTS = ("push", "schedule", "workflow_dispatch")
-VOUCHING_EVENTS = HEAD_TREE_EVENTS + ("pull_request", "merge_group")
+HEAD_TREE_EVENTS = ("push", "schedule", "workflow_dispatch", "merge_group")
+VOUCHING_EVENTS = HEAD_TREE_EVENTS + ("pull_request",)
 # Older markers are only consulted when newer ones fail a check. This bounds the API calls one check makes.
 MAX_RUNS_CHECKED = 10
 ARTIFACTS_PER_PAGE = 100
