@@ -4,8 +4,9 @@ name: check
 # segments a change needs. Test: workflows keeps every workflow hosted and SHA-pinned, parses them, runs the
 # stress workflow's shell steps against a stub dotnet and runs the Node workflow tests. Test: actions keeps
 # every action SHA-pinned, parses them and runs the Python action tests. CI passed gives the run one verdict
-# and one summary, and marks the tree as passed or failed after a full run. On a full run every test job runs,
-# whatever segments lists.
+# and one summary, and marks the tree as passed or failed after a full run. The final job exercises reuse
+# and checks that a full run rejects the nested optional job until it is explicitly allowed. On a full run
+# every test job runs, whatever segments lists.
 on:
   push:
     branches: [main]
@@ -73,19 +74,7 @@ jobs:
     name: 'Test: actions'
     needs: scope
     if: needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.segments), 'actions')
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # The pin check reads every workflow and action, so a change to an action alone is still checked.
-      - name: Pinned
-        run: sh scripts/check-workflows.sh
-      - name: Every action parses
-        run: find .github/actions -type f \( -name action.yml -o -name action.yaml \) -print0 | xargs -0 -n 1 python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))"
-      - name: Python action tests
-        run: python3 -m unittest discover -s scripts/tests -p 'test_ci_*.py' -v
+    uses: ./.github/workflows/check-actions.yml
 
   ci-passed:
     name: CI passed
@@ -101,10 +90,32 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Look up a full pass for the checked-out tree
+        uses: ./.github/actions/ci-tested-tree
+        with:
+          workflow: .github/workflows/check.yml
+      - name: Reject an unapproved nested skip on a full run
+        if: >-
+          needs.scope.outputs.full == 'true'
+          && needs.test-workflows.result == 'success'
+          && needs.test-actions.result == 'success'
+        env:
+          CI_FINISH_NEEDS: ${{ toJSON(needs) }}
+          CI_FINISH_FULL: 'true'
+          CI_API_TOKEN: ${{ github.token }}
+        run: |
+          output="$(mktemp)"
+          log="$(mktemp)"
+          GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY='' python3 .github/actions/ci-finish/finish.py > "$log"
+          cat "$log"
+          grep -Fx 'Not passed: Test: actions / Optional report was skipped on a full run' "$log"
+          grep -Fx 'passed=false' "$output"
+          grep -Fx 'upload=false' "$output"
       - uses: ./.github/actions/ci-finish
         with:
           needs: ${{ toJSON(needs) }}
           allow-skipped: test-workflows test-actions
+          allow-skipped-always: '["Test: actions / Optional report"]'
           full: ${{ needs.scope.outputs.full }}
           segments: ${{ needs.scope.outputs.segments }}
           scope-reason: ${{ needs.scope.outputs.reason }}

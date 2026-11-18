@@ -729,7 +729,10 @@ marker. A job inside a reusable workflow is matched as `CALLER / NAME` when `job
 ### Example workflow
 
 A complete `.github/workflows/ci.yml` for `example-app` with one test segment, `unit`. This repository's own
-`check.yml` has the same shape with two segments.
+`check.yml` has the same shape with two segments. Its actions segment uses a reusable workflow with
+a deliberately skipped non-test job. The final job exercises `ci-tested-tree` against markers for
+its own workflow. On full runs it verifies that leaving the skipped job off the allow list fails
+the verdict and withholds the pass marker, then runs `ci-finish` with the explicit exception.
 
 ```yaml
 name: ci
