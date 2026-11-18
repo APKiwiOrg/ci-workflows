@@ -38,6 +38,7 @@ JOB_IDS = itertools.count(1000)
 TREE = "c" * 40
 NOW = datetime.datetime(2026, 1, 20, 12, 0, 0, tzinfo=datetime.timezone.utc)
 JOBS_PATH = "/repos/%s/actions/runs/%s/jobs?per_page=100&page=%d"
+FIRST_ATTEMPT_JOBS_PATH = "/repos/%s/actions/runs/%s/attempts/1/jobs?per_page=100&page=1" % (REPO, RUN_ID)
 ARTIFACTS_PATH = "/repos/%s/actions/artifacts?per_page=100" % REPO
 
 
@@ -838,6 +839,48 @@ class FinishTests(unittest.TestCase):
         fetch.answers[JOBS_PATH % (REPO, RUN_ID, 2)] = {"total_count": 101, "jobs": jobs[100:]}
         outcome = finish.finish(self.full(), fetch, good_tree, NOW)
         self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+
+    def test_full_rerun_requires_the_first_attempt_job_names(self):
+        name = "checks / Optional report"
+        env = dict(self.full(), GITHUB_RUN_ATTEMPT="2", CI_FINISH_ALLOW_SKIPPED_ALWAYS=json.dumps([name]))
+        expected = FULL_JOBS + [job(name, "skipped")]
+        old_rows = [dict(row, id=500 + i) for i, row in enumerate(expected)]
+        for latest, passes in ((FULL_JOBS, False), (expected, True)):
+            with self.subTest(carried_forward=passes):
+                fetch = FakeFetch(latest, ARTIFACTS)
+                fetch.answers[FIRST_ATTEMPT_JOBS_PATH] = {"total_count": len(old_rows), "jobs": old_rows}
+                outcome = finish.finish(env, fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (passes, passes))
+                if not passes:
+                    self.assertTrue(any("jobs-audit-incomplete" in problem and name in problem
+                                        for problem in outcome.problems))
+
+    def test_full_rerun_refuses_an_unapproved_skip_that_was_carried_forward(self):
+        name = "checks / Optional report"
+        jobs = FULL_JOBS + [job(name, "skipped")]
+        fetch = FakeFetch(jobs, ARTIFACTS)
+        fetch.answers[FIRST_ATTEMPT_JOBS_PATH] = {"total_count": len(jobs), "jobs": jobs}
+        outcome = finish.finish(dict(self.full(), GITHUB_RUN_ATTEMPT="2"), fetch, good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_full_rerun_requires_a_readable_first_attempt(self):
+        for first_attempt in (None, {"total_count": 1, "jobs": [None]}):
+            with self.subTest(first_attempt=first_attempt):
+                fetch = FakeFetch(FULL_JOBS, ARTIFACTS)
+                if first_attempt is not None:
+                    fetch.answers[FIRST_ATTEMPT_JOBS_PATH] = first_attempt
+                outcome = finish.finish(dict(self.full(), GITHUB_RUN_ATTEMPT="2"), fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (False, False))
+                self.assertTrue(any("jobs-audit-incomplete" in problem for problem in outcome.problems))
+
+    def test_first_attempt_roster_is_only_read_on_full_reruns(self):
+        for env in (dict(self.full(), GITHUB_RUN_ATTEMPT="1"), settings(GITHUB_RUN_ATTEMPT="2")):
+            with self.subTest(full=env["CI_FINISH_FULL"]):
+                fetch = mock.Mock(side_effect=FakeFetch(FULL_JOBS, ARTIFACTS))
+                outcome = finish.finish(env, fetch, good_tree, NOW)
+                self.assertIs(outcome.passed, True)
+                self.assertNotIn(mock.call(FIRST_ATTEMPT_JOBS_PATH), fetch.call_args_list)
 
     def test_full_run_fails_if_a_short_page_claims_more_jobs(self):
         fetch = FakeFetch(FULL_JOBS, ARTIFACTS)

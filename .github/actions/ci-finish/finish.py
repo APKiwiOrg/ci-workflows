@@ -8,7 +8,8 @@ always-allowed list and not the segment list. Every available API row is audited
 every other job to complete with success or an explicitly allowed skip. Unreadable data fails a full run.
 On a partial run, only known failures and identifiable unfinished jobs add to the needs verdict. The
 current check run ID identifies the finishing job. Without a match, a partial run cannot tell which
-unfinished row is its own, but still counts completed failures. Summary fallback preserves the verdict.
+unfinished row is its own, but still counts completed failures. A full re-run must account for every
+job name from the first attempt. Summary fallback preserves the verdict.
 
 A full run that passed prepares the ci-passed-full-TREE marker, but only when the jobs API was read, since
 otherwise a job missing from `needs` could have failed unseen. A full run that failed with at least one job
@@ -17,7 +18,8 @@ of the tree failed. A run whose only problems are cancelled or wrongly skipped j
 
 Inputs come from the environment: CI_FINISH_NEEDS, CI_FINISH_ALLOW_SKIPPED, CI_FINISH_ALLOW_SKIPPED_ALWAYS,
 CI_FINISH_FULL, CI_FINISH_SEGMENTS, CI_FINISH_SCOPE_REASON, CI_FINISH_TITLE, CI_FINISH_CHECK_RUN_ID,
-CI_API_TOKEN and the runner's GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_EVENT_NAME, GITHUB_SERVER_URL,
+CI_API_TOKEN and the runner's GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_EVENT_NAME,
+GITHUB_SERVER_URL,
 GITHUB_API_URL, GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and RUNNER_TEMP. The summary is appended to
 GITHUB_STEP_SUMMARY and the outputs passed, upload, tree, artifact and marker to GITHUB_OUTPUT. The script
 itself always exits 0, so the action's upload and verdict steps still run. Python 3.8 or later, standard
@@ -149,11 +151,16 @@ def any_failure(needs):
     return any(isinstance(entry, dict) and entry.get("result") == "failure" for entry in parsed.values())
 
 
+def job_names(jobs):
+    return Counter(job["name"] for job in jobs
+                   if isinstance(job, dict) and isinstance(job.get("name"), str) and job["name"])
+
+
 def audit_jobs(jobs, own_id, full, allowed_names):
     # type: (Sequence[Any], Optional[int], bool, Set[str]) -> Tuple[List[str], List[str], Optional[int]]
     """Audit all available rows before deciding whether the jobs list was complete."""
     ids = Counter(job["id"] for job in jobs if isinstance(job, dict) and type(job.get("id")) is int)
-    names = Counter(job["name"] for job in jobs if isinstance(job, dict) and isinstance(job.get("name"), str))
+    names = job_names(jobs)
     if ids[own_id] != 1:
         own_id = None
 
@@ -397,13 +404,16 @@ class AuditFetch:
                 time.sleep(min(JOBS_RETRY_SECONDS, self._remaining()))
 
 
-def fetch_jobs(repo, run_id, fetch):
-    # type: (str, str, github_api.Fetch) -> Tuple[List[Any], Optional[str]]
+def fetch_jobs(repo, run_id, fetch, attempt=None):
+    # type: (str, str, github_api.Fetch, Optional[int]) -> Tuple[List[Any], Optional[str]]
     """Return the rows read and the reason if they do not cover the reported count."""
     jobs = []  # type: List[Any]
     total = None
+    run_path = "/repos/%s/actions/runs/%s" % (repo, run_id)
+    if attempt is not None:
+        run_path += "/attempts/%d" % attempt
     for page in range(1, JOB_PAGES + 1):
-        path = "/repos/%s/actions/runs/%s/jobs?per_page=%d&page=%d" % (repo, run_id, JOBS_PER_PAGE, page)
+        path = "%s/jobs?per_page=%d&page=%d" % (run_path, JOBS_PER_PAGE, page)
         try:
             answer = fetch(path)
         except Exception as error:  # noqa: BLE001 The verdict still needs the earlier pages.
@@ -425,6 +435,20 @@ def fetch_jobs(repo, run_id, fetch):
         if len(jobs) == total:
             return jobs, None
     return jobs, "jobs API page limit reached after %d of %d jobs" % (len(jobs), total)
+
+
+def first_attempt_problem(repo, run_id, fetch, jobs):
+    """GitHub can give carried-forward jobs new IDs. Compare names and their multiplicities."""
+    first_jobs, error = fetch_jobs(repo, run_id, fetch, attempt=1)
+    if error:
+        return "cannot read the first attempt's jobs: %s" % error
+    first_names = job_names(first_jobs)
+    if sum(first_names.values()) != len(first_jobs):
+        return "the first attempt's jobs include a row without a usable name"
+    missing = first_names - job_names(jobs)
+    if missing:
+        return "the current jobs API list omits jobs from the first attempt: %s" % ", ".join(sorted(missing))
+    return None
 
 
 def _string_list(text):
@@ -497,9 +521,18 @@ def finish(env, fetch, tree_of, now):
     check_run_id = env.get("CI_FINISH_CHECK_RUN_ID", "")
     own_id = int(check_run_id) if re.fullmatch(r"[1-9][0-9]{0,19}", check_run_id) else None
     api = AuditFetch(fetch, JOBS_ATTEMPTS if full else 1)
-    jobs, read_error = fetch_jobs(repo, env.get("GITHUB_RUN_ID", ""), api.jobs)
+    run_id = env.get("GITHUB_RUN_ID", "")
+    jobs, read_error = fetch_jobs(repo, run_id, api.jobs)
     job_problems, incomplete, own_id = audit_jobs(jobs, own_id, full, allowed_names)
     problems.extend(job_problems)
+    attempt = env.get("GITHUB_RUN_ATTEMPT", "1")
+    if full and attempt != "1":
+        if not re.fullmatch(r"[1-9][0-9]*", attempt):
+            incomplete.append("GITHUB_RUN_ATTEMPT is not a positive integer")
+        else:
+            attempt_error = first_attempt_problem(repo, run_id, api.jobs, jobs)
+            if attempt_error:
+                incomplete.append(attempt_error)
     notes = []
     if full and (read_error or incomplete):
         cause = ". ".join(([read_error] if read_error else []) + incomplete)

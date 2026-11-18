@@ -712,8 +712,10 @@ jobs. On full runs it tries transient network errors, timeouts, HTTP 429 and 5xx
 one second between attempts. Permanent HTTP errors and invalid bodies are refused on the first attempt.
 All jobs requests, waits, response bodies and the optional artifact footer share a 45-second wall-clock
 budget, leaving time to write the summary and outputs in a five-minute job. An incomplete audit logs its
-cause under `jobs-audit-incomplete` and asks for a re-run. Unreadable data is ignored on partial runs.
-The summary can fall back to `needs` without losing audit failures. The APIs otherwise supply the
+cause under `jobs-audit-incomplete` and asks for a re-run. A full re-run also reads the first attempt's
+jobs under the same page limit and time budget. The latest list must include every name from the first
+attempt with at least the same number of occurrences. Either list being incomplete fails the audit.
+Unreadable data is ignored on partial runs. The summary can fall back to `needs` without losing audit failures. The APIs otherwise supply the
 summary's names, times and its `Full suite last passed` footer, which counts only markers from runs of this
 repository's own code. Summary cells escape text from git or the API.
 
