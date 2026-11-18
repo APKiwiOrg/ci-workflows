@@ -277,7 +277,7 @@ jobs:
               if [ "$#" -eq 1 ]; then target="$1"; else target="$PROJECT"; fi
             fi
             if [ ! -e "$target" ]; then
-              echo "::error::build target $target does not exist on this ref" >&2
+              echo "::error::build target $target does not exist on this ref"
               return 1
             fi
           }
@@ -307,7 +307,8 @@ jobs:
             cd "$1" || exit
             root=$(pwd -P) || exit
             verify_path project "$PROJECT" "$root" || exit
-            select_target || exit
+            # This function's output is the target name, so the resolver's diagnostic goes to the error stream here.
+            select_target >&2 || exit
             verify_path 'build target' "$target" "$root" || exit
             printf '%s\n' "$target"
           )
