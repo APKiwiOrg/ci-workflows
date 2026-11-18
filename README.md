@@ -59,6 +59,10 @@ on:
         description: Environment variable naming each run's retained directory, empty for none
         default: ''
         type: string
+      compare_ref:
+        description: Second branch, tag or commit to test on the same machine, empty for none
+        default: ''
+        type: string
 permissions:
   contents: read
 jobs:
@@ -73,6 +77,7 @@ jobs:
       support-cost: ${{ inputs.support-cost }}
       build-target: ${{ inputs.build-target }}
       artifact-env: ${{ inputs.artifact-env }}
+      compare-ref: ${{ inputs.compare_ref }}
 ```
 
 A caller whose `nuget.config` restores from GitHub Packages also passes
@@ -150,6 +155,56 @@ timing or load run, stays with the caller.
 Quote the whole filter for the shell, without embedded quotes around a simple unit name. Embedded quotes
 can be stripped while dotnet forwards the filter to the test adapter, leaving an invalid condition and no
 selected tests. Check the retained TRX count before treating a run as evidence.
+
+The optional `compare-ref` string defaults to empty and preserves the single-ref behavior. Set it to a
+branch, tag or commit in the caller repository to compare it with the dispatched ref on one runner.
+Compare mode requires manual workflow dispatch. Use trusted code from the caller repository for both refs.
+Use a fully qualified ref such as `refs/heads/tag` or `refs/tags/v1.2.3` for reserved names like `tag`,
+names beginning with `+`, or names shared by a branch and a tag.
+
+The workflow checks out the comparison in a detached worktree outside the primary checkout and builds
+both refs before any tests. Each ref resolves its own build target and runs the applicable package
+and local feed setup. The comparison uses a separate NuGet package directory so packages with the same
+version can differ between refs. Use checkout-relative paths for `project` and `build-target`.
+The test project must exist on both refs. Both paths must resolve inside their respective checkout,
+including through symlinks. `support-cost` cannot be combined with `compare-ref`.
+
+Each iteration runs the same selection once per ref. Odd iterations run primary first and even
+iterations run comparison first. Any configured load runs throughout the loop. The comparison test
+process gets its resolved commit in `GITHUB_SHA`. The primary test process keeps the runner's value.
+The summary reports both refs, their commits and each side's passed, failed and selected-nothing counts.
+Any run that fails or selects nothing fails the step.
+
+The upload step attempts to retain the whole `stress` tree as one `stress-compare` artifact for seven days
+on success, failure or cancellation. `progress.txt` records the requested refs before validation and
+adds validation, checkout and build outcomes as they become known. It gives early failures an artifact
+even before tests run. Once both commits resolve, `refs.txt` records each side, requested ref and commit,
+followed by the processor model and logical processor count. The tree keeps the logs and TRX files
+each run writes, including passing runs, plus test-written files when `artifact-env` is set.
+Cancellation or a job timeout can interrupt the upload or end the job before it starts.
+
+```text
+stress/
+  progress.txt
+  refs.txt
+  primary/
+    run-N.log
+    run-N.trx
+    artifacts/run-N/
+  compare/
+    run-N.log
+    run-N.trx
+    artifacts/run-N/
+```
+
+Compare mode runs twice as many tests and allows up to 180 minutes for the job and 150 minutes for
+the repeat step. Get the owner's explicit permission before starting any load or stress run, including
+this comparison. For an approved two-iteration proof with no load, set `PRIMARY_BRANCH`,
+`BASELINE_SHA`, `TEST_PROJECT` and `TEST_NAME` in your shell and use the caller's `compare_ref` dispatch input.
+
+```bash
+gh workflow run stress-test.yml --ref "$PRIMARY_BRANCH" -f compare_ref="$BASELINE_SHA" -f project="$TEST_PROJECT" -f filter="FullyQualifiedName=$TEST_NAME" -f iterations=2 -f load=0 -f configuration=Release
+```
 
 ## site-ci
 
@@ -604,7 +659,7 @@ commit counts as tested when its content matches a commit that passed, whatever 
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `workflow` | `.github/workflows/ci.yml` | Path of the workflow file whose full passing run counts. |
-| `token` | `${{ github.token }}` | Token that can read the repository's Actions artifacts and runs. |
+| `token` | `${{ github.token }}` | Token that can read the repository's Actions artifacts, workflow runs and git commits. |
 
 | Output | Meaning |
 | --- | --- |
@@ -623,6 +678,11 @@ this repository with its head here too. The run's event must be `push`, `pull_re
 repository while the code it tests can come from a fork, so it never vouches for a tree. A run still going, a
 failed run, a marker from another workflow file or repository, an expired marker and any API error each give
 `reuse` false with the reason.
+
+For a marker produced by a `push`, `schedule`, `workflow_dispatch` or `merge_group` run, the action
+reads the run's head commit through the GitHub API and verifies that its tree matches the marker. A mismatch or failed
+lookup gives `reuse` false. A `pull_request` run normally tests GitHub's merge commit. The run API does
+not name that commit, so the action still relies on the marker name for the tested tree of a pull request.
 
 It also looks for `ci-failed-full-TREE`, which `ci-finish` uploads when a full run of the tree fails. When
 such a marker is unexpired, its run passes the same origin and event checks, and it is as new as the pass or
@@ -652,13 +712,13 @@ as the last job, `CI passed`.
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `needs` | required | The calling job's `${{ toJSON(needs) }}`. |
-| `allow-skipped` | empty | Job ids skipped when their segment is not selected, separated by spaces or commas. |
-| `allow-skipped-always` | empty | Job ids that may be skipped on any run, separated by spaces or commas. |
+| `allow-skipped` | empty | Direct job IDs in `needs` that may skip on partial runs. |
+| `allow-skipped-always` | empty | IDs and exact API names of jobs that do not test and may skip on any run. |
 | `full` | required | `true` when `ci-scope` made this a full run, so every segment job must run, `false` otherwise. Any other value fails the run. |
 | `segments` | empty | The JSON list of segments `ci-scope` selected, used to explain skipped test segments. |
 | `scope-reason` | empty | The reason `ci-scope` gave, shown on the `Scope` row. |
 | `title` | empty | Summary heading. Empty means the repository's name followed by `CI`. |
-| `job-name` | `CI passed` | Display name of the job that runs the action, so its row is the verdict and comes last. It must match, or the job counts itself as unfinished and the run fails. |
+| `job-name` | `CI passed` | Legacy input accepted for compatibility. The action identifies itself by check run ID. |
 | `token` | `${{ github.token }}` | Token that can read the run's jobs and the repository's artifacts. |
 
 It has no outputs. The calling job runs under `if: always()`, needs `actions: read` and `contents: read`, and
@@ -670,28 +730,49 @@ The verdict starts from `needs`. A job that succeeded passes. A failed or cancel
 does empty or malformed `needs` or a `full` value other than `true` or `false`. A skipped job fails the run
 unless its id is listed:
 
-- `allow-skipped` names the `Test: SEGMENT` jobs, which are skipped when their segment is not selected. On a
-  full run every segment runs, so a skip of one of them fails the run, even when its id is in
-  `allow-skipped-always` too.
-- `allow-skipped-always` names jobs that do not test and may skip on any run, such as a deploy that runs
-  only on the default branch.
+- `allow-skipped` holds only IDs of direct jobs in `needs`. A skip of one of them fails a full run,
+  even if its ID is also listed in `allow-skipped-always`.
+- `allow-skipped-always` is for jobs that do not test, such as a deploy that runs only on the default
+  branch. Use the direct job ID for `needs` and the exact jobs API display name for the full-run audit.
+  A nested job is excused only by its exact API name, including the caller prefix, for example
+  `allow-skipped-always: '["checks / Publish docs"]'`. Duplicate API names make a skip exception ambiguous
+  and fail the audit.
 
-The jobs API can then only turn a pass into a fail, never the reverse. A job of the run that has not
-finished, or that failed, timed out or was cancelled, and that `needs` does not report, fails the run. That
-catches a job missing from `needs` whether it already failed or is still going, and it means a job allowed to
-fail (`continue-on-error`) does not belong in the workflow whose verdict this is. While `CI passed` runs, the
-jobs API does not list a job that needs it, so such a job never counts. An API error leaves the verdict from
-`needs` unchanged and withholds the pass marker, since a job missing from `needs` could have failed unseen. The APIs otherwise supply the
+Both inputs take job IDs matching `[A-Za-z_][A-Za-z0-9_-]*`, separated by spaces or commas, or a JSON array
+of strings. Only `allow-skipped-always` accepts display names in the JSON form, which preserves spaces and
+commas. A malformed list fails the verdict with the input name and grants no exemptions.
+
+**Moving the pin.** A full run can still use `allow-skipped-always: publish_docs` when the API job name is
+also `publish_docs`. For a job with ID `publish_docs` and display name `Publish docs`, change the old
+`allow-skipped-always: publish_docs` to `allow-skipped-always: '["publish_docs", "Publish docs"]'` when moving
+the pin. The Jobs API exposes the display name and `needs` uses IDs, so each must match in its own list check.
+
+The jobs API exempts the finishing job only when its `job.check_run_id` uniquely matches an API row ID.
+The finishing job's name grants no exemption. A missing or unmatched ID makes a full audit incomplete.
+On a partial run it leaves unfinished rows ambiguous, so the audit checks only completed failures and the
+verdict from `needs`. With an ID match, an unfinished dependency also fails the partial verdict.
+
+The audit examines available rows even when a later page, the page count or the page limit is unusable.
+A full run requires every other job to be completed with `success` or with an exact-name skip exception.
+Any other state or an incomplete audit fails the full verdict. The audit reads up to three pages of 100
+jobs. On full runs it tries transient network errors, timeouts, HTTP 429 and 5xx up to three times, with
+one second between attempts. Permanent HTTP errors and invalid bodies are refused on the first attempt.
+All jobs requests, waits, response bodies and the optional artifact footer share a 45-second wall-clock
+budget, leaving time to write the summary and outputs in a five-minute job. An incomplete audit logs its
+cause under `jobs-audit-incomplete` and asks for a re-run. A full re-run also reads the first attempt's
+jobs under the same page limit and time budget. The latest list must include every name from the first
+attempt with at least the same number of occurrences. Either list being incomplete fails the audit.
+Unreadable data is ignored on partial runs. The summary can fall back to `needs` without losing audit failures. The APIs otherwise supply the
 summary's names, times and its `Full suite last passed` footer, which counts only markers from runs of this
-repository's own code. Text from git or the API is escaped in the summary, so a file or job name cannot
-render as a link or other Markdown.
+repository's own code. Summary cells escape text from git or the API.
 
-The action writes the summary first, then uploads a marker artifact holding the tree and the run's link, kept
-30 days, then fails the job when the run did not pass. A failed run still shows its summary. A full run that
-passed, with the jobs API read, uploads `ci-passed-full-TREE`. A full run where a job in `needs` reports `failure` uploads
+The action writes the summary, uploads any marker, then fails the job if the verdict failed. A marker holds
+the tree and the run's link and is kept for 30 days. The `ci-passed-full-TREE` marker requires a full run,
+a passed verdict, a complete jobs audit, a summary built without fallback and a readable checkout tree.
+A full run where a job in `needs` reports `failure` uploads
 `ci-failed-full-TREE`, so `ci-tested-tree` does not reuse an older pass of a tree whose newest full run
 failed. A run whose only problems are cancelled or wrongly skipped jobs, and a partial run, upload no
-marker. A job inside a reusable workflow is matched as `CALLER / NAME` when `job-name` is set to its name.
+marker.
 
 ```yaml
 - uses: actions/checkout@<full commit sha>
@@ -709,7 +790,10 @@ marker. A job inside a reusable workflow is matched as `CALLER / NAME` when `job
 ### Example workflow
 
 A complete `.github/workflows/ci.yml` for `example-app` with one test segment, `unit`. This repository's own
-`check.yml` has the same shape with two segments.
+`check.yml` has the same shape with two segments. Its actions segment uses a reusable workflow with
+a deliberately skipped non-test job. The final job exercises `ci-tested-tree` against markers for
+its own workflow. On full runs it verifies that leaving the skipped job off the allow list fails
+the verdict and withholds the pass marker, then runs `ci-finish` with the explicit exception.
 
 ```yaml
 name: ci
@@ -793,7 +877,7 @@ The wiring that matters:
 - `allow-skipped` lists the `Test: SEGMENT` jobs, which skip when their segment is not selected. A skip of
   one of them fails a full run.
 - `allow-skipped-always` lists jobs that do not test and skip by design, such as a deploy that runs only on
-  `main`. It is empty here because every job runs on every run.
+  `main`. It is empty here because every job runs on a full run.
 - `CI passed` passes `full` from `Scope`, so only a full run leaves the marker that `ci-tested-tree` reads.
   The input is required, and an empty value, as when `Scope` failed, fails the run.
 - A job allowed to fail does not belong in this workflow: `CI passed` fails when any job of the run fails,

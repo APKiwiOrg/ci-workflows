@@ -1,19 +1,12 @@
 name: ci-finish
 description: Give a CI run one verdict and one summary, and mark the tree after a full run.
 
-# Runs as the last job of a run, under `if: always()`. Every job of the workflow that does not itself wait
-# for the verdict must be in its `needs`. A job that runs after the verdict is not counted. The verdict
-# starts from `needs`: a failed or cancelled job fails the run, and so does a `full` input other than true or
-# false. A skipped job fails it unless its id is in `allow-skipped` on a run that is not full, or in
-# `allow-skipped-always` and not in `allow-skipped`, since a full run runs every segment. The jobs API can
-# then only turn a pass into a fail: a job of this run that has not finished, or that failed, timed out or
-# was cancelled, and that `needs` does not report, fails the run. So a job allowed to fail does not belong
-# in the workflow whose verdict this is. An API error leaves the verdict from `needs` unchanged, thins the
-# summary and withholds the pass marker. The steps run in order: write the summary, upload the marker, then
-# fail when the run did not pass, so a failed run still shows its summary. A full run that passed uploads
-# ci-passed-full-TREE. A full run with a job in `needs` that failed uploads ci-failed-full-TREE, so
-# ci-tested-tree does not reuse an older pass of that tree. The calling job checks the repository out and
-# grants `actions: read`.
+# Runs as the last job under `if: always()`. Its needs must include each job that can run before the
+# verdict. A full run requires every other API job to have completed with success or an exact-name skip
+# exception. A full re-run must account for every job name from attempt one. An incomplete audit fails a full run. A partial run adds only established failures to the
+# needs verdict, including failures read before an API error. Only a full passing run whose audit and
+# summary completed and whose tree is readable uploads ci-passed-full-TREE. A full run with a failed job in needs uploads
+# ci-failed-full-TREE. The calling job checks the repository out and grants `actions: read`.
 
 inputs:
   needs:
@@ -21,20 +14,23 @@ inputs:
     required: true
   allow-skipped:
     description: >-
-      Job ids that may be skipped because their segment was not selected, separated by spaces or commas.
-      A skip of one of them fails a full run.
+      Only IDs of direct jobs in needs that may skip on partial runs. IDs match [A-Za-z_][A-Za-z0-9_-]*.
+      Separate them with spaces or commas, or use a JSON array of IDs. This list applies only to needs.
+      A listed job that skips on a full run fails the verdict.
     required: false
     default: ''
   allow-skipped-always:
     description: >-
-      Job ids that may be skipped on any run, separated by spaces or commas, for a job that does not test,
-      such as a deploy that runs only on the default branch
+      Only jobs that do not test. Use space- or comma-separated IDs matching [A-Za-z_][A-Za-z0-9_-]*,
+      or a JSON array of strings. Use direct IDs for needs and exact API names for the full-run audit.
+      A nested job needs its exact API name, including the caller prefix.
     required: false
     default: ''
   full:
     description: >-
-      true when ci-scope made this a full run, so every segment job must run and the tree is marked, false
-      otherwise. Any other value fails the run.
+      true for a full run, false for a partial run. Any other value fails. Full runs require the runner's
+      check run ID to match the finishing job's API row. Without that match, a partial run ignores
+      unfinished rows and still counts completed failures and the needs verdict.
     required: true
   segments:
     description: The JSON list of segments ci-scope selected, used to explain skipped test segments
@@ -50,8 +46,7 @@ inputs:
     default: ''
   job-name:
     description: >-
-      Display name of the job that runs this action, so its row is the verdict and comes last. It must match,
-      or the job counts itself as a job that has not finished and the run fails.
+      Legacy input accepted for compatibility. The action identifies its job by check run ID.
     required: false
     default: CI passed
   token:
@@ -72,7 +67,7 @@ runs:
         CI_FINISH_SEGMENTS: ${{ inputs.segments }}
         CI_FINISH_SCOPE_REASON: ${{ inputs.scope-reason }}
         CI_FINISH_TITLE: ${{ inputs.title }}
-        CI_FINISH_JOB_NAME: ${{ inputs.job-name }}
+        CI_FINISH_CHECK_RUN_ID: ${{ job.check_run_id }}
         CI_API_TOKEN: ${{ inputs.token }}
       run: python3 "$GITHUB_ACTION_PATH/finish.py"
     - if: steps.finish.outputs.upload == 'true'

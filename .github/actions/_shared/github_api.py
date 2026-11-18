@@ -9,6 +9,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Optional
@@ -28,6 +29,10 @@ class ApiError(Exception):
     """Any failure to read one API answer: HTTP status, network, timeout or a body that is not an object.
     The message never holds the token."""
 
+    def __init__(self, message, *, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
 
 def make_fetch(token, base_url=None, open_url=urllib.request.urlopen):
     # type: (str, Optional[str], Callable[..., Any]) -> Fetch
@@ -43,17 +48,26 @@ def make_fetch(token, base_url=None, open_url=urllib.request.urlopen):
             request.add_unredirected_header("Authorization", "Bearer " + token)
         try:
             with open_url(request, timeout=TIMEOUT_SECONDS) as response:
+                status = getattr(response, "status", None)
                 body = response.read()
         except urllib.error.HTTPError as error:
-            raise ApiError("HTTP %d for %s" % (error.code, path))
+            status = error.code
+            error.close()
+            raise ApiError("HTTP %d for %s" % (status, path), retryable=status == 429 or 500 <= status < 600)
         except (OSError, http.client.HTTPException) as error:
-            raise ApiError("%s for %s" % (type(error).__name__, path))
+            cause = error.reason if isinstance(error, urllib.error.URLError) else error
+            retryable = (isinstance(cause, (OSError, http.client.IncompleteRead))
+                         and not isinstance(cause, ssl.SSLCertVerificationError))
+            raise ApiError("%s for %s" % (type(error).__name__, path), retryable=retryable)
+        answer_label = "answer for %s" % path
+        if status is not None:
+            answer_label += " (HTTP %s)" % status
         try:
             answer = json.loads(body.decode("utf-8"))
-        except ValueError:
-            raise ApiError("answer for %s is not JSON" % path)
+        except (ValueError, RecursionError):
+            raise ApiError("%s is not JSON" % answer_label)
         if not isinstance(answer, dict):
-            raise ApiError("answer for %s is not a JSON object" % path)
+            raise ApiError("%s is not a JSON object" % answer_label)
         return answer
 
     return fetch

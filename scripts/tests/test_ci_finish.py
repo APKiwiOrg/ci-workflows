@@ -7,14 +7,20 @@ Every refusal sits beside a control that differs only in that one thing. A fake 
 dictionaries, so no test reaches the network. The one real-process test points the API at a closed local
 port.
 """
+import contextlib
 import datetime
 import importlib.util
+import io
+import itertools
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ACTIONS = os.path.join(ROOT, ".github", "actions")
@@ -27,16 +33,24 @@ github_api = finish.github_api
 
 REPO = "example-org/example-app"
 RUN_ID = "7"
+OWN_ID = 901
+JOB_IDS = itertools.count(1000)
 TREE = "c" * 40
 NOW = datetime.datetime(2026, 1, 20, 12, 0, 0, tzinfo=datetime.timezone.utc)
 JOBS_PATH = "/repos/%s/actions/runs/%s/jobs?per_page=100&page=%d"
+FIRST_ATTEMPT_JOBS_PATH = "/repos/%s/actions/runs/%s/attempts/1/jobs?per_page=100&page=1" % (REPO, RUN_ID)
 ARTIFACTS_PATH = "/repos/%s/actions/artifacts?per_page=100" % REPO
 
 
 def job(name, conclusion="success", started="2026-01-20T11:58:00Z", completed="2026-01-20T11:58:52Z",
-        steps=()):
-    return {"name": name, "status": "completed" if conclusion else "in_progress", "conclusion": conclusion,
+        steps=(), job_id=None):
+    return {"id": next(JOB_IDS) if job_id is None else job_id,
+            "name": name, "status": "completed" if conclusion else "in_progress", "conclusion": conclusion,
             "started_at": started, "completed_at": completed if conclusion else None, "steps": list(steps)}
+
+
+def own_job(name="CI passed", conclusion=None, **fields):
+    return job(name, conclusion, job_id=OWN_ID, **fields)
 
 
 def step(name, conclusion="success", started="2026-01-20T11:58:10Z", completed="2026-01-20T11:58:40Z"):
@@ -210,7 +224,7 @@ class DurationTests(unittest.TestCase):
 
 class RowsTests(unittest.TestCase):
     def rows(self, jobs, segments=None, scope_reason=""):
-        return [tuple(row) for row in finish.rows(jobs, "CI passed", segments, scope_reason)]
+        return [tuple(row) for row in finish.rows(jobs, OWN_ID, segments, scope_reason)]
 
     def test_job_named_by_stage_gives_one_row(self):
         self.assertEqual(self.rows([job("Build")]), [("Build", "Passed", 52, "")])
@@ -231,10 +245,10 @@ class RowsTests(unittest.TestCase):
                          [("Other: lint", "Passed", 52, "")])
 
     def test_own_job_is_left_for_the_verdict_row(self):
-        self.assertEqual(self.rows([job("Scope"), job("CI passed", None)]), [("Scope", "Passed", 52, "")])
+        self.assertEqual(self.rows([job("Scope"), own_job()]), [("Scope", "Passed", 52, "")])
 
     def test_own_job_inside_a_reusable_workflow_is_left_out(self):
-        self.assertEqual(self.rows([job("Scope"), job("Checks / CI passed", None)]),
+        self.assertEqual(self.rows([job("Scope"), own_job("Checks / CI passed")]),
                          [("Scope", "Passed", 52, "")])
 
     def test_result_words(self):
@@ -272,19 +286,19 @@ class RowsTests(unittest.TestCase):
 
 class TableTests(unittest.TestCase):
     def test_verdict_row_comes_last_with_the_verdict_and_own_time(self):
-        jobs = [job("CI passed", None, started="2026-01-20T11:59:58Z"), job("Build")]
+        jobs = [own_job(started="2026-01-20T11:59:58Z"), job("Build")]
         table = [tuple(row) for row in finish.table(
-            needs(build="success"), jobs, "CI passed", None, "", True, NOW)]
+            needs(build="success"), jobs, OWN_ID, None, "", True, NOW)]
         self.assertEqual(table, [("Build", "Passed", 52, ""), ("CI passed", "Passed", 2, "")])
 
     def test_failed_verdict_row(self):
-        table = finish.table(needs(build="failure"), [job("Build", "failure")], "CI passed", None, "", False, NOW)
+        table = finish.table(needs(build="failure"), [job("Build", "failure")], OWN_ID, None, "", False, NOW)
         self.assertEqual(tuple(table[-1]), ("CI passed", "Failed", None, ""))
 
     def test_api_unavailable_falls_back_to_needs(self):
         table = [tuple(row) for row in finish.table(
             needs(scope="success", test_unit="failure", test_api="skipped", deploy="cancelled"),
-            None, "CI passed", ["unit"], "reason", False, NOW)]
+            None, OWN_ID, ["unit"], "reason", False, NOW)]
         self.assertEqual(table, [
             ("scope", "Passed", None, ""),
             ("test-unit", "Failed", None, ""),
@@ -294,7 +308,7 @@ class TableTests(unittest.TestCase):
         ])
 
     def test_malformed_needs_and_no_api_still_give_the_verdict_row(self):
-        table = finish.table("{", None, "CI passed", None, "", False, NOW)
+        table = finish.table("{", None, OWN_ID, None, "", False, NOW)
         self.assertEqual([tuple(row) for row in table], [("CI passed", "Failed", None, "")])
 
 
@@ -407,7 +421,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("\\[Passed\\, safe to merge\\]\\(https\\:\\/\\/example\\.test\\)", cell)
 
     def test_hostile_job_name_is_escaped(self):
-        rows = finish.rows([job("[ok](https://example.test)")], "CI passed", None, "")
+        rows = finish.rows([job("[ok](https://example.test)")], OWN_ID, None, "")
         text = finish.render("t", "push", True, rows, "x", 1)
         self.assertIn("| Other\\: \\[ok\\]\\(https\\:\\/\\/example\\.test\\) |", text)
 
@@ -433,17 +447,53 @@ class FetchJobsTests(unittest.TestCase):
         for page in (1, 2, 3, 4):
             pages[JOBS_PATH % (REPO, RUN_ID, page)] = {
                 "total_count": 400, "jobs": [job("lint %d %d" % (page, i)) for i in range(100)]}
-        jobs = finish.fetch_jobs(REPO, RUN_ID, pages.__getitem__)
+        jobs, error = finish.fetch_jobs(REPO, RUN_ID, pages.__getitem__)
         self.assertEqual(len(jobs), 300)
+        self.assertIsNotNone(error)
 
     def test_stops_at_a_short_page(self):
         pages = {JOBS_PATH % (REPO, RUN_ID, 1): {"total_count": 2, "jobs": [job("Build"), job("Scope")]}}
-        self.assertEqual(len(finish.fetch_jobs(REPO, RUN_ID, pages.__getitem__)), 2)
+        jobs, error = finish.fetch_jobs(REPO, RUN_ID, pages.__getitem__)
+        self.assertEqual(len(jobs), 2)
+        self.assertIsNone(error)
 
-    def test_answer_without_a_list_raises(self):
+    def test_answer_without_a_list_reports_an_error(self):
         pages = {JOBS_PATH % (REPO, RUN_ID, 1): {"total_count": 2}}
-        with self.assertRaises(github_api.ApiError):
-            finish.fetch_jobs(REPO, RUN_ID, pages.__getitem__)
+        jobs, error = finish.fetch_jobs(REPO, RUN_ID, pages.__getitem__)
+        self.assertEqual(jobs, [])
+        self.assertIsNotNone(error)
+
+
+class ApiResponse(io.BytesIO):
+    status = 200
+
+
+def response(payload):
+    return ApiResponse(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+
+
+def http_error(status):
+    return urllib.error.HTTPError("https://api.example.test/jobs", status, "error", {}, io.BytesIO())
+
+
+class JobsTransport:
+    """Serve the supplied jobs responses through the real GitHub HTTP adapter."""
+
+    def __init__(self, *replies):
+        self.jobs_requests = []
+        self.replies = iter(replies)
+        self.fetch = github_api.make_fetch("", "https://api.example.test", self.open_url)
+
+    def open_url(self, request, timeout):
+        if request.selector == ARTIFACTS_PATH:
+            return response({"artifacts": ARTIFACTS})
+        self.jobs_requests.append(request.selector)
+        item = next(self.replies, None)
+        if item is None:
+            item = http_error(404)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 def settings(**overrides):
@@ -454,7 +504,7 @@ def settings(**overrides):
         "CI_FINISH_SEGMENTS": '["unit"]',
         "CI_FINISH_SCOPE_REASON": "1 file changed. Segments: unit",
         "CI_FINISH_TITLE": "",
-        "CI_FINISH_JOB_NAME": "CI passed",
+        "CI_FINISH_CHECK_RUN_ID": str(OWN_ID),
         "GITHUB_REPOSITORY": REPO,
         "GITHUB_RUN_ID": RUN_ID,
         "GITHUB_EVENT_NAME": "push",
@@ -467,8 +517,9 @@ JOBS = [
     job("Scope", started="2026-01-20T11:58:00Z", completed="2026-01-20T11:58:06Z"),
     job("Test: unit", started="2026-01-20T11:58:10Z", completed="2026-01-20T11:59:02Z"),
     job("Test: api", "skipped", started="2026-01-20T11:58:10Z", completed="2026-01-20T11:58:10Z"),
-    job("CI passed", None, started="2026-01-20T11:59:58Z"),
+    own_job(started="2026-01-20T11:59:58Z"),
 ]
+FULL_JOBS = JOBS[:2] + [job("Test: api"), JOBS[-1]]
 ARTIFACTS = [{"name": "ci-passed-full-" + "d" * 40, "created_at": "2026-01-15T08:00:00Z",
               "expired": False, "expires_at": "2026-02-14T08:00:00Z",
               "workflow_run": {"id": 99, "repository_id": 1, "head_repository_id": 1}}]
@@ -509,7 +560,7 @@ class FinishTests(unittest.TestCase):
                             scope="success", test_unit="success", test_api="success"))
 
     def test_control_full_pass_uploads_the_marker(self):
-        outcome = finish.finish(self.full(), FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+        outcome = finish.finish(self.full(), FakeFetch(FULL_JOBS, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, True)
         self.assertIs(outcome.upload, True)
         self.assertEqual(outcome.tree, TREE)
@@ -521,7 +572,7 @@ class FinishTests(unittest.TestCase):
         outcome = finish.finish(self.full(scope="success", test_unit="success", test_api="skipped"),
                                 FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, False)
-        self.assertEqual(outcome.problems, ["test-api was skipped on a full run"])
+        self.assertTrue(any("test-api" in problem for problem in outcome.problems))
         self.assertIs(outcome.upload, False)
         self.assertEqual(outcome.artifact, "")
 
@@ -531,7 +582,7 @@ class FinishTests(unittest.TestCase):
                        CI_FINISH_ALLOW_SKIPPED="test-workflows test-actions",
                        CI_FINISH_NEEDS=needs(scope="success", test_workflows="skipped", test_actions="skipped"))
         jobs = [job("Scope"), job("Test: workflows", "skipped"), job("Test: actions", "skipped"),
-                job("CI passed", None)]
+                own_job()]
         outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, False)
         self.assertIs(outcome.upload, False)
@@ -539,9 +590,41 @@ class FinishTests(unittest.TestCase):
     def test_full_run_with_an_always_allowed_skip_passes_and_uploads_the_marker(self):
         env = self.full(scope="success", test_unit="success", test_api="success", deploy="skipped")
         env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = "deploy"
-        outcome = finish.finish(env, FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+        jobs = FULL_JOBS + [job("deploy", "skipped")]
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, True)
         self.assertEqual(outcome.artifact, "ci-passed-full-" + TREE)
+
+    def test_full_run_rejects_a_skipped_nested_job(self):
+        jobs = [job("Scope"), job("checks / Publish docs, preview", "skipped"), own_job()]
+        env = self.full(scope="success", checks="success")
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        with self.subTest("verdict"):
+            self.assertIs(outcome.passed, False)
+        with self.subTest("diagnostic"):
+            self.assertTrue(any("checks / Publish docs, preview" in problem for problem in outcome.problems))
+        with self.subTest("marker"):
+            self.assertEqual((outcome.upload, outcome.artifact), (False, ""))
+
+    def test_full_run_allows_a_skip_by_exact_nested_name(self):
+        jobs = [job("Scope"), job("checks / Publish docs, preview", "skipped"), own_job()]
+        env = self.full(scope="success", checks="success")
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = '["checks / Publish docs, preview"]'
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+
+    def test_full_run_requires_the_caller_prefix_for_a_nested_skip(self):
+        jobs = [job("Scope"), job("checks / Publish docs, preview", "skipped"), own_job()]
+        env = self.full(scope="success", checks="success")
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = '["Publish docs, preview"]'
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertIs(outcome.passed, False)
+
+    def test_partial_run_ignores_a_nested_skip(self):
+        jobs = [job("Scope"), job("checks / Publish docs, preview", "skipped"), own_job()]
+        env = settings(CI_FINISH_NEEDS=needs(scope="success", checks="success"))
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.artifact), (True, ""))
 
     def test_full_run_that_failed_uploads_the_failed_marker(self):
         outcome = finish.finish(self.full(scope="success", test_unit="failure", test_api="success"),
@@ -577,7 +660,7 @@ class FinishTests(unittest.TestCase):
         self.assertEqual(outcome.artifact, "")
 
     def test_failed_job_missing_from_needs_fails_the_run(self):
-        jobs = [job("Scope"), job("Test: unit", "failure"), job("CI passed", None)]
+        jobs = [job("Scope"), job("Test: unit", "failure"), own_job()]
         outcome = finish.finish(settings(CI_FINISH_NEEDS=needs(scope="success")), FakeFetch(jobs, ARTIFACTS),
                                 good_tree, NOW)
         self.assertIs(outcome.passed, False)
@@ -589,7 +672,7 @@ class FinishTests(unittest.TestCase):
     def test_timed_out_and_cancelled_jobs_missing_from_needs_fail_the_run(self):
         for conclusion in ("timed_out", "cancelled"):
             with self.subTest(conclusion=conclusion):
-                jobs = [job("Scope"), job("lint", conclusion), job("CI passed", None)]
+                jobs = [job("Scope"), job("lint", conclusion), own_job()]
                 outcome = finish.finish(settings(CI_FINISH_NEEDS=needs(scope="success")),
                                         FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
                 self.assertIs(outcome.passed, False)
@@ -602,75 +685,406 @@ class FinishTests(unittest.TestCase):
             with self.subTest(status=status):
                 slow = {"name": "Unlisted and slow", "status": status, "conclusion": None,
                         "started_at": "2026-01-20T11:58:00Z", "completed_at": None, "steps": []}
-                jobs = [job("Scope"), job("Test: unit"), slow, job("CI passed", None)]
+                jobs = [job("Scope"), job("Test: unit"), slow, own_job()]
                 env = settings(CI_FINISH_NEEDS=needs(scope="success", test_unit="success"))
                 outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
                 self.assertIs(outcome.passed, False)
-                self.assertEqual(outcome.problems,
-                                 ["Unlisted and slow has not finished and needs does not wait for it"])
+                self.assertTrue(any("Unlisted and slow" in problem for problem in outcome.problems))
                 self.assertIn("| CI passed | \U0001F534 Failed |", outcome.summary)
 
     def test_unfinished_job_missing_from_needs_withholds_the_pass_marker(self):
-        jobs = [job("Scope"), job("Test: unit"), job("Test: api"), job("Package", None), job("CI passed", None)]
+        jobs = [job("Scope"), job("Test: unit"), job("Test: api"), job("Package", None), own_job()]
         outcome = finish.finish(self.full(), FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, False)
         self.assertIs(outcome.upload, False)
 
     def test_control_finished_passing_or_skipped_jobs_missing_from_needs_keep_the_pass(self):
-        jobs = [job("Scope"), job("lint"), job("docs", "skipped"), job("CI passed", None)]
+        jobs = [job("Scope"), job("lint"), job("docs", "skipped"), own_job()]
         outcome = finish.finish(settings(CI_FINISH_NEEDS=needs(scope="success")), FakeFetch(jobs, ARTIFACTS),
                                 good_tree, NOW)
         self.assertIs(outcome.passed, True)
         self.assertEqual(outcome.problems, [])
 
-    def test_unfinished_job_does_not_change_a_failed_verdict(self):
-        jobs = [job("Scope"), job("Test: unit", "failure"), job("Package", None), job("CI passed", None)]
+    def test_known_unfinished_job_is_audited_even_when_needs_failed(self):
+        jobs = [job("Scope"), job("Test: unit", "failure"), job("Package", None), own_job()]
         env = settings(CI_FINISH_NEEDS=needs(scope="success", test_unit="failure", test_api="skipped"))
         outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, False)
-        self.assertEqual(outcome.problems, ["test-unit: failure"])
+        self.assertIn("test-unit: failure", outcome.problems)
+        self.assertTrue(any("Package" in problem for problem in outcome.problems))
 
-    def test_finishing_job_whose_name_is_not_job_name_counts_as_unfinished(self):
-        jobs = [job("Scope"), job("Verdict", None)]
-        outcome = finish.finish(settings(CI_FINISH_NEEDS=needs(scope="success")), FakeFetch(jobs, ARTIFACTS),
-                                good_tree, NOW)
-        self.assertIs(outcome.passed, False)
-        self.assertEqual(outcome.problems, ["Verdict has not finished and needs does not wait for it"])
-
-    def test_control_finishing_job_named_by_job_name_is_left_out(self):
-        jobs = [job("Scope"), job("Verdict", None)]
+    def test_unrelated_running_job_is_not_exempted_by_the_configured_name(self):
+        jobs = [job("Scope"), job("Verdict", None), own_job()]
         env = settings(CI_FINISH_NEEDS=needs(scope="success"), CI_FINISH_JOB_NAME="Verdict")
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertIs(outcome.passed, False)
+        self.assertTrue(any("Verdict" in problem for problem in outcome.problems))
+
+    def test_control_finishing_job_with_a_custom_name_is_left_out_by_id(self):
+        jobs = [job("Scope"), own_job("Verdict")]
+        env = settings(CI_FINISH_NEEDS=needs(scope="success"))
         outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, True)
 
-    def test_own_job_is_never_counted_as_missing_from_needs(self):
-        jobs = [job("Scope"), {"name": "CI passed", "status": "completed", "conclusion": "failure",
-                               "started_at": None, "completed_at": None, "steps": []}]
-        outcome = finish.finish(settings(CI_FINISH_NEEDS=needs(scope="success")), FakeFetch(jobs, ARTIFACTS),
-                                good_tree, NOW)
-        self.assertIs(outcome.passed, True)
+    def test_control_finishing_row_needs_no_conclusion(self):
+        jobs = [job("Scope"), dict(own_job(), status="completed")]
+        env = self.full(scope="success")
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
 
     def test_jobs_api_error_keeps_the_needs_verdict(self):
         outcome = finish.finish(settings(CI_FINISH_NEEDS=needs(scope="success")), FakeFetch(), good_tree, NOW)
         self.assertIs(outcome.passed, True)
 
     def test_failed_full_run_missing_from_needs_uploads_no_failed_marker(self):
-        jobs = [job("Scope"), job("Test: unit", "failure"), job("CI passed", None)]
+        jobs = [job("Scope"), job("Test: unit", "failure"), own_job()]
         env = settings(CI_FINISH_FULL="true", CI_FINISH_NEEDS=needs(scope="success"))
         outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, False)
         self.assertIs(outcome.upload, False)
 
-    def test_full_pass_with_the_jobs_api_down_passes_and_uploads_no_pass_marker(self):
-        # A job missing from needs could have failed unseen, so the tree is not marked as tested.
+    @mock.patch("time.sleep")
+    def test_full_run_with_jobs_api_down_fails_and_uploads_no_pass_marker(self, _sleep):
         outcome = finish.finish(self.full(), FakeFetch(artifacts=ARTIFACTS), good_tree, NOW)
-        self.assertIs(outcome.passed, True)
-        self.assertIs(outcome.upload, False)
-        self.assertEqual(outcome.artifact, "")
-        self.assertIn("Jobs API not read, so no tested-tree marker is uploaded.", outcome.notes)
-        self.assertTrue(outcome.summary.endswith("Full suite last passed: 2026-01-15\n"))
+        self.assertEqual((outcome.passed, outcome.upload, outcome.artifact), (False, False, ""))
+        self.assertEqual(len(outcome.problems), 1)
+        self.assertIn("jobs-audit-incomplete", outcome.problems[0])
+        self.assertIn("HTTP 404", outcome.problems[0])
 
-    def test_full_failure_with_the_jobs_api_down_still_uploads_the_failed_marker(self):
+    @mock.patch("time.sleep")
+    def test_transient_jobs_request_can_recover_to_a_full_pass(self, _sleep):
+        for first_error in (http_error(429), http_error(503),
+                            urllib.error.URLError(ConnectionResetError()), TimeoutError()):
+            with self.subTest(error=first_error):
+                transport = JobsTransport(first_error, response({"total_count": len(FULL_JOBS), "jobs": FULL_JOBS}))
+                outcome = finish.finish(self.full(), transport.fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+                self.assertEqual(len(transport.jobs_requests), 2)
+
+    @mock.patch("time.sleep")
+    def test_permanent_jobs_response_is_refused_without_retry(self, _sleep):
+        for payload, status in ((http_error(401), 401), (http_error(403), 403), (http_error(404), 404),
+                                (response(b"<html>"), 200), (response([]), 200)):
+            with self.subTest(status=status):
+                transport = JobsTransport(payload)
+                outcome = finish.finish(self.full(), transport.fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (False, False))
+                self.assertEqual(len(transport.jobs_requests), 1)
+                self.assertIn("jobs-audit-incomplete", outcome.problems[0])
+                self.assertIn("HTTP %d" % status, outcome.problems[0])
+
+    def test_jobs_audit_budget_covers_a_later_response_body(self):
+        jobs = FULL_JOBS + [job("Check %d" % n) for n in range(97)]
+        entered_body = threading.Event()
+        release_body = threading.Event()
+        closed_body = threading.Event()
+
+        class SlowBody(ApiResponse):
+            def read(self):
+                entered_body.set()
+                release_body.wait(0.8)
+                return super().read()
+
+            def close(self):
+                super().close()
+                closed_body.set()
+
+        transport = JobsTransport(
+            response({"total_count": 101, "jobs": jobs[:100]}),
+            SlowBody(json.dumps({"total_count": 101, "jobs": jobs[100:]}).encode()))
+        try:
+            with mock.patch.object(finish, "AUDIT_BUDGET_SECONDS", 0.25, create=True):
+                outcome = finish.finish(self.full(), transport.fetch, good_tree, NOW)
+            self.assertTrue(entered_body.is_set())
+            self.assertEqual((outcome.passed, outcome.upload), (False, False))
+            self.assertIn("jobs-audit-incomplete", outcome.problems[0])
+            self.assertIn("0.25", outcome.problems[0])
+        finally:
+            release_body.set()
+            closed_body.wait(1)
+
+    @mock.patch("time.sleep")
+    def test_skip_found_before_a_later_page_error_is_preserved(self, _sleep):
+        name = "checks / Optional report"
+        jobs = FULL_JOBS + [job(name, "skipped")] + [job("Check %d" % n) for n in range(95)]
+        fetch = FakeFetch(jobs, ARTIFACTS)
+        fetch.answers[JOBS_PATH % (REPO, RUN_ID, 1)]["total_count"] = 101
+        outcome = finish.finish(self.full(), fetch, good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any(name in problem for problem in outcome.problems))
+        self.assertTrue(any("jobs-audit-incomplete" in problem for problem in outcome.problems))
+
+    def test_summary_error_does_not_erase_an_audit_failure(self):
+        name = "checks / Optional report"
+        jobs = FULL_JOBS + [job(name, "skipped"), dict(job("Unlabelled check"), steps=7)]
+        outcome = finish.finish(self.full(), FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any(name in problem for problem in outcome.problems))
+        self.assertIn("| CI passed | \U0001F534 Failed |", outcome.summary)
+
+    def test_full_run_fails_if_pagination_cap_leaves_unread_jobs(self):
+        fetch = FakeFetch(artifacts=ARTIFACTS)
+        jobs = FULL_JOBS + [job("Check %d" % n) for n in range(296)]
+        for page in range(1, 4):
+            fetch.answers[JOBS_PATH % (REPO, RUN_ID, page)] = {
+                "total_count": 301, "jobs": jobs[(page - 1) * 100:page * 100]}
+        outcome = finish.finish(self.full(), fetch, good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any("jobs-audit-incomplete" in problem for problem in outcome.problems))
+
+    def test_full_run_passes_after_reading_the_reported_count_across_pages(self):
+        jobs = FULL_JOBS + [job("Check %d" % n) for n in range(97)]
+        fetch = FakeFetch(jobs[:100], ARTIFACTS)
+        fetch.answers[JOBS_PATH % (REPO, RUN_ID, 1)]["total_count"] = 101
+        fetch.answers[JOBS_PATH % (REPO, RUN_ID, 2)] = {"total_count": 101, "jobs": jobs[100:]}
+        outcome = finish.finish(self.full(), fetch, good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+
+    def test_full_rerun_requires_the_first_attempt_job_names(self):
+        name = "checks / Optional report"
+        env = dict(self.full(), GITHUB_RUN_ATTEMPT="2", CI_FINISH_ALLOW_SKIPPED_ALWAYS=json.dumps([name]))
+        expected = FULL_JOBS + [job(name, "skipped")]
+        old_rows = [dict(row, id=500 + i) for i, row in enumerate(expected)]
+        for latest, passes in ((FULL_JOBS, False), (expected, True)):
+            with self.subTest(carried_forward=passes):
+                fetch = FakeFetch(latest, ARTIFACTS)
+                fetch.answers[FIRST_ATTEMPT_JOBS_PATH] = {"total_count": len(old_rows), "jobs": old_rows}
+                outcome = finish.finish(env, fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (passes, passes))
+                if not passes:
+                    self.assertTrue(any("jobs-audit-incomplete" in problem and name in problem
+                                        for problem in outcome.problems))
+
+    def test_full_rerun_refuses_an_unapproved_skip_that_was_carried_forward(self):
+        name = "checks / Optional report"
+        jobs = FULL_JOBS + [job(name, "skipped")]
+        fetch = FakeFetch(jobs, ARTIFACTS)
+        fetch.answers[FIRST_ATTEMPT_JOBS_PATH] = {"total_count": len(jobs), "jobs": jobs}
+        outcome = finish.finish(dict(self.full(), GITHUB_RUN_ATTEMPT="2"), fetch, good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_full_rerun_requires_a_readable_first_attempt(self):
+        for first_attempt in (None, {"total_count": 1, "jobs": [None]}):
+            with self.subTest(first_attempt=first_attempt):
+                fetch = FakeFetch(FULL_JOBS, ARTIFACTS)
+                if first_attempt is not None:
+                    fetch.answers[FIRST_ATTEMPT_JOBS_PATH] = first_attempt
+                outcome = finish.finish(dict(self.full(), GITHUB_RUN_ATTEMPT="2"), fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (False, False))
+                self.assertTrue(any("jobs-audit-incomplete" in problem for problem in outcome.problems))
+
+    def test_first_attempt_roster_is_only_read_on_full_reruns(self):
+        for env in (dict(self.full(), GITHUB_RUN_ATTEMPT="1"), settings(GITHUB_RUN_ATTEMPT="2")):
+            with self.subTest(full=env["CI_FINISH_FULL"]):
+                fetch = mock.Mock(side_effect=FakeFetch(FULL_JOBS, ARTIFACTS))
+                outcome = finish.finish(env, fetch, good_tree, NOW)
+                self.assertIs(outcome.passed, True)
+                self.assertNotIn(mock.call(FIRST_ATTEMPT_JOBS_PATH), fetch.call_args_list)
+
+    def test_full_run_fails_if_a_short_page_claims_more_jobs(self):
+        fetch = FakeFetch(FULL_JOBS, ARTIFACTS)
+        fetch.answers[JOBS_PATH % (REPO, RUN_ID, 1)]["total_count"] += 1
+        outcome = finish.finish(self.full(), fetch, good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any("jobs-audit-incomplete" in problem for problem in outcome.problems))
+
+    def test_full_run_fails_if_a_job_row_is_not_an_object(self):
+        outcome = finish.finish(self.full(), FakeFetch(FULL_JOBS + [None], ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any("jobs-audit-incomplete" in problem for problem in outcome.problems))
+
+    def test_full_run_fails_if_a_completed_job_has_no_conclusion(self):
+        jobs = FULL_JOBS + [dict(job("Final checks"), conclusion=None)]
+        outcome = finish.finish(self.full(), FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any("Final checks" in problem for problem in outcome.problems))
+
+    def test_nested_job_with_the_verdict_suffix_is_still_audited(self):
+        name = "checks / CI passed"
+        jobs = FULL_JOBS + [job(name, "failure")]
+        outcome = finish.finish(self.full(), FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_full_run_exempts_only_the_check_run_id_even_with_two_identical_names(self):
+        jobs = FULL_JOBS + [job("CI passed", None)]
+        outcome = finish.finish(self.full(), FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any("CI passed" in problem for problem in outcome.problems))
+
+    def test_full_run_requires_matching_finishing_identity_even_if_all_rows_completed(self):
+        jobs = FULL_JOBS[:-1] + [own_job(conclusion="success")]
+        for identity, passes in ((str(OWN_ID), True), ("999", False)):
+            with self.subTest(identity=identity):
+                env = self.full()
+                env["CI_FINISH_CHECK_RUN_ID"] = identity
+                outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (passes, passes))
+                if not passes:
+                    self.assertTrue(any("jobs-audit-incomplete" in problem for problem in outcome.problems))
+
+    def test_known_and_unknown_conclusions_follow_the_full_and_partial_rules(self):
+        # GitHub status check conclusions, plus a future value and an absent conclusion.
+        cases = (
+            ("success", True, True),
+            ("skipped", False, True),
+            ("neutral", False, True),
+            ("failure", False, False),
+            ("cancelled", False, False),
+            ("timed_out", False, False),
+            ("action_required", False, False),
+            ("stale", False, False),
+            ("startup_failure", False, False),
+            ("example-future-result", False, True),
+            (None, False, True),
+        )
+        name = "checks / Verify output"
+        for conclusion, full_passes, partial_passes in cases:
+            jobs = FULL_JOBS + [dict(job(name), conclusion=conclusion)]
+            for full, passes in ((True, full_passes), (False, partial_passes)):
+                with self.subTest(conclusion=conclusion, full=full):
+                    env = self.full() if full else settings(CI_FINISH_NEEDS=needs(scope="success"))
+                    outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+                    self.assertEqual((outcome.passed, outcome.upload), (passes, full and passes))
+                    if not passes:
+                        self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_partial_audit_keeps_a_returned_failure_when_the_count_is_inconsistent(self):
+        name = "checks / Verify output"
+        for conclusion, passes in (("success", True), ("failure", False)):
+            with self.subTest(conclusion=conclusion):
+                fetch = FakeFetch(FULL_JOBS + [job(name, conclusion)], ARTIFACTS)
+                fetch.answers[JOBS_PATH % (REPO, RUN_ID, 1)]["total_count"] += 1
+                outcome = finish.finish(settings(), fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (passes, False))
+                if not passes:
+                    self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_partial_audit_keeps_a_returned_failure_when_a_later_page_cannot_be_read(self):
+        name = "checks / Verify output"
+        jobs = FULL_JOBS + [job(name, "failure")] + [job("Check %d" % n) for n in range(95)]
+        fetch = FakeFetch(jobs, ARTIFACTS)
+        fetch.answers[JOBS_PATH % (REPO, RUN_ID, 1)]["total_count"] = 101
+        outcome = finish.finish(settings(), fetch, good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_partial_audit_does_not_guess_unfinished_job_identity(self):
+        for identity in (None, "", "invalid", "999", str(OWN_ID)):
+            with self.subTest(identity=identity):
+                env = settings()
+                if identity is None:
+                    del env["CI_FINISH_CHECK_RUN_ID"]
+                else:
+                    env["CI_FINISH_CHECK_RUN_ID"] = identity
+                outcome = finish.finish(env, FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.problems, outcome.upload), (True, [], False))
+
+    def test_completed_failure_still_counts_when_partial_identity_is_missing(self):
+        name = "checks / Verify output"
+        jobs = JOBS + [job(name, "failure")]
+        env = settings(CI_FINISH_CHECK_RUN_ID="")
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertEqual(len(outcome.problems), 1)
+        self.assertIn(name, outcome.problems[0])
+
+    def test_allow_list_decoder_recursion_writes_a_named_refusal(self):
+        text = "[" * 5000 + "]" * 5000
+        loads = json.loads
+
+        def decode(value):
+            # Older supported Python releases raise RecursionError on this input.
+            if value == text:
+                raise RecursionError("decoder depth")
+            return loads(value)
+
+        env = self.full()
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = text
+        fetch = FakeFetch(FULL_JOBS, ARTIFACTS)
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "outputs")
+            summary_path = os.path.join(tmp, "summary")
+            env.update(GITHUB_OUTPUT=output_path, GITHUB_STEP_SUMMARY=summary_path)
+            log = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(finish.json, "loads", decode), \
+                    mock.patch.object(github_api, "fetch_from_env", return_value=fetch), contextlib.redirect_stdout(log):
+                self.assertEqual(finish.main(), 0)
+            self.assertIn("[invalid-allow-list]", log.getvalue())
+            self.assertIn("allow-skipped-always", log.getvalue())
+            with open(output_path, encoding="utf-8") as output:
+                values = dict(line.strip().split("=", 1) for line in output)
+            self.assertEqual((values["passed"], values["upload"]), ("false", "false"))
+            with open(summary_path, encoding="utf-8") as summary:
+                self.assertIn("| CI passed |", summary.read())
+
+    def test_full_run_refuses_an_ambiguous_exact_skip_exception(self):
+        name = "checks / Optional report"
+        env = self.full()
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = json.dumps([name])
+        jobs = FULL_JOBS + [job(name, "skipped"), job(name)]
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_full_run_explains_a_missing_display_name_in_an_old_id_list(self):
+        env = self.full(scope="success", deploy="skipped")
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = "deploy"
+        outcome = finish.finish(env, FakeFetch(FULL_JOBS + [job("Publish docs", "skipped")], ARTIFACTS),
+                                good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any("Publish docs" in problem and "allow-skipped-always" in problem
+                            for problem in outcome.problems))
+
+    def test_full_run_accepts_both_id_and_exact_display_name(self):
+        env = self.full(scope="success", deploy="skipped")
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = '["deploy", "Publish docs"]'
+        outcome = finish.finish(env, FakeFetch(FULL_JOBS + [job("Publish docs", "skipped")], ARTIFACTS),
+                                good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+
+    def test_json_shaped_always_list_cannot_excuse_a_skipped_job(self):
+        env = self.full(scope="success", deploy="skipped")
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = '{"allow": deploy }'
+        outcome = finish.finish(env, FakeFetch(FULL_JOBS + [job("deploy", "skipped")], ARTIFACTS),
+                                good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any("allow-skipped-always" in problem for problem in outcome.problems))
+
+    def test_invalid_json_always_list_fails_even_when_no_job_skips(self):
+        for bad in ('["deploy"', '["deploy", 1]', '"deploy"', '{"allow": ["deploy"]}'):
+            with self.subTest(bad=bad):
+                env = self.full()
+                env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = bad
+                outcome = finish.finish(env, FakeFetch(FULL_JOBS, ARTIFACTS), good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (False, False))
+                self.assertTrue(any("allow-skipped-always" in problem for problem in outcome.problems))
+
+    def test_bad_token_in_legacy_always_list_invalidates_the_whole_input(self):
+        env = self.full(scope="success", deploy="skipped")
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = "deploy, report!"
+        outcome = finish.finish(env, FakeFetch(FULL_JOBS + [job("deploy", "skipped")], ARTIFACTS),
+                                good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+
+    def test_nested_name_is_rejected_in_the_segment_id_list(self):
+        env = settings(CI_FINISH_NEEDS=needs(scope="success", checks="skipped"),
+                       CI_FINISH_ALLOW_SKIPPED="checks / Optional report")
+        outcome = finish.finish(env, FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any("allow-skipped" in problem for problem in outcome.problems))
+
+    def test_segment_id_does_not_override_an_unrelated_api_name(self):
+        env = self.full(scope="success", report="success")
+        env["CI_FINISH_ALLOW_SKIPPED"] = "report"
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = '["report"]'
+        jobs = FULL_JOBS + [job("report", "skipped")]
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+
+    @mock.patch("time.sleep")
+    def test_full_failure_with_the_jobs_api_down_still_uploads_the_failed_marker(self, _sleep):
         outcome = finish.finish(self.full(scope="success", test_unit="failure", test_api="success"),
                                 FakeFetch(artifacts=ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, False)
@@ -682,11 +1096,11 @@ class FinishTests(unittest.TestCase):
                        CI_FINISH_ALLOW_SKIPPED_ALWAYS="test-workflows test-actions",
                        CI_FINISH_NEEDS=needs(scope="success", test_workflows="skipped", test_actions="skipped"))
         jobs = [job("Scope"), job("Test: workflows", "skipped"), job("Test: actions", "skipped"),
-                job("CI passed", None)]
+                own_job()]
         outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, False)
-        self.assertEqual(outcome.problems, ["test-workflows was skipped on a full run",
-                                            "test-actions was skipped on a full run"])
+        self.assertTrue(any("test-workflows" in problem for problem in outcome.problems))
+        self.assertTrue(any("test-actions" in problem for problem in outcome.problems))
         self.assertIs(outcome.upload, False)
 
     def test_full_input_other_than_true_or_false_fails(self):
@@ -709,7 +1123,8 @@ class FinishTests(unittest.TestCase):
             with self.subTest(value=value):
                 env = self.full()
                 env["CI_FINISH_FULL"] = value
-                outcome = finish.finish(env, FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+                jobs = FULL_JOBS if upload else JOBS
+                outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
                 self.assertIs(outcome.passed, True)
                 self.assertIs(outcome.upload, upload)
 
@@ -722,7 +1137,7 @@ class FinishTests(unittest.TestCase):
         self.assertIs(outcome.upload, False)
 
     def test_full_pass_without_a_tree_uploads_nothing_and_still_passes(self):
-        outcome = finish.finish(self.full(), FakeFetch(JOBS, ARTIFACTS), no_tree, NOW)
+        outcome = finish.finish(self.full(), FakeFetch(FULL_JOBS, ARTIFACTS), no_tree, NOW)
         self.assertIs(outcome.passed, True)
         self.assertIs(outcome.upload, False)
 
@@ -754,33 +1169,6 @@ class FinishTests(unittest.TestCase):
     def test_malformed_segments_give_no_detail(self):
         outcome = finish.finish(settings(CI_FINISH_SEGMENTS="unit"), FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
         self.assertIn("| Test\\: api | \u26AA Skipped |  |  |\n", outcome.summary)
-
-
-class PlainOutcomeTests(unittest.TestCase):
-    def test_keeps_a_failure_and_writes_a_summary(self):
-        env = settings(CI_FINISH_NEEDS=needs(scope="success", test_unit="failure"))
-        outcome = finish.plain_outcome(env, "note", good_tree)
-        self.assertIs(outcome.passed, False)
-        self.assertIs(outcome.upload, False)
-        self.assertIn("| test\\-unit | \U0001F534 Failed |  |  |\n", outcome.summary)
-
-    def test_full_failure_still_uploads_the_failed_marker(self):
-        env = settings(CI_FINISH_FULL="true", CI_FINISH_NEEDS=needs(scope="success", test_unit="failure"))
-        outcome = finish.plain_outcome(env, "note", good_tree)
-        self.assertIs(outcome.passed, False)
-        self.assertEqual(outcome.artifact, "ci-failed-full-" + TREE)
-
-    def test_full_input_other_than_true_or_false_fails(self):
-        outcome = finish.plain_outcome(settings(CI_FINISH_FULL="1"), "note", good_tree)
-        self.assertIs(outcome.passed, False)
-        self.assertEqual(outcome.problems, ["full input is not true or false"])
-
-    def test_control_keeps_a_pass_and_uploads_nothing(self):
-        env = settings(CI_FINISH_FULL="true", CI_FINISH_ALLOW_SKIPPED="",
-                       CI_FINISH_NEEDS=needs(scope="success", test_unit="success"))
-        outcome = finish.plain_outcome(env, "note", good_tree)
-        self.assertIs(outcome.passed, True)
-        self.assertIs(outcome.upload, False)
 
 
 class ScriptProcessTests(unittest.TestCase):

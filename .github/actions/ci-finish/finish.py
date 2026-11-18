@@ -4,12 +4,12 @@
 The verdict starts from the calling job's `needs`: a job that failed or was cancelled fails the run, and
 input that is not a JSON object naming at least one job fails it, as does a `full` input other than true or
 false. A skipped job fails it unless its id is in the segment list on a run that is not full, or in the
-always-allowed list and not the segment list, since a full run runs every segment. The jobs API can then only
-turn a pass into a fail: a job of this run other than the finishing one that has not finished, or that
-finished as failed, timed out or cancelled, fails the run. `needs` reports neither, so the job is missing
-from `needs` or allowed to fail. A job that needs the finishing job is not listed by the API while the
-finishing job runs, so it is never counted. An API error leaves the verdict from `needs` as it is. The API
-otherwise supplies the summary's stage names and times, and the artifacts API its footer.
+always-allowed list and not the segment list. Every available API row is audited. A full run requires
+every other job to complete with success or an explicitly allowed skip. Unreadable data fails a full run.
+On a partial run, only known failures and identifiable unfinished jobs add to the needs verdict. The
+current check run ID identifies the finishing job. Without a match, a partial run cannot tell which
+unfinished row is its own, but still counts completed failures. A full re-run must account for every
+job name from the first attempt. Summary fallback preserves the verdict.
 
 A full run that passed prepares the ci-passed-full-TREE marker, but only when the jobs API was read, since
 otherwise a job missing from `needs` could have failed unseen. A full run that failed with at least one job
@@ -17,8 +17,9 @@ in `needs` reporting `failure` prepares ci-failed-full-TREE instead, so ci-teste
 of the tree failed. A run whose only problems are cancelled or wrongly skipped jobs prepares neither.
 
 Inputs come from the environment: CI_FINISH_NEEDS, CI_FINISH_ALLOW_SKIPPED, CI_FINISH_ALLOW_SKIPPED_ALWAYS,
-CI_FINISH_FULL, CI_FINISH_SEGMENTS, CI_FINISH_SCOPE_REASON, CI_FINISH_TITLE, CI_FINISH_JOB_NAME,
-CI_API_TOKEN and the runner's GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_EVENT_NAME, GITHUB_SERVER_URL,
+CI_FINISH_FULL, CI_FINISH_SEGMENTS, CI_FINISH_SCOPE_REASON, CI_FINISH_TITLE, CI_FINISH_CHECK_RUN_ID,
+CI_API_TOKEN and the runner's GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_EVENT_NAME,
+GITHUB_SERVER_URL,
 GITHUB_API_URL, GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and RUNNER_TEMP. The summary is appended to
 GITHUB_STEP_SUMMARY and the outputs passed, upload, tree, artifact and marker to GITHUB_OUTPUT. The script
 itself always exits 0, so the action's upload and verdict steps still run. Python 3.8 or later, standard
@@ -27,10 +28,14 @@ library only.
 import datetime
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from collections import Counter
 from typing import Any, Callable, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "_shared"))
@@ -39,14 +44,18 @@ import github_api  # noqa: E402
 DEFAULT_JOB_NAME = "CI passed"
 MARKER_PREFIX = "ci-passed-full-"
 FAILED_MARKER_PREFIX = "ci-failed-full-"
-# Job conclusions from the API that fail the run when `needs` does not report the job.
-FAILING_CONCLUSIONS = ("failure", "timed_out", "cancelled")
+# Known API conclusions that constitute a failure even on a partial run.
+FAILING_CONCLUSIONS = ("failure", "timed_out", "cancelled", "action_required", "stale", "startup_failure")
 NOT_AN_OBJECT = "needs input is not a JSON object"
 BAD_FULL = "full input is not true or false"
 NOT_AFFECTED = "Not affected by this change"
 JOBS_PER_PAGE = 100
 JOB_PAGES = 3
+JOBS_ATTEMPTS = 3
+JOBS_RETRY_SECONDS = 1
+AUDIT_BUDGET_SECONDS = 45
 
+_JOB_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 _STAGE = re.compile(r"(?:Scope|Build|Build and test|Test|Package|CI passed|(?:Test|Package|Deploy): \S.*)")
 _TREE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
@@ -95,9 +104,18 @@ def parse_needs(needs):
     return needs if isinstance(needs, dict) else None
 
 
-def parse_allowed(text):
-    # type: (str) -> Set[str]
-    return {name for name in re.split(r"[\s,]+", text or "") if name}
+def parse_allowed(text, api_names=False):
+    # type: (str, bool) -> Optional[Set[str]]
+    """Read an entire allow list or return None. Only the always list takes API names."""
+    if text.lstrip().startswith(("[", "{", '"')):
+        values = _string_list(text)
+        if values is None:
+            return None
+        if api_names:
+            return set(values)
+    else:
+        values = [name for name in re.split(r"[\s,]+", text) if name]
+    return set(values) if all(_JOB_ID.fullmatch(name) for name in values) else None
 
 
 def verdict(needs, allowed, always=(), full=False):
@@ -133,23 +151,65 @@ def any_failure(needs):
     return any(isinstance(entry, dict) and entry.get("result") == "failure" for entry in parsed.values())
 
 
-def unreported_problems(jobs, own_job_name):
-    # type: (Sequence[dict], str) -> List[str]
-    """A problem for each job of this run, other than the finishing one, that has not finished, or that
-    finished as failed, timed out or cancelled. Called only when needs reported a pass, so needs does not
-    report any of these: the job is missing from needs or is allowed to fail. A job that needs the finishing
-    job is not listed while it runs, so a listed job that has not finished is one the verdict does not wait
-    for."""
+def job_names(jobs):
+    return Counter(job["name"] for job in jobs
+                   if isinstance(job, dict) and isinstance(job.get("name"), str) and job["name"])
+
+
+def audit_jobs(jobs, own_id, full, allowed_names):
+    # type: (Sequence[Any], Optional[int], bool, Set[str]) -> Tuple[List[str], List[str], Optional[int]]
+    """Audit all available rows before deciding whether the jobs list was complete."""
+    ids = Counter(job["id"] for job in jobs if isinstance(job, dict) and type(job.get("id")) is int)
+    names = job_names(jobs)
+    if ids[own_id] != 1:
+        own_id = None
+
     problems = []
-    for job in jobs:
-        if not isinstance(job, dict) or _is_own(job.get("name"), own_job_name):
+    incomplete = []
+    if full and own_id is None:
+        incomplete.append("the finishing job's check run ID could not be uniquely matched in the jobs API")
+    for index, job in enumerate(jobs, 1):
+        label = "jobs API row %d" % index
+        if not isinstance(job, dict):
+            if full:
+                incomplete.append("%s is not an object" % label)
             continue
-        if job.get("status") != "completed":
-            problems.append("%s has not finished and needs does not wait for it" % job.get("name"))
-        elif job.get("conclusion") in FAILING_CONCLUSIONS:
-            problems.append("%s: %s, not reported by needs (missing from needs or allowed to fail)"
-                            % (job.get("name"), job.get("conclusion")))
-    return problems
+        job_id, name = job.get("id"), job.get("name")
+        status, conclusion = job.get("status"), job.get("conclusion")
+        valid_id = type(job_id) is int and job_id > 0
+        if valid_id and job_id == own_id:
+            continue
+        if isinstance(name, str) and name:
+            label = name
+        elif full:
+            incomplete.append("%s has no usable API name" % label)
+        if full and (not valid_id or ids[job_id] != 1):
+            incomplete.append("%s has an invalid or duplicate ID" % label)
+
+        if status != "completed":
+            if full or own_id is not None:
+                problems.append("%s has not finished and needs does not wait for it" % label)
+            continue
+
+        if not full:
+            if conclusion in FAILING_CONCLUSIONS:
+                problems.append("%s: %s, not reported by needs (missing from needs or allowed to fail)"
+                                % (label, conclusion))
+            continue
+
+        if conclusion == "success":
+            continue
+        if conclusion == "skipped":
+            if not isinstance(name, str) or name not in allowed_names:
+                problems.append("%s was skipped on a full run. List its exact API name in allow-skipped-always "
+                                "only if the job does not test." % label)
+            elif names[name] != 1:
+                incomplete.append("skip exception %s matches more than one API job" % label)
+        elif conclusion in FAILING_CONCLUSIONS or conclusion == "neutral":
+            problems.append("%s concluded %s on a full run" % (label, conclusion))
+        else:
+            incomplete.append("%s has an unusable conclusion %r" % (label, conclusion))
+    return problems, incomplete, own_id
 
 
 def stage_of(name):
@@ -165,7 +225,6 @@ def stage_of(name):
 def _word(conclusion):
     if conclusion is None:
         return "Running"
-    # Other API conclusions such as timed_out are shown as failures. They never reach the verdict.
     return WORDS.get(conclusion, "Failed")
 
 
@@ -193,17 +252,13 @@ def _row(stage, item, segments, scope_reason):
     return Row(stage, word, _seconds(item, word), _detail(stage, word, segments, scope_reason))
 
 
-def _is_own(name, own_job_name):
-    return name == own_job_name or (isinstance(name, str) and name.endswith(" / " + own_job_name))
-
-
-def rows(jobs, own_job_name, segments, scope_reason):
-    # type: (Sequence[dict], str, Optional[Sequence[str]], str) -> List[Row]
+def rows(jobs, own_id, segments, scope_reason):
+    # type: (Sequence[dict], Optional[int], Optional[Sequence[str]], str) -> List[Row]
     """One row per stage-named job, else per stage-named step, else one Other row. The job running this
     action is left out, since its row is the verdict and comes last."""
     table = []
     for job in jobs:
-        if not isinstance(job, dict) or _is_own(job.get("name"), own_job_name):
+        if not isinstance(job, dict) or (own_id is not None and job.get("id") == own_id):
             continue
         stage = stage_of(job.get("name"))
         if stage:
@@ -225,20 +280,22 @@ def needs_rows(needs):
     table = []
     for job_id, entry in parsed.items():
         result = entry.get("result") if isinstance(entry, dict) else None
-        table.append(Row(str(job_id), WORDS.get(result, "Failed"), None, ""))
+        table.append(Row(str(job_id), WORDS.get(result, "Failed") if isinstance(result, str) else "Failed",
+                         None, ""))
     return table
 
 
-def table(needs, jobs, own_job_name, segments, scope_reason, passed, now):
-    # type: (Any, Optional[Sequence[dict]], str, Optional[Sequence[str]], str, bool, datetime.datetime)
+def table(needs, jobs, own_id, segments, scope_reason, passed, now):
+    # type: (Any, Optional[Sequence[dict]], Optional[int], Optional[Sequence[str]], str, bool, datetime.datetime)
     # -> List[Row]
     """Every row of the summary. jobs is None when the API could not be read."""
     if jobs is None:
         body = needs_rows(needs)
         own = None
     else:
-        body = rows(jobs, own_job_name, segments, scope_reason)
-        own = next((j for j in jobs if isinstance(j, dict) and _is_own(j.get("name"), own_job_name)), None)
+        body = rows(jobs, own_id, segments, scope_reason)
+        own = next((j for j in jobs if own_id is not None and isinstance(j, dict)
+                    and j.get("id") == own_id), None)
     started = github_api.parse_time(own.get("started_at")) if own else None
     seconds = max(0.0, (now - started).total_seconds()) if started else None
     return body + [Row(DEFAULT_JOB_NAME, "Passed" if passed else "Failed", seconds, "")]
@@ -299,26 +356,105 @@ def render(title, event, passed, rows, footer, seconds=None):
     return "\n".join(out)
 
 
-def fetch_jobs(repo, run_id, fetch):
-    # type: (str, str, github_api.Fetch) -> List[dict]
-    """The run's jobs, up to JOB_PAGES pages. A longer run keeps the rows it has. Raises ApiError."""
-    jobs = []  # type: List[dict]
+class AuditFetch:
+    """Share one deadline across job pages, retries and the optional artifact footer."""
+
+    def __init__(self, fetch, attempts):
+        self.fetch = fetch
+        self.attempts = attempts
+        self.deadline = time.monotonic() + AUDIT_BUDGET_SECONDS
+
+    def _timeout(self):
+        return github_api.ApiError("API audit exceeded its %g-second budget" % AUDIT_BUDGET_SECONDS)
+
+    def _remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._timeout()
+        return remaining
+
+    def request(self, path):
+        self._remaining()
+        result = queue.Queue(maxsize=1)
+
+        def read():
+            try:
+                result.put((self.fetch(path), None))
+            except Exception as error:  # noqa: BLE001 The caller handles the API failure.
+                result.put((None, error))
+
+        # urllib's socket timeout is not a total body timeout. The short-lived action
+        # can return its verdict even if a network read is still blocked.
+        threading.Thread(target=read, daemon=True).start()
+        try:
+            answer, error = result.get(timeout=self._remaining())
+        except queue.Empty:
+            raise self._timeout()
+        if error is not None:
+            raise error
+        return answer
+
+    def jobs(self, path):
+        for attempt in range(self.attempts):
+            try:
+                return self.request(path)
+            except github_api.ApiError as error:
+                if not error.retryable or attempt == self.attempts - 1:
+                    raise
+                time.sleep(min(JOBS_RETRY_SECONDS, self._remaining()))
+
+
+def fetch_jobs(repo, run_id, fetch, attempt=None):
+    # type: (str, str, github_api.Fetch, Optional[int]) -> Tuple[List[Any], Optional[str]]
+    """Return the rows read and the reason if they do not cover the reported count."""
+    jobs = []  # type: List[Any]
+    total = None
+    run_path = "/repos/%s/actions/runs/%s" % (repo, run_id)
+    if attempt is not None:
+        run_path += "/attempts/%d" % attempt
     for page in range(1, JOB_PAGES + 1):
-        answer = fetch("/repos/%s/actions/runs/%s/jobs?per_page=%d&page=%d"
-                       % (repo, run_id, JOBS_PER_PAGE, page))
-        batch = answer.get("jobs")
+        path = "%s/jobs?per_page=%d&page=%d" % (run_path, JOBS_PER_PAGE, page)
+        try:
+            answer = fetch(path)
+        except Exception as error:  # noqa: BLE001 The verdict still needs the earlier pages.
+            return jobs, "jobs API page %d could not be read: %s" % (page, error)
+        batch = answer.get("jobs") if isinstance(answer, dict) else None
+        count = answer.get("total_count") if isinstance(answer, dict) else None
         if not isinstance(batch, list):
-            raise github_api.ApiError("jobs answer holds no job list")
+            return jobs, "jobs API page %d holds no job list" % page
+        previous = len(jobs)
         jobs.extend(batch)
-        if len(batch) < JOBS_PER_PAGE:
-            break
-    return jobs
+        if type(count) is not int or count < 0:
+            return jobs, "jobs API page %d has no usable total count" % page
+        if total is not None and count != total:
+            return jobs, "jobs API total count changed on page %d" % page
+        total = count
+        if len(batch) != min(JOBS_PER_PAGE, total - previous):
+            return jobs, "jobs API page %d has %d jobs, inconsistent with the reported count of %d" % (
+                page, len(batch), total)
+        if len(jobs) == total:
+            return jobs, None
+    return jobs, "jobs API page limit reached after %d of %d jobs" % (len(jobs), total)
 
 
-def _segments(text):
+def first_attempt_problem(repo, run_id, fetch, jobs):
+    """GitHub can give carried-forward jobs new IDs. Compare names and their multiplicities."""
+    first_jobs, error = fetch_jobs(repo, run_id, fetch, attempt=1)
+    if error:
+        return "cannot read the first attempt's jobs: %s" % error
+    first_names = job_names(first_jobs)
+    if sum(first_names.values()) != len(first_jobs):
+        return "the first attempt's jobs include a row without a usable name"
+    missing = first_names - job_names(jobs)
+    if missing:
+        return "the current jobs API list omits jobs from the first attempt: %s" % ", ".join(sorted(missing))
+    return None
+
+
+def _string_list(text):
     try:
         value = json.loads(text) if text else None
-    except ValueError:
+    except Exception:  # noqa: BLE001 Any decoder failure makes the whole input unusable.
         return None
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return value
@@ -337,20 +473,19 @@ def parse_full(text):
     return {"true": True, "false": False}.get(value)
 
 
-def _full(env):
-    # Only a full run that says so is marked. An unreadable value fails the verdict anyway.
-    return parse_full(env.get("CI_FINISH_FULL")) is True
-
-
-def _verdict_from(env):
-    full = parse_full(env.get("CI_FINISH_FULL"))
-    passed, problems = verdict(
-        env.get("CI_FINISH_NEEDS", ""), parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED", "")),
-        parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED_ALWAYS", "")), full is True)
+def _verdict_from(env, full):
+    allowed = parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED", ""))
+    always = parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED_ALWAYS", ""), api_names=True)
+    problems = []
     if full is None:
-        # Read as partial, `allow-skipped` would excuse every segment skip, so the run cannot pass.
-        return False, [BAD_FULL] + problems
-    return passed, problems
+        problems.append(BAD_FULL)
+    if allowed is None:
+        problems.append("[invalid-allow-list] Invalid allow-skipped input. Use direct job IDs.")
+    if always is None:
+        problems.append("[invalid-allow-list] Invalid allow-skipped-always input. "
+                        "Use job IDs or a JSON array of strings.")
+    _, needs_problems = verdict(env.get("CI_FINISH_NEEDS", ""), allowed or (), always or (), full is True)
+    return problems + needs_problems, always or set()
 
 
 def marker_for(full, passed, needs, tree_of, jobs_read=True):
@@ -360,15 +495,18 @@ def marker_for(full, passed, needs, tree_of, jobs_read=True):
     if not full:
         return "", "", []
     if passed and not jobs_read:
-        return "", "", ["Jobs API not read, so no tested-tree marker is uploaded."]
+        return "", "", ["Jobs audit or summary unavailable, so no tested-tree marker is uploaded."]
     if passed:
         prefix = MARKER_PREFIX
     elif any_failure(needs):
         prefix = FAILED_MARKER_PREFIX
     else:
         return "", "", []
-    tree = tree_of() or ""
-    if not _TREE.fullmatch(tree):
+    try:
+        tree = tree_of()
+    except Exception:  # noqa: BLE001 A tree lookup failure must preserve the verdict.
+        tree = None
+    if not isinstance(tree, str) or not _TREE.fullmatch(tree):
         return "", "", ["Cannot read the tree of HEAD, so no tested-tree marker is uploaded."]
     return prefix + tree, tree, []
 
@@ -376,52 +514,65 @@ def marker_for(full, passed, needs, tree_of, jobs_read=True):
 def finish(env, fetch, tree_of, now):
     # type: (dict, github_api.Fetch, Callable[[], Optional[str]], datetime.datetime) -> Outcome
     needs = env.get("CI_FINISH_NEEDS", "")
-    passed, problems = _verdict_from(env)
-    full = _full(env)
+    full_input = parse_full(env.get("CI_FINISH_FULL"))
+    full = full_input is True
+    problems, allowed_names = _verdict_from(env, full_input)
     repo = env.get("GITHUB_REPOSITORY", "")
-    own_job_name = env.get("CI_FINISH_JOB_NAME") or DEFAULT_JOB_NAME
+    check_run_id = env.get("CI_FINISH_CHECK_RUN_ID", "")
+    own_id = int(check_run_id) if re.fullmatch(r"[1-9][0-9]{0,19}", check_run_id) else None
+    api = AuditFetch(fetch, JOBS_ATTEMPTS if full else 1)
+    run_id = env.get("GITHUB_RUN_ID", "")
+    jobs, read_error = fetch_jobs(repo, run_id, api.jobs)
+    job_problems, incomplete, own_id = audit_jobs(jobs, own_id, full, allowed_names)
+    problems.extend(job_problems)
+    attempt = env.get("GITHUB_RUN_ATTEMPT", "1")
+    if full and attempt != "1":
+        if not re.fullmatch(r"[1-9][0-9]*", attempt):
+            incomplete.append("GITHUB_RUN_ATTEMPT is not a positive integer")
+        else:
+            attempt_error = first_attempt_problem(repo, run_id, api.jobs, jobs)
+            if attempt_error:
+                incomplete.append(attempt_error)
     notes = []
-    try:
-        jobs = fetch_jobs(repo, env.get("GITHUB_RUN_ID", ""), fetch)  # type: Optional[List[dict]]
-    except Exception as error:  # noqa: BLE001 The summary falls back to needs. The verdict stays as needs set it.
-        notes.append("Jobs API unavailable, summary built from needs: %s" % error)
-        jobs = None
-    if passed and jobs is not None:
-        # The API can only turn a pass into a fail, never the reverse.
-        unreported = unreported_problems(jobs, own_job_name)
-        if unreported:
-            passed, problems = False, problems + unreported
-    all_rows = table(needs, jobs, own_job_name,
-                     _segments(env.get("CI_FINISH_SEGMENTS", "")), env.get("CI_FINISH_SCOPE_REASON", ""),
-                     passed, now)
-    starts = [github_api.parse_time(j.get("started_at")) for j in jobs or [] if isinstance(j, dict)]
-    starts = [s for s in starts if s is not None]
-    seconds = max(0.0, (now - min(starts)).total_seconds()) if starts else None
-    if full and passed and jobs is not None:
+    if full and (read_error or incomplete):
+        cause = ". ".join(([read_error] if read_error else []) + incomplete)
+        problems.append("[jobs-audit-incomplete] %s. Re-run this job." % cause)
+    if read_error:
+        notes.append("Jobs API unavailable, summary built from needs: %s" % read_error)
+    if own_id is not None:
+        notes.append("Finishing job check run ID matched jobs API: %d" % own_id)
+    elif not full and jobs:
+        notes.append("Finishing job identity unavailable, unfinished jobs omitted from the verdict.")
+    passed = not problems
+    jobs_read = read_error is None and not incomplete
+    footer = "not recorded"
+    if full and passed and jobs_read:
         footer = "this run"
     else:
         try:
-            answer = fetch("/repos/%s/actions/artifacts?per_page=100" % repo)
+            answer = api.request("/repos/%s/actions/artifacts?per_page=100" % repo)
             artifacts = answer.get("artifacts")
             footer = last_full_pass(artifacts if isinstance(artifacts, list) else [], now)
         except Exception as error:  # noqa: BLE001 Only the footer depends on this.
             notes.append("Artifacts API unavailable: %s" % error)
-            footer = "not recorded"
-    summary = render(_title(env), env.get("GITHUB_EVENT_NAME", ""), passed, all_rows, footer, seconds)
-    artifact, tree, marker_notes = marker_for(full, passed, needs, tree_of, jobs is not None)
+
+    title, event = _title(env), env.get("GITHUB_EVENT_NAME", "")
+    try:
+        all_rows = table(needs, jobs if jobs_read else None, own_id,
+                         _string_list(env.get("CI_FINISH_SEGMENTS", "")), env.get("CI_FINISH_SCOPE_REASON", ""),
+                         passed, now)
+        starts = [github_api.parse_time(j.get("started_at")) for j in jobs if isinstance(j, dict)] if jobs_read else []
+        starts = [s for s in starts if s is not None]
+        seconds = max(0.0, (now - min(starts)).total_seconds()) if starts else None
+        summary = render(title, event, passed, all_rows, footer, seconds)
+    except Exception as error:  # noqa: BLE001 Keep the audited verdict and withhold any pass marker.
+        notes.append("Summary detail failed: " + type(error).__name__)
+        jobs_read = False
+        plain = table(needs, None, own_id, None, "", passed, now)
+        summary = render(title, event, passed, plain, "not recorded")
+
+    artifact, tree, marker_notes = marker_for(full, passed, needs, tree_of, jobs_read)
     return Outcome(passed, problems, summary, bool(artifact), tree, notes + marker_notes, artifact)
-
-
-def plain_outcome(env, note, tree_of):
-    # type: (dict, str, Callable[[], Optional[str]]) -> Outcome
-    """The verdict with a summary built from needs alone, for when building the full summary crashed. It
-    never prepares a pass marker, since the jobs API check did not run, but still prepares a failed one."""
-    passed, problems = _verdict_from(env)
-    needs = env.get("CI_FINISH_NEEDS", "")
-    plain = needs_rows(needs) + [Row(DEFAULT_JOB_NAME, "Passed" if passed else "Failed", None, "")]
-    summary = render(_title(env), env.get("GITHUB_EVENT_NAME", ""), passed, plain, "not recorded")
-    artifact, tree, notes = marker_for(_full(env), passed, needs, tree_of, jobs_read=False)
-    return Outcome(passed, problems, summary, bool(artifact), tree, [note] + notes, artifact)
 
 
 def head_tree():
@@ -452,11 +603,8 @@ def write_marker(env, tree):
 def main():
     # type: () -> int
     env = dict(os.environ)
-    try:
-        outcome = finish(env, github_api.fetch_from_env(env), head_tree,
-                         datetime.datetime.now(datetime.timezone.utc))
-    except Exception as error:  # noqa: BLE001 Keep the verdict and a plain summary whatever went wrong.
-        outcome = plain_outcome(env, "Summary detail failed: " + type(error).__name__, head_tree)
+    outcome = finish(env, github_api.fetch_from_env(env), head_tree,
+                     datetime.datetime.now(datetime.timezone.utc))
     for note in outcome.notes:
         print(note)
     for problem in outcome.problems:
