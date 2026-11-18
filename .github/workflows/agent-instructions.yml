@@ -1,6 +1,7 @@
 name: agent-instructions
 on:
   push:
+    branches: [main]
     paths:
       - 'AGENTS.md'
       - 'AGENTS.override.md'
@@ -16,12 +17,19 @@ on:
       - 'scripts/check-agent-instructions.sh'
       - 'scripts/tests/check-agent-instructions.test.sh'
       - '.github/workflows/agent-instructions.yml'
+concurrency:
+  group: agent-instructions-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
   instruction-budget:
+    name: 'Test: instructions'
     runs-on: ubuntu-26.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: sh scripts/check-agent-instructions.sh --tree
       - run: sh scripts/tests/check-agent-instructions.test.sh
