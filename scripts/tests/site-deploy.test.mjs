@@ -2,13 +2,13 @@
 // wiring that keeps the deploy token and the production environment in the deploy job only.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
-import { jobBlock, stepScript } from './workflow-steps.mjs'
+import { jobBlock, stepBlock, stepScript } from './workflow-steps.mjs'
 
 const folders = []
 const sha = '1234567890abcdef1234567890abcdef12345678'
@@ -16,6 +16,7 @@ const newerSha = 'abcdef1234567890abcdef1234567890abcdef12'
 const olderSha = '0987654321fedcba0987654321fedcba09876543'
 const repository = 'APKiwiOrg/site'
 const selectStep = 'Select the green main SHA to deploy'
+const snapshotStep = 'Capture catalog snapshot'
 const workflowPath = fileURLToPath(new URL('../../.github/workflows/site-deploy.yml', import.meta.url))
 const readmePath = fileURLToPath(new URL('../../README.md', import.meta.url))
 const workflow = () => readFileSync(workflowPath, 'utf8')
@@ -324,6 +325,50 @@ describe('the build never sees the deploy token', () => {
     assert.match(build, /upload-artifact@[a-f0-9]{40} # v[\d.]+\n {8}with:\n {10}name: site\n {10}path: \$\{\{ needs\.config\.outputs\.app-location \}\}\n {10}if-no-files-found: error\n {10}retention-days: 1\n {10}overwrite: true\n/u)
   })
 
+  test('catalog snapshot uses the selected deployment and precedes both build steps', () => {
+    const snapshot = stepBlock(workflowPath, 'build', snapshotStep)
+    const condition = snapshot.match(/^ {8}if: (.+)$/mu)?.[1]
+    assert.ok(condition, 'the snapshot has a capability condition')
+    for (const capability of ['true', 'false', undefined]) {
+      assert.equal(expression(condition, {
+        needs: { config: { outputs: { 'has-catalog': capability } } },
+      }), capability === 'true')
+    }
+
+    assert.match(snapshot, /^ {10}SITE_ORIGIN: \$\{\{ inputs\.site-origin \}\}$/mu)
+    assert.match(snapshot, /^ {10}DEPLOYED_SHA: \$\{\{ needs\.guard\.outputs\.sha \}\}$/mu)
+    assert.match(snapshot, /^ {10}CATALOG_DEPLOY: '1'$/mu)
+    assert.doesNotMatch(stepScript(workflowPath, 'build', snapshotStep), /\$\{\{/u)
+
+    const build = job('build')
+    const position = build.indexOf(snapshot)
+    assert.ok(build.indexOf('actions/checkout@') < build.indexOf('actions/setup-node@'))
+    assert.ok(build.indexOf('actions/setup-node@') < position)
+    for (const name of ['Build site', 'Build site with analytics']) {
+      assert.ok(position < build.indexOf('- name: ' + name + '\n'))
+    }
+  })
+
+  for (const exitCode of [0, 1]) {
+    test('catalog snapshot ' + (exitCode ? 'fails the build step on error' : 'records its source in the step summary'), () => {
+      const folder = mkdtempSync(join(tmpdir(), 'ciwf-catalog-snapshot-'))
+      folders.push(folder)
+      const summary = join(folder, 'summary')
+      const source = 'Catalog snapshot source: live\n'
+      writeFileSync(summary, 'Existing summary\n')
+      mkdirSync(join(folder, 'scripts'))
+      writeFileSync(join(folder, 'scripts/catalog-snapshot.mjs'), exitCode
+        ? 'process.exit(1)'
+        : 'process.stdout.write(' + JSON.stringify(source) + ')')
+      const result = spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'build', snapshotStep)], {
+        cwd: folder, encoding: 'utf8', env: { PATH: process.env.PATH, GITHUB_STEP_SUMMARY: summary },
+      })
+
+      assert.equal(result.status, exitCode, result.stderr)
+      assert.equal(readFileSync(summary, 'utf8'), 'Existing summary\n' + (exitCode ? '' : source))
+    })
+  }
+
   test('the build step installs first, then runs the build command from env', () => {
     const env = { BUILD_COMMAND: 'npm run build' }
     const result = runStep('build', 'Build site', env)
@@ -355,7 +400,7 @@ describe('the build never sees the deploy token', () => {
     const source = workflow()
     const defaults = {
       'dispatch-sha': "''", 'node-version-file': '.nvmrc',
-      'build-command': 'npm run build', 'analytics-token': "''",
+      'build-command': 'npm run build', 'analytics-token': "''", 'site-origin': "''",
     }
     for (const [name, value] of Object.entries(defaults)) {
       assert.match(source, new RegExp(`\\n {6}${name}:\\n(?: {8}.+\\n)* {8}default: ${value.replace(/\./gu, '\\.')}\\n`, 'u'), name)

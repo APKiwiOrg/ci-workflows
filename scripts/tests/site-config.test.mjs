@@ -15,7 +15,7 @@ const workflows = [
 ]
 const folders = []
 const values = {
-  'app-location': 'out', 'has-form': 'false', 'has-theme': 'false', 'has-accounts': 'false', analytics: 'none',
+  'app-location': 'out', 'has-form': 'false', 'has-theme': 'false', 'has-accounts': 'false', 'has-catalog': 'false', analytics: 'none',
   'infra-params': '["infra/params/site.bicepparam","infra/params/preview.bicepparam"]',
 }
 
@@ -72,7 +72,7 @@ afterEach(() => {
 
 for (const [path, jobId] of workflows) {
   describe(`${path.split('/').at(-1)} config gate`, () => {
-    test('the fixture CLI exports all six validated job outputs', () => {
+    test('the fixture CLI exports all seven validated job outputs', () => {
       const result = readConfig(path, jobId)
       assert.equal(result.status, 0, result.stderr)
       const implementation = calledWorkflowPath(path, jobId)
@@ -96,7 +96,7 @@ for (const [path, jobId] of workflows) {
 
     test('accepts the alternate framework and capability values', () => {
       assert.equal(readConfig(path, jobId, {
-        'app-location': 'build/client', 'has-form': 'true', 'has-theme': 'true', 'has-accounts': 'true', analytics: 'cloudflare',
+        'app-location': 'build/client', 'has-form': 'true', 'has-theme': 'true', 'has-accounts': 'true', 'has-catalog': 'true', analytics: 'cloudflare',
         'infra-params': '["infra/params/site.bicepparam"]',
       }).status, 0)
     })
@@ -122,7 +122,8 @@ for (const [path, jobId] of workflows) {
     }
 
     for (const [key, invalid] of [
-      ['app-location', 'dist'], ['has-form', 'TRUE'], ['has-theme', '0'], ['has-accounts', 'TRUE'], ['analytics', 'other'],
+      ['app-location', 'dist'], ['has-form', 'TRUE'], ['has-theme', '0'], ['has-accounts', 'TRUE'],
+      ['has-catalog', 'TRUE'], ['analytics', 'other'],
       ['infra-params', 'not-json'], ['infra-params', '{}'], ['infra-params', '[]'],
       ['infra-params', '[null]'], ['infra-params', '["/tmp/site.bicepparam"]'],
       ['infra-params', '["../site.bicepparam"]'], ['infra-params', '["infra/../site.bicepparam"]'],

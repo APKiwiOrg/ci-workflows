@@ -247,7 +247,7 @@ site caller's existing pin. Its checkout reads the site repository. The optional
 selects the source commit to read, without changing the validation implementation's ref.
 
 The shared config job runs `node scripts/site-config.mjs --github-output` once from that checkout before
-any install. The CLI validates the config and appends these six `key=value` lines to `$GITHUB_OUTPUT`:
+any install. The CLI validates the config and appends these seven `key=value` lines to `$GITHUB_OUTPUT`:
 
 | Key | Required value | Use |
 | --- | --- | --- |
@@ -255,13 +255,16 @@ any install. The CLI validates the config and appends these six `key=value` line
 | `has-form` | `true` or `false` | Exposed capability, independent of the api directory |
 | `has-theme` | `true` or `false` | Run the theme check only when true |
 | `has-accounts` | `true` or `false` | Run the SQL integration stage only when true |
+| `has-catalog` | `true` or `false` | Capture a catalog snapshot before the deploy build only when true |
 | `analytics` | `cloudflare` or `none` | Pass a build token only for cloudflare |
 | `infra-params` | Compact JSON array such as `["infra/params/site.bicepparam"]` | Compile every params file |
 
 The workflows reject a missing CLI, a failed CLI, missing or duplicate keys and invalid values. The params
 array must be nonempty and contain repo-relative `.bicepparam` paths without empty, `.` or `..` segments.
 Absolute paths, backslashes and control characters are refused. Every listed params file must exist.
-There are no default capabilities or output folders.
+There are no default capabilities or output folders. Move the shared CI and deploy pins in the same
+site commit that adds `has-catalog` to the CLI output. A rollback through the new pin also needs a
+selected commit whose CLI emits that key.
 
 The SQL stage starts a digest-pinned SQL Server 2022 container on the hosted runner with a random, masked
 SA password. It tries up to 30 logins, two seconds apart, and fails if SQL never answers. After a login
@@ -333,6 +336,7 @@ jobs:
     with:
       enabled: ${{ vars.AZURE_ENABLED == 'true' }}
       dispatch-sha: ${{ inputs.sha }}
+      site-origin: ${{ vars.SITE_ORIGIN }}
       analytics-token: ${{ vars.CLOUDFLARE_ANALYTICS_TOKEN }}
     secrets:
       AZURE_STATIC_WEB_APPS_API_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
@@ -360,7 +364,14 @@ the verification, `scripts/check-npm-policy.mjs`, which runs before `npm ci`, an
 which receives the deployed URL.
 
 Optional inputs and their defaults are `dispatch-sha` (empty), `node-version-file` (`.nvmrc`),
-`build-command` (`npm run build`) and `analytics-token` (empty). The required `enabled` input gates all work.
+`build-command` (`npm run build`), `analytics-token` (empty) and `site-origin` (empty). The required
+`enabled` input gates all work.
+
+When `has-catalog` is true, the build first runs the site's `scripts/catalog-snapshot.mjs` in deploy mode
+with `site-origin` and the selected SHA. The script writes `.catalog/snapshot.json` for the static build.
+The step adds the script's source line to the run summary and fails the build if the script fails. Catalog
+deploys require `SITE_ORIGIN` to hold the site's https origin.
+
 The build command runs as one bash command line after `npm ci`. Only `analytics: cloudflare` passes the
 analytics token in `VITE_CLOUDFLARE_ANALYTICS_TOKEN`. With `none`, the build receives no analytics token.
 It runs under `bash -euo pipefail`, so any failing command in it fails the build and nothing uploads.
@@ -549,6 +560,44 @@ Run it by hand from a site:
 
 ```bash
 gh workflow run maintenance.yml --ref main
+```
+
+## site-catalog-refresh
+
+Refreshes the static catalog nightly using the source commit already deployed. It reads
+`/_catalog/snapshot.json` at the site's https origin and dispatches the caller's `deploy.yml` on
+`main` with that snapshot's `deployedSha`. The existing deploy guard still requires a successful
+main-push CI run for the SHA. A failed fetch or a missing or invalid SHA fails the refresh. The
+SHA must contain exactly 40 lowercase hexadecimal characters.
+
+If `enabled` is false or `site-origin` is empty, the job skips with a notice. The workflow uses the
+caller repository's token with `actions: write` to dispatch the deploy.
+
+A catalog site adds this caller as `.github/workflows/catalog-refresh.yml`, pinned to a commit of this
+repository. The schedule lands early in the morning in New Zealand:
+
+```yaml
+name: Catalog refresh
+on:
+  schedule:
+    - cron: '23 14 * * *'
+  workflow_dispatch:
+permissions: { actions: write, contents: read }
+concurrency:
+  group: catalog-refresh
+  cancel-in-progress: false
+jobs:
+  refresh:
+    uses: APKiwiOrg/ci-workflows/.github/workflows/site-catalog-refresh.yml@<full commit sha>
+    with:
+      enabled: ${{ vars.AZURE_ENABLED == 'true' }}
+      site-origin: ${{ vars.SITE_ORIGIN }}
+```
+
+Run it by hand from a site:
+
+```bash
+gh workflow run catalog-refresh.yml --ref main
 ```
 
 ## Stage names

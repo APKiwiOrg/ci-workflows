@@ -1,0 +1,51 @@
+name: site-catalog-refresh
+
+# The caller owns the schedule. Redispatch its existing deploy workflow with the published source SHA.
+on:
+  workflow_call:
+    inputs:
+      enabled:
+        description: Refresh only when true. Callers pass vars.AZURE_ENABLED == 'true'
+        required: false
+        default: false
+        type: boolean
+      site-origin:
+        description: The site's https origin, empty to skip. Callers pass vars.SITE_ORIGIN
+        required: false
+        default: ''
+        type: string
+
+permissions: {}
+
+jobs:
+  refresh:
+    name: Refresh the catalog
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch catalog refresh
+        env:
+          ENABLED: ${{ inputs.enabled }}
+          SITE_ORIGIN: ${{ inputs.site-origin }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ "$ENABLED" != "true" ] || [ -z "$SITE_ORIGIN" ]; then
+            echo "::notice::Catalog refresh skipped. Enable deployment and set the SITE_ORIGIN repository variable to run it."
+            exit 0
+          fi
+
+          snapshot=$(curl --fail --silent --show-error --max-time 30 --globoff -- "${SITE_ORIGIN%/}/_catalog/snapshot.json")
+          # Validate the decoded string before command substitution can strip trailing newlines.
+          if ! sha=$(jq -ers '
+            select(length == 1)
+            | .[0].deployedSha
+            | select(type == "string" and test("\\A[a-f0-9]{40}\\z"))
+          ' <<< "$snapshot"); then
+            echo "::error::Catalog refresh requires a published snapshot with a full lowercase deployedSha." >&2
+            exit 1
+          fi
+          gh workflow run deploy.yml --ref main -f sha="$sha"

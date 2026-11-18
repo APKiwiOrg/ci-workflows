@@ -23,6 +23,9 @@ on:
       has-accounts:
         description: Validated accounts capability
         value: ${{ jobs.config.outputs.has-accounts }}
+      has-catalog:
+        description: Validated catalog capability
+        value: ${{ jobs.config.outputs.has-catalog }}
       analytics:
         description: Validated analytics provider
         value: ${{ jobs.config.outputs.analytics }}
@@ -44,6 +47,7 @@ jobs:
       has-form: ${{ steps.config.outputs.has-form }}
       has-theme: ${{ steps.config.outputs.has-theme }}
       has-accounts: ${{ steps.config.outputs.has-accounts }}
+      has-catalog: ${{ steps.config.outputs.has-catalog }}
       analytics: ${{ steps.config.outputs.analytics }}
       infra-params: ${{ steps.config.outputs.infra-params }}
     steps:
@@ -85,6 +89,7 @@ jobs:
             'has-form': ['true', 'false'],
             'has-theme': ['true', 'false'],
             'has-accounts': ['true', 'false'],
+            'has-catalog': ['true', 'false'],
             analytics: ['cloudflare', 'none'],
           })) {
             if (!allowed.includes(outputs.get(key))) fail(`${key} must be one of ${allowed.join(', ')}`)

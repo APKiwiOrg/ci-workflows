@@ -38,6 +38,11 @@ on:
         required: false
         default: ''
         type: string
+      site-origin:
+        description: The site's https origin, required for catalog builds
+        required: false
+        default: ''
+        type: string
     # Named like the production environment secret, which wins over the passed value in the deploy job
     # because that job declares the environment. Not required, the deploy job refuses an empty token itself.
     secrets:
@@ -149,6 +154,17 @@ jobs:
 
       - name: npm install policy
         run: node scripts/check-npm-policy.mjs
+
+      - name: Capture catalog snapshot
+        if: needs.config.outputs.has-catalog == 'true'
+        env:
+          SITE_ORIGIN: ${{ inputs.site-origin }}
+          DEPLOYED_SHA: ${{ needs.guard.outputs.sha }}
+          CATALOG_DEPLOY: '1'
+        run: |
+          set -eu
+          source=$(node scripts/catalog-snapshot.mjs)
+          printf '%s\n' "$source" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The build command reaches the shell through env and runs as one bash command line. Errexit, nounset
       # and pipefail make any failing part fail the step, so a partial build never uploads.
