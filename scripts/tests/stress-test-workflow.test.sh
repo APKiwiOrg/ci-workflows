@@ -1,7 +1,7 @@
 #!/bin/sh
 # Exercise the stress workflow's own shell steps, extracted from the YAML, against a stub dotnet. Proves the
-# input checks, log and TRX retention, per-run artifact directories and the step wiring without a build, a
-# real test process, sleeps or load. Every case runs at most three stub iterations.
+# input checks, disk cleanup and evidence, log and TRX retention, per-run artifacts and step wiring without
+# a build, a real test process, sleeps or load. Every case runs at most three stub iterations.
 set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/stress-workflow.XXXXXX")
@@ -48,6 +48,7 @@ repeat = steps['Repeat the selection']
 for step in (check, repeat):
     need(step['env'].get('ARTIFACT_ENV') == '${{ inputs.artifact-env }}', 'ARTIFACT_ENV reaches %s through env' % step['name'])
 compare_check = steps.get('Check comparison inputs', {})
+free_disk = steps.get('Free disk space for comparison', {})
 checkout = steps.get('Check out the comparison ref', {})
 for name in ('Check comparison inputs', 'Check the inputs', 'Check out the comparison ref', 'Build once', 'Repeat the selection'):
     need(steps.get(name, {}).get('env', {}).get('COMPARE_REF') == '${{ inputs.compare-ref }}',
@@ -60,6 +61,12 @@ need(compare_check and first_step == compare_check and compare_check.get('if') =
 need(checkout and step_order.index('Cache NuGet packages') < step_order.index(checkout['name'])
      < step_order.index('Build once') < step_order.index('Repeat the selection'),
      'comparison checkout stays outside primary cache key calculation and both builds precede testing')
+need(free_disk.get('if') == "inputs.compare-ref != ''",
+     'disk cleanup runs only in compare mode')
+need(free_disk and step_order.index('Check the inputs') < step_order.index(free_disk['name'])
+     < step_order.index('Build once'), 'disk cleanup follows input checks and precedes both builds')
+need(free_disk and not free_disk.get('continue-on-error') and 'if' not in steps['Build once']
+     and 'if' not in repeat, 'disk cleanup failure skips both builds and the runs')
 need(repeat.get('timeout-minutes') == "${{ inputs.compare-ref != '' && 150 || (inputs.artifact-env != '' && 60 || 90) }}",
      'repeat timeout is 150 in compare mode and keeps the legacy 60/90 limits otherwise')
 need('timeout-minutes' not in check, 'check step keeps no timeout of its own')
@@ -70,6 +77,8 @@ compare = steps.get('Upload the stress comparison', {})
 need(cost['if'] == "always() && inputs.compare-ref == '' && inputs.support-cost",
      'support-cost upload keeps its condition when compare-ref is empty')
 need(compare.get('if') == "always() && inputs.compare-ref != ''", 'compare upload always runs only in compare mode')
+need(free_disk and step_order.index(free_disk['name']) < step_order.index(compare['name']),
+     'the always-on compare upload follows the disk preflight even when it fails')
 need(compare.get('with') == {'name': 'stress-compare', 'path': '${{ runner.temp }}/stress',
                              'retention-days': 7, 'if-no-files-found': 'warn',
                              'include-hidden-files': True}, 'compare upload takes the entire tree')
@@ -85,7 +94,8 @@ need(failing['if'] == "failure() && inputs.compare-ref == '' && inputs.artifact-
      'failing-runs upload keeps its condition when compare-ref is empty')
 need(failing['with'] == {'name': 'stress-test-results', 'path': '${{ runner.temp }}/stress',
                          'retention-days': 7, 'if-no-files-found': 'ignore'}, 'failing-runs upload unchanged')
-for name, step in (('check', check), ('compare-check', compare_check), ('repeat', repeat), ('checkout', checkout), ('build', steps['Build once'])):
+for name, step in (('check', check), ('compare-check', compare_check), ('free-disk', free_disk),
+                   ('repeat', repeat), ('checkout', checkout), ('build', steps['Build once'])):
     if 'run' in step:
         with open(out + '/' + name + '.sh', 'w') as script:
             script.write(step['run'])
@@ -154,7 +164,47 @@ esac
 echo "<Counters total=\"1\" executed=\"$executed\" />" > "$results/$trx"
 exit "$code"
 EOF
-chmod +x "$work/bin/dotnet"
+cat > "$work/bin/stat" <<'EOF'
+#!/bin/sh
+[ "$#" -eq 4 ] && [ "$1 $2 $3" = '-Lc %d --' ] || exit 98
+case "$4" in
+  "$GITHUB_WORKSPACE") echo 1 ;;
+  "$RUNNER_TEMP") if [ -f "$STUB_DISK/runner-temp" ]; then echo 2; else echo 1; fi ;;
+  *) exit 98 ;;
+esac
+EOF
+cat > "$work/bin/df" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -eq 3 ] && [ "$1 $2" = '-Pk --' ] || exit 98
+case "$3" in
+  "$GITHUB_WORKSPACE") side=workspace ;;
+  "$RUNNER_TEMP") side=runner-temp ;;
+  *) exit 98 ;;
+esac
+echo "$side" >> "$STUB_DISK/calls"
+available=25165824
+if [ -f "$STUB_DISK/$side" ]; then
+  call=$(grep -cx "$side" "$STUB_DISK/calls")
+  available=$(sed -n "${call}p" "$STUB_DISK/$side")
+  [ -n "$available" ] || exit 98
+fi
+echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+printf '/dev/%s 33554432 %s %s 30%% %s\n' "$side" "$((33554432 - available))" "$available" "$3"
+EOF
+cat > "$work/bin/sudo" <<'EOF'
+#!/bin/sh
+[ "$#" -eq 5 ] && [ "$1 $2 $3 $4" = '-n rm -rf --' ] || exit 98
+case "$5" in
+  "$STUB_IMAGE"/*) ;;
+  *) echo 'unsafe cleanup fixture path' >&2; exit 98 ;;
+esac
+echo "${5#"$STUB_IMAGE"}" >> "$STUB_DISK/removals"
+[ -d "$5" ] || exit 98
+if [ "$5" = "$STUB_REMOVE_FAILURE" ]; then echo 'stub: removal denied' >&2; exit 1; fi
+rm -rf -- "$5"
+EOF
+chmod +x "$work/bin/dotnet" "$work/bin/stat" "$work/bin/df" "$work/bin/sudo"
 cat > "$work/repo/scripts/record-support-cost-exit.py" <<'EOF'
 import sys
 open(sys.argv[1], 'a').write('exit %s\n' % sys.argv[2])
@@ -164,7 +214,7 @@ EOF
 
 start_case() {
   rm -rf "$work/case"
-  mkdir -p "$work/case/temp"
+  mkdir -p "$work/case/temp" "$work/case/disk"
   checkout_dir="$work/repo"
   # shellcheck disable=SC2086 # the plan splits into one outcome per stub call
   printf '%s\n' $1 > "$work/case/plan"
@@ -177,18 +227,20 @@ run_case_step() {
   expected=$2
   shift 2
   [ -f "$work/$script" ] || fail "missing workflow step $script"
+  set -- "$@" bash -e "$work/$script"
+  if [ "$script" = free-disk.sh ]; then set -- "$@" "$work/case/image"; fi
   actual=0
   (cd "$checkout_dir" && env -i PATH="$work/bin:$PATH" HOME="$work/case" \
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    RUNNER_TEMP="$work/case/temp" GITHUB_STEP_SUMMARY="$work/case/summary" \
+    RUNNER_TEMP="$work/case/temp" GITHUB_WORKSPACE="$checkout_dir" GITHUB_STEP_SUMMARY="$work/case/summary" \
     GITHUB_REF=refs/heads/primary GITHUB_SHA=runner-sha GITHUB_EVENT_NAME=workflow_dispatch \
     STUB_PLAN="$work/case/plan" STUB_COUNT="$work/case/count" STUB_SEEN="$work/case/seen" \
     STUB_WATCH=KE_COVERAGE_COST_REPORTS STUB_TRACE="$work/case/trace" STUB_BUILDS="$work/case/builds" \
-    STUB_FAIL_BUILD='' \
+    STUB_FAIL_BUILD='' STUB_DISK="$work/case/disk" STUB_IMAGE="$work/case/image" STUB_REMOVE_FAILURE='' \
     PROJECT=Stub.csproj FILTER='FullyQualifiedName~Stub&Name!=x' ITERATIONS=1 LOAD=0 \
-    CONFIGURATION=Release SUPPORT_COST=false ARTIFACT_ENV='' COMPARE_REF='' BUILD_TARGET='' "$@" \
-    bash -e "$work/$script") > "$work/case/out" 2>&1 || actual=$?
-  [ "$actual" -eq "$expected" ] || fail "$script $* exited $actual, expected $expected"
+    CONFIGURATION=Release SUPPORT_COST=false ARTIFACT_ENV='' COMPARE_REF='' BUILD_TARGET='' "$@") \
+    > "$work/case/out" 2>&1 || actual=$?
+  [ "$actual" -eq "$expected" ] || fail "$script exited $actual, expected $expected"
   pass=$((pass + 1))
 }
 
@@ -329,8 +381,126 @@ start_compare() {
 
 # Link and build the real worktree. The input gate is covered separately against the runner lifecycle.
 build_pair() {
+  run_case_step free-disk.sh 0
   run_case_step checkout.sh 0 COMPARE_REF=baseline "$@"
   run_case_step build.sh 0 COMPARE_REF=baseline "$@"
+}
+
+comparison_disk_removes_tool() {
+  start_compare ''
+  tool="$work/case/image/$1"
+  mkdir -p "$tool"
+  : > "$tool/installed"
+  run_case_step free-disk.sh 0
+  [ ! -e "$tool" ] || fail "$1 was not removed"
+}
+
+comparison_disk_skips_missing() {
+  start_compare ''
+  image="$work/case/image"
+  mkdir -p "$image/opt/hostedtoolcache/node" "$image/opt/hostedtoolcache/Python" "$image/usr/share/dotnet"
+  run_case_step free-disk.sh 0
+  [ ! -e "$work/case/disk/removals" ] || fail 'cleanup tried to remove unlisted or missing tools'
+  for tool in opt/hostedtoolcache/node opt/hostedtoolcache/Python usr/share/dotnet; do
+    [ -d "$image/$tool" ] || fail "cleanup removed $tool"
+  done
+}
+
+comparison_disk_removal_failure() {
+  start_compare ''
+  android="$work/case/image/usr/local/lib/android"
+  swift="$work/case/image/usr/share/swift"
+  mkdir -p "$android" "$swift"
+  run_case_step free-disk.sh 0 STUB_REMOVE_FAILURE="$android"
+  grep -qE "^::warning title=compare-disk-cleanup::.*$android" "$work/case/out" ||
+    fail 'the failed removal has no warning identifying its directory'
+  [ -d "$android" ] && [ ! -e "$swift" ] || fail 'a failed removal prevented cleanup of another directory'
+}
+
+append_disk_log() {
+  grep '^disk-' "$work/case/out" >> "$work/case/disk.log" || fail 'step log has no disk readings'
+}
+
+comparison_disk_evidence() {
+  start_compare 'pass pass'
+  printf '%s\n' 13631488 23068672 18874368 14680064 12582912 > "$work/case/disk/workspace"
+  if [ "$1" = split ]; then
+    printf '%s\n' 19922944 20971520 20971520 15728640 14680064 > "$work/case/disk/runner-temp"
+  fi
+  run_case_step compare-check.sh 0 COMPARE_REF=baseline
+  run_case_step check.sh 0 COMPARE_REF=baseline
+  run_case_step free-disk.sh 0
+  append_disk_log
+  run_case_step checkout.sh 0 COMPARE_REF=baseline
+  run_case_step build.sh 0 COMPARE_REF=baseline
+  append_disk_log
+  run_case_step repeat.sh 0 COMPARE_REF=baseline
+  append_disk_log
+  tab=$(printf '\t')
+  case "$1" in
+    shared)
+      cat > "$work/case/expected" <<EOF_DISK
+disk-before-freeing-workspace${tab}13631488
+disk-after-freeing-workspace${tab}23068672
+disk-after-primary-build-workspace${tab}18874368
+disk-after-comparison-build-workspace${tab}14680064
+disk-after-runs-workspace${tab}12582912
+EOF_DISK
+      ;;
+    split)
+      cat > "$work/case/expected" <<EOF_DISK
+disk-before-freeing-workspace${tab}13631488
+disk-before-freeing-runner-temp${tab}19922944
+disk-after-freeing-workspace${tab}23068672
+disk-after-freeing-runner-temp${tab}20971520
+disk-after-primary-build-workspace${tab}18874368
+disk-after-primary-build-runner-temp${tab}20971520
+disk-after-comparison-build-workspace${tab}14680064
+disk-after-comparison-build-runner-temp${tab}15728640
+disk-after-runs-workspace${tab}12582912
+disk-after-runs-runner-temp${tab}14680064
+EOF_DISK
+      ;;
+  esac
+  grep '^disk-' "$stress/progress.txt" > "$work/case/readings" || fail 'artifact has no disk readings'
+  diff -u "$work/case/expected" "$work/case/readings" || fail 'disk evidence is out of order or incomplete'
+  diff -u "$work/case/readings" "$work/case/disk.log" || fail 'disk evidence differs from the step logs'
+}
+
+comparison_disk_floor() {
+  start_compare 'pass pass'
+  available=1048576
+  printf '%s\n' 524288 "$available" > "$work/case/disk/$1"
+  run_case_step compare-check.sh 0 COMPARE_REF=baseline
+  run_case_step check.sh 0 COMPARE_REF=baseline
+  run_case_step free-disk.sh 1
+  diagnostic=$(grep '^::error title=compare-disk-space::' "$work/case/out") || fail 'missing disk space error'
+  case "$diagnostic" in *"$1"*) ;; *) fail 'disk space error does not identify the filesystem' ;; esac
+  required=$(printf '%s\n' "$diagnostic" | awk -v available="$available" '
+    { for (i = 1; i < NF; i++) if ($(i+1) == "KiB") {
+        if ($i == available) found = 1
+        if ($i > available && $i ~ /^[0-9]+$/) required = $i
+      }
+      if (found && required) print required
+    }')
+  [ -n "$required" ] || fail 'disk space error does not report available and required KiB'
+  tab=$(printf '\t')
+  says "$stress/progress.txt" "disk-before-freeing-$1${tab}524288"
+  says "$stress/progress.txt" "disk-after-freeing-$1${tab}$available"
+  [ ! -e "$work/case/builds" ] && [ ! -e "$work/case/count" ] || fail 'a build or run started during preflight'
+
+  start_compare 'pass pass'
+  printf '%s\n' 524288 "$required" > "$work/case/disk/$1"
+  run_case_step free-disk.sh 0
+}
+
+legacy_disk() {
+  start_compare 'pass'
+  run_case_step build.sh 0
+  run_case_step repeat.sh 0
+  lacks progress.txt
+  [ ! -e "$work/case/disk/calls" ] || fail 'single-ref run measured disk usage'
+  [ ! -e "$work/case/disk/removals" ] || fail 'single-ref run removed preinstalled tools'
 }
 
 comparison_checkout() {
@@ -363,6 +533,7 @@ EOF_LFS
 
 comparison_build_failure() {
   start_compare ''
+  run_case_step free-disk.sh 0
   run_case_step checkout.sh 0 COMPARE_REF=baseline
   run_case_step build.sh 7 COMPARE_REF=baseline STUB_FAIL_BUILD="$1"
   says "$stress/progress.txt" "$1 build: exit 7"
@@ -379,6 +550,7 @@ comparison_paths() {
   : > "$work/case/outside.csproj"
   : > "$work/case/outside-target"
   : > "$work/case/temp/outside-target"
+  run_case_step free-disk.sh 0
   run_case_step checkout.sh 0 COMPARE_REF=baseline PROJECT="$1"
   run_case_step build.sh "$3" COMPARE_REF=baseline PROJECT="$1" BUILD_TARGET="$2"
   if [ "$3" -eq 0 ]; then
@@ -554,6 +726,16 @@ compare_case comparison_checkout refs/tags/compare-tag
 compare_case comparison_checkout "$compare_commit"
 compare_case comparison_checkout refs/heads/tag
 compare_case comparison_lfs_skip
+for tool in usr/local/lib/android opt/hostedtoolcache/CodeQL usr/local/.ghcup usr/share/swift; do
+  compare_case comparison_disk_removes_tool "$tool"
+done
+compare_case comparison_disk_skips_missing
+compare_case comparison_disk_removal_failure
+compare_case comparison_disk_evidence shared
+compare_case comparison_disk_evidence split
+compare_case comparison_disk_floor workspace
+compare_case comparison_disk_floor runner-temp
+compare_case legacy_disk
 compare_case comparison_build_failure primary
 compare_case comparison_build_failure compare
 compare_case comparison_paths Inside.csproj Inside.csproj 0

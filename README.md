@@ -169,6 +169,10 @@ version can differ between refs. Use checkout-relative paths for `project` and `
 The test project must exist on both refs. Both paths must resolve inside their respective checkout,
 including through symlinks. `support-cost` cannot be combined with `compare-ref`.
 
+Before building, compare mode frees disk space by removing unused preinstalled tools from the runner.
+It stops before either build if free space after cleanup is below 16 GiB. If a full solution build still
+runs out of space, set `build-target` to a narrower solution or project that builds what the test selection needs.
+
 Each iteration runs the same selection once per ref. Odd iterations run primary first and even
 iterations run comparison first. Any configured load runs throughout the loop. The comparison test
 process gets its resolved commit in `GITHUB_SHA`. The primary test process keeps the runner's value.
@@ -178,7 +182,10 @@ Any run that fails or selects nothing fails the step.
 The upload step attempts to retain the whole `stress` tree as one `stress-compare` artifact for seven days
 on success, failure or cancellation. `progress.txt` records the requested refs before validation and
 adds validation, checkout and build outcomes as they become known. It gives early failures an artifact
-even before tests run. Once both commits resolve, `refs.txt` records each side, requested ref and commit,
+even before tests run. It also records free space in KiB before and after cleanup, after each build and
+after the runs, using tab-separated labels and values that also appear in the step logs. The readings cover
+the workspace filesystem and the runner's temporary filesystem when they differ. Once both commits resolve,
+`refs.txt` records each side, requested ref and commit,
 followed by the processor model and logical processor count. The tree keeps the logs and TRX files
 each run writes, including passing runs, plus test-written files when `artifact-env` is set.
 Cancellation or a job timeout can interrupt the upload or end the job before it starts.

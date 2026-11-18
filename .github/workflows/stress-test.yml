@@ -209,6 +209,52 @@ jobs:
             fi
           fi
 
+      - name: Free disk space for comparison
+        if: inputs.compare-ref != ''
+        run: |
+          # Allow the two builds and checkouts about 10 GiB, with 6 GiB more for packages and runner headroom.
+          minimum_available_kib=$((16 * 1024 * 1024))
+          disk_usage="$RUNNER_TEMP/stress-disk-usage.sh"
+          cat > "$disk_usage" <<'EOF'
+          set -eo pipefail
+          checkpoint=$1
+          minimum_kib=${2:-0}
+          status=0
+          record_disk() {
+            local filesystem=$1 path=$2 available_kib
+            available_kib=$(LC_ALL=C df -Pk -- "$path" | awk 'NR == 2 {print $4}')
+            case "$available_kib" in
+              ''|*[!0-9]*) echo "::error title=compare-disk-evidence::Could not read available space on $filesystem"; exit 1 ;;
+            esac
+            printf 'disk-%s-%s\t%s\n' "$checkpoint" "$filesystem" "$available_kib" |
+              tee -a "$RUNNER_TEMP/stress/progress.txt"
+            if [ "$available_kib" -lt "$minimum_kib" ]; then
+              printf '::error title=compare-disk-space::Insufficient disk space on %s: %s KiB available, %s KiB required before comparison builds.\n' \
+                "$filesystem" "$available_kib" "$minimum_kib"
+              status=1
+            fi
+          }
+          workspace_device=$(stat -Lc %d -- "$GITHUB_WORKSPACE")
+          temp_device=$(stat -Lc %d -- "$RUNNER_TEMP")
+          record_disk workspace "$GITHUB_WORKSPACE"
+          if [ "$workspace_device" != "$temp_device" ]; then
+            record_disk runner-temp "$RUNNER_TEMP"
+          fi
+          exit "$status"
+          EOF
+
+          bash "$disk_usage" before-freeing
+          # Only the local shell fixture passes a root argument. The Actions step supplies no arguments.
+          tools_root=${1:-}
+          # Tool paths from actions/runner-images for ubuntu-26.04. Keep the runner, Node, Python and .NET.
+          for tool in /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift; do
+            path="$tools_root$tool"
+            if [ -d "$path" ] && ! sudo -n rm -rf -- "$path"; then
+              echo "::warning title=compare-disk-cleanup::Could not remove $path"
+            fi
+          done
+          bash "$disk_usage" after-freeing "$minimum_available_kib"
+
       - name: Check out the comparison ref
         if: inputs.compare-ref != ''
         env:
@@ -312,6 +358,10 @@ jobs:
             verify_path 'build target' "$target" "$root" || exit
             printf '%s\n' "$target"
           )
+          record_build_disk() {
+            bash "$RUNNER_TEMP/stress-disk-usage.sh" "$1" ||
+              echo "::warning title=compare-disk-evidence::Could not record $1 disk usage"
+          }
 
           progress="$RUNNER_TEMP/stress/progress.txt"
           compare_checkout="$RUNNER_TEMP/stress-compare"
@@ -325,12 +375,16 @@ jobs:
 
           stage='primary build'
           printf 'primary build: started\n' >> "$progress"
-          build "$primary_target"
+          (
+            trap 'record_build_disk after-primary-build' EXIT
+            build "$primary_target"
+          )
           printf 'primary build: exit 0\n' >> "$progress"
 
           stage='compare build'
           printf 'compare build: started\n' >> "$progress"
           (
+            trap 'record_build_disk after-comparison-build' EXIT
             cd "$compare_checkout"
             # A package may have different content under the same version on the two refs.
             export NUGET_PACKAGES="$RUNNER_TEMP/stress-compare-packages"
@@ -474,6 +528,8 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$COMPARE_REF" ]; then
+            bash "$RUNNER_TEMP/stress-disk-usage.sh" after-runs ||
+              echo "::warning title=compare-disk-evidence::Could not record after-runs disk usage"
             echo "stress-test primary: $(result 0)"
             echo "stress-test compare: $(result 1)"
           else
