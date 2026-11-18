@@ -42,12 +42,16 @@ check = steps['Check the inputs']
 repeat = steps['Repeat the selection']
 for step in (check, repeat):
     need(step['env'].get('ARTIFACT_ENV') == '${{ inputs.artifact-env }}', 'ARTIFACT_ENV reaches %s through env' % step['name'])
+compare_check = steps.get('Check comparison inputs', {})
 checkout = steps.get('Check out the comparison ref', {})
-for step in (check, checkout, steps['Build once'], repeat):
-    need(step.get('env', {}).get('COMPARE_REF') == '${{ inputs.compare-ref }}',
-         'COMPARE_REF reaches %s through env' % step.get('name', 'comparison checkout'))
+for name in ('Check comparison inputs', 'Check the inputs', 'Check out the comparison ref', 'Build once', 'Repeat the selection'):
+    need(steps.get(name, {}).get('env', {}).get('COMPARE_REF') == '${{ inputs.compare-ref }}',
+         'COMPARE_REF reaches %s through env' % name)
 need(checkout.get('if') == "inputs.compare-ref != ''", 'empty compare-ref skips the extra checkout')
 step_order = list(steps)
+first_step = job['steps'][0]
+need(compare_check and first_step == compare_check and compare_check.get('if') == "inputs.compare-ref != ''",
+     'compare-only input gate precedes the first checkout')
 need(checkout and step_order.index('Cache NuGet packages') < step_order.index(checkout['name'])
      < step_order.index('Build once') < step_order.index('Repeat the selection'),
      'comparison checkout stays outside primary cache key calculation and both builds precede testing')
@@ -76,7 +80,7 @@ need(failing['if'] == "failure() && inputs.compare-ref == '' && inputs.artifact-
      'failing-runs upload keeps its condition when compare-ref is empty')
 need(failing['with'] == {'name': 'stress-test-results', 'path': '${{ runner.temp }}/stress',
                          'retention-days': 7, 'if-no-files-found': 'ignore'}, 'failing-runs upload unchanged')
-for name, step in (('check', check), ('repeat', repeat), ('checkout', checkout), ('build', steps['Build once'])):
+for name, step in (('check', check), ('compare-check', compare_check), ('repeat', repeat), ('checkout', checkout), ('build', steps['Build once'])):
     if 'run' in step:
         with open(out + '/' + name + '.sh', 'w') as script:
             script.write(step['run'])
@@ -95,8 +99,14 @@ cat > "$work/bin/dotnet" <<'EOF'
 #!/bin/sh
 if [ "$1" = build ]; then
   printf '%s %s %s %s\n' "$(cat side.txt)" "$2" "$4" "${NUGET_PACKAGES:-default}" >> "$STUB_BUILDS"
-  [ -f evicted ] && [ -d local-feed ]
-  exit $?
+  [ -f evicted ] && [ -d local-feed ] || exit 98
+  if [ "$(cat side.txt)" = "$STUB_FAIL_BUILD" ]; then exit 7; fi
+  touch built
+  exit
+fi
+if [ ! -f built ]; then
+  echo 'stub: test ran before its own build' >&2
+  exit 98
 fi
 project=$2
 configuration=$4
@@ -106,14 +116,17 @@ outcome=$(sed -n "${call}p" "$STUB_PLAN")
 trx=""
 results=""
 filter=""
+no_build=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --no-build) no_build=true ;;
     --filter) filter=$2; shift ;;
     --logger) trx=${2#trx;LogFileName=}; shift ;;
     --results-directory) results=$2; shift ;;
   esac
   shift
 done
+if [ "$no_build" != true ]; then echo 'stub: missing --no-build' >&2; exit 98; fi
 if [ -f side.txt ]; then
   printf '%s %s %s %s %s %s\n' "$(cat side.txt)" "$GITHUB_SHA" \
     "$project" "$configuration" "$filter" "${NUGET_PACKAGES:-default}" >> "$STUB_TRACE"
@@ -142,6 +155,7 @@ import sys
 open(sys.argv[1], 'a').write('exit %s\n' % sys.argv[2])
 EOF
 : > "$work/repo/Stub.csproj"
+: > "$work/repo/built"
 
 start_case() {
   rm -rf "$work/case"
@@ -161,9 +175,10 @@ run_case_step() {
   actual=0
   (cd "$checkout_dir" && env -i PATH="$work/bin:$PATH" HOME="$work/case" \
     RUNNER_TEMP="$work/case/temp" GITHUB_STEP_SUMMARY="$work/case/summary" \
-    GITHUB_REF=refs/heads/primary GITHUB_SHA=runner-sha \
+    GITHUB_REF=refs/heads/primary GITHUB_SHA=runner-sha GITHUB_EVENT_NAME=workflow_dispatch \
     STUB_PLAN="$work/case/plan" STUB_COUNT="$work/case/count" STUB_SEEN="$work/case/seen" \
     STUB_WATCH=KE_COVERAGE_COST_REPORTS STUB_TRACE="$work/case/trace" STUB_BUILDS="$work/case/builds" \
+    STUB_FAIL_BUILD='' \
     PROJECT=Stub.csproj FILTER='FullyQualifiedName~Stub&Name!=x' ITERATIONS=1 LOAD=0 \
     CONFIGURATION=Release SUPPORT_COST=false ARTIFACT_ENV='' COMPARE_REF='' BUILD_TARGET='' "$@" \
     bash -e "$work/$script") > "$work/case/out" 2>&1 || actual=$?
@@ -188,7 +203,7 @@ calls() { [ "$(cat "$work/case/count")" -eq "$1" ] || fail "stub ran $(cat "$wor
 run_step repeat.sh 0 'pass pass' ITERATIONS=2
 calls 2
 lacks run-1.log; lacks run-1.trx; lacks run-2.log; lacks run-2.trx; lacks artifacts
-lacks primary; lacks compare; lacks refs.txt
+lacks primary; lacks compare; lacks refs.txt; lacks progress.txt
 says "$work/case/seen" '1 unset'
 says "$work/case/seen" '2 unset'
 says "$work/case/summary" '2 passed, 0 failed, 0 selected nothing, of 2 runs'
@@ -272,6 +287,11 @@ git init -q -b baseline "$origin"
 printf '%s\n' compare > "$origin/side.txt"
 : > "$origin/Stub.csproj"
 : > "$origin/Compare.slnx"
+ln -s Stub.csproj "$origin/Inside.csproj"
+ln -s ../../outside.csproj "$origin/Outside.csproj"
+ln -s ../outside-target "$origin/OutsideBuild"
+printf '%s\n' '*.bin filter=lfs' > "$origin/.gitattributes"
+printf '%s\n' 'version https://git-lfs.github.com/spec/v1' > "$origin/Pointer.bin"
 mkdir "$origin/scripts"
 printf '%s\n' ': > evicted' > "$origin/scripts/evict-stale-vendored.sh"
 printf '%s\n' local-feed > "$origin/nuget.config"
@@ -280,6 +300,7 @@ fixture_commit() { git -C "$origin" -c user.name=Fixture -c user.email=fixture@e
 fixture_commit baseline
 compare_commit=$(git -C "$origin" rev-parse HEAD)
 git -C "$origin" -c user.name=Fixture -c user.email=fixture@example.test tag -am baseline compare-tag
+git -C "$origin" branch tag baseline
 git -C "$origin" update-ref refs/tags/non-commit "$(git -C "$origin" rev-parse HEAD:side.txt)"
 git -C "$origin" switch -qc missing-project
 git -C "$origin" rm -q Stub.csproj
@@ -287,7 +308,8 @@ fixture_commit 'remove the test project'
 git -C "$origin" switch -qc primary baseline
 git -C "$origin" mv Compare.slnx Primary.sln
 printf '%s\n' primary > "$origin/side.txt"
-git -C "$origin" add side.txt
+ln -sf Stub.csproj "$origin/Outside.csproj"
+git -C "$origin" add side.txt Outside.csproj
 fixture_commit primary
 primary_commit=$(git -C "$origin" rev-parse HEAD)
 
@@ -295,13 +317,14 @@ start_compare() {
   start_case "$1"
   checkout_dir="$work/case/primary"
   git clone -q --depth 1 --branch primary "file://$origin" "$checkout_dir" || fail 'create primary fixture'
+  (cd "$checkout_dir" && sh scripts/evict-stale-vendored.sh && mkdir local-feed) || fail 'prepare primary build'
+  mkdir -p "$stress"
 }
 
-# For step-level tests of build and repeat, prepare the second tree independently of the checkout step.
-prepare_pair() {
-  start_compare "$1"
-  git clone -q --depth 1 --branch baseline "file://$origin" "$work/case/temp/stress-compare" ||
-    fail 'create comparison fixture'
+# Link and build the real worktree. The input gate is covered separately against the runner lifecycle.
+build_pair() {
+  run_case_step checkout.sh 0 COMPARE_REF=baseline "$@"
+  run_case_step build.sh 0 COMPARE_REF=baseline "$@"
 }
 
 comparison_checkout() {
@@ -319,22 +342,62 @@ comparison_checkout() {
   grep -qE '^Logical processors: [1-9][0-9]*$' "$stress/refs.txt" || fail 'missing logical processor count'
 }
 
-comparison_build() {
-  prepare_pair ''
-  # The existing standalone setup steps already ran for the primary when the build step starts.
-  (cd "$checkout_dir" && sh scripts/evict-stale-vendored.sh) ||
-    fail 'prepare primary eviction marker'
-  mkdir "$checkout_dir/local-feed"
-  run_case_step build.sh 0 COMPARE_REF=baseline CONFIGURATION=Debug NUGET_PACKAGES="$work/case/primary-packages"
+comparison_lfs_skip() {
+  start_compare ''
+  cat > "$work/case/lfs-smudge.sh" <<'EOF_LFS'
+#!/bin/sh
+if [ "${GIT_LFS_SKIP_SMUDGE:-0}" = 1 ]; then cat; else echo 'unexpected LFS smudge' >&2; exit 1; fi
+EOF_LFS
+  git -C "$checkout_dir" config filter.lfs.smudge "sh '$work/case/lfs-smudge.sh'"
+  git -C "$checkout_dir" config filter.lfs.required true
+  run_case_step checkout.sh 0 COMPARE_REF=baseline
+  cmp "$work/case/temp/stress-compare/Pointer.bin" "$checkout_dir/Pointer.bin" ||
+    fail 'comparison changed the LFS pointer'
+}
+
+comparison_build_failure() {
+  start_compare ''
+  run_case_step checkout.sh 0 COMPARE_REF=baseline
+  run_case_step build.sh 7 COMPARE_REF=baseline STUB_FAIL_BUILD="$1"
+  says "$stress/progress.txt" "$1 build: exit 7"
+  if [ "$1" = compare ]; then
+    says "$stress/progress.txt" 'primary build: exit 0'
+  else
+    if grep -q '^compare ' "$work/case/builds"; then fail 'comparison ran after primary build failed'; fi
+  fi
+  [ ! -e "$work/case/count" ] || fail 'tests ran after a build failure'
+}
+
+comparison_paths() {
+  start_compare 'pass pass'
+  : > "$work/case/outside.csproj"
+  : > "$work/case/outside-target"
+  : > "$work/case/temp/outside-target"
+  run_case_step checkout.sh 0 COMPARE_REF=baseline PROJECT="$1"
+  run_case_step build.sh "$3" COMPARE_REF=baseline PROJECT="$1" BUILD_TARGET="$2"
+  if [ "$3" -eq 0 ]; then
+    run_case_step repeat.sh 0 COMPARE_REF=baseline PROJECT="$1"
+    calls 2
+  else
+    says "$work/case/out" 'outside its checkout'
+    [ ! -e "$work/case/builds" ] || fail 'a build ran before both sides were checked'
+  fi
+}
+
+comparison_alternates() {
+  start_compare 'pass pass pass pass'
+  run_case_step compare-check.sh 0 COMPARE_REF=baseline
+  run_case_step check.sh 0 COMPARE_REF=baseline
+  build_pair CONFIGURATION=Debug NUGET_PACKAGES="$work/case/primary-packages"
   cat > "$work/case/expected" <<EOF_BUILD
 primary Primary.sln Debug $work/case/primary-packages
 compare Compare.slnx Debug $work/case/temp/stress-compare-packages
 EOF_BUILD
-  diff -u "$work/case/expected" "$work/case/builds" || fail 'build each ref with its own solution and packages'
-}
-
-comparison_alternates() {
-  prepare_pair 'pass pass pass pass'
+  diff -u "$work/case/expected" "$work/case/builds" || fail 'build each linked ref with its own solution and packages'
+  [ -f "$work/case/temp/stress-compare/.git" ] || fail 'comparison is not a linked worktree'
+  for stage in 'comparison validation' 'input validation' fetch peel worktree 'compare project' 'primary build' 'compare build'; do
+    says "$stress/progress.txt" "$stage: exit 0"
+  done
   run_case_step repeat.sh 0 COMPARE_REF=baseline ITERATIONS=2 CONFIGURATION=Debug ARTIFACT_ENV=KE_COVERAGE_COST_REPORTS
   compare_packages="$work/case/temp/stress-compare-packages"
   cat > "$work/case/expected" <<EOF_TRACE
@@ -361,30 +424,107 @@ EOF_TRACE
 }
 
 comparison_verdict() {
-  prepare_pair "pass $1"
+  if [ "$1" = primary ]; then start_compare "$2 pass"; else start_compare "pass $2"; fi
+  build_pair
   run_case_step repeat.sh 1 COMPARE_REF=baseline
   calls 2
   has primary/run-1.log; has primary/run-1.trx
   has compare/run-1.log; has compare/run-1.trx
-  grep -qE 'primary.*1 passed, 0 failed, 0 selected nothing' "$work/case/summary" ||
-    fail 'primary side should pass'
-  grep -qE "compare.*$2" "$work/case/summary" || fail 'compare side should have its own verdict'
+  for side in primary compare; do
+    counts='1 passed, 0 failed, 0 selected nothing'
+    if [ "$side" = "$1" ]; then counts=$3; fi
+    grep -qE "$side.*$counts" "$work/case/summary" || fail "$side should report $counts"
+  done
+}
+
+comparison_summary() {
+  start_compare 'pass pass'
+  build_pair
+  # These are legal ref names, and the fences must be longer than their longest backtick spans.
+  # shellcheck disable=SC2016 # literal backticks in the ref names
+  run_case_step repeat.sh 0 'GITHUB_REF=refs/heads/a`b' 'COMPARE_REF=c``d`'
+  # shellcheck disable=SC2016 # literal backticks from the summary's Markdown
+  says "$work/case/summary" '`` refs/heads/a`b ``'
+  # shellcheck disable=SC2016 # literal backticks from the summary's Markdown
+  says "$work/case/summary" '``` c``d` ```'
+}
+
+legacy_environment() {
+  # Read the process environment before a shell interpreter can reinitialize OLDPWD.
+  mkdir -p "$work/legacy-bin"
+  cat > "$work/legacy-bin/dotnet" <<'EOF_DOTNET'
+#!/usr/bin/env python3
+import os
+import sys
+
+with open(os.environ['STUB_OLDPWD'], 'w') as captured:
+    captured.write(os.environ.get('OLDPWD', 'unset') + '\n')
+os.execv(os.environ['STUB_DOTNET'], sys.argv)
+EOF_DOTNET
+  chmod +x "$work/legacy-bin/dotnet"
+  # shellcheck disable=SC2016 # the step shell expands this value at startup
+  printf '%s\n' 'export OLDPWD="$LEGACY_OLDPWD"' > "$work/legacy-env"
+  start_case 'pass'
+  run_case_step repeat.sh 0 PATH="$work/legacy-bin:$work/bin:$PATH" \
+    BASH_ENV="$work/legacy-env" LEGACY_OLDPWD="$work" \
+    STUB_DOTNET="$work/bin/dotnet" STUB_OLDPWD="$work/case/oldpwd"
+  [ "$(cat "$work/case/oldpwd")" = "$work" ] || fail 'primary changed the inherited OLDPWD'
+}
+
+comparison_event_gate() {
+  start_case ''
+  run_case_step compare-check.sh 1 COMPARE_REF=baseline GITHUB_EVENT_NAME="$1"
+  says "$work/case/out" 'compare-ref requires a workflow_dispatch caller'
+  says "$stress/progress.txt" 'primary ref: refs/heads/primary'
+  says "$stress/progress.txt" 'compare ref: baseline'
+  says "$stress/progress.txt" 'comparison validation: exit 1'
+  run_case_step check.sh 0 GITHUB_EVENT_NAME="$1"
+}
+
+comparison_short_tag() {
+  start_compare ''
+  run_case_step check.sh 1 COMPARE_REF=tag
+  says "$work/case/out" 'fully qualified ref'
+  says "$stress/progress.txt" 'input validation: exit 1'
+}
+
+comparison_input_failure() {
+  start_compare ''
+  run_case_step check.sh 1 COMPARE_REF=baseline PROJECT=Missing.csproj
+  says "$stress/progress.txt" 'input validation: exit 1'
+}
+
+comparison_worktree_failure() {
+  start_compare ''
+  mkdir "$work/case/temp/stress-compare"
+  : > "$work/case/temp/stress-compare/occupied"
+  run_case_step checkout.sh 128 COMPARE_REF=baseline
+  says "$stress/progress.txt" 'fetch: exit 0'
+  says "$stress/progress.txt" 'peel: exit 0'
+  says "$stress/progress.txt" "$compare_commit"
+  says "$stress/progress.txt" 'worktree: exit 128'
 }
 
 comparison_bad_ref() {
-  run_step check.sh 1 '' COMPARE_REF="$1"
+  start_case ''
+  mkdir -p "$stress"
+  run_case_step check.sh 1 COMPARE_REF="$1"
   says "$work/case/out" '::error::compare-ref'
 }
 
 comparison_bad_path() {
-  run_step check.sh 1 '' COMPARE_REF=baseline "$1"
+  start_case ''
+  mkdir -p "$stress"
+  run_case_step check.sh 1 COMPARE_REF=baseline "$1"
   says "$work/case/out" '::error::compare-ref requires checkout-relative'
 }
 
 comparison_conflict() {
-  run_step check.sh 0 '' COMPARE_REF=baseline
-  run_step check.sh 0 '' SUPPORT_COST=true
-  run_step check.sh 1 '' COMPARE_REF=baseline SUPPORT_COST=true
+  start_case ''
+  mkdir -p "$stress"
+  run_case_step check.sh 0 COMPARE_REF=baseline
+  run_case_step check.sh 0 SUPPORT_COST=true
+  run_case_step check.sh 1 COMPARE_REF=baseline SUPPORT_COST=true
   says "$work/case/out" '::error::support-cost cannot be used with compare-ref'
 }
 
@@ -392,6 +532,7 @@ comparison_bad_checkout() {
   start_compare ''
   run_case_step checkout.sh 1 COMPARE_REF="$1"
   says "$work/case/out" "::error::$2"
+  says "$stress/progress.txt" "$3: exit 1"
 }
 
 compare_failures=0
@@ -405,19 +546,34 @@ compare_case() {
 }
 compare_case comparison_checkout refs/tags/compare-tag
 compare_case comparison_checkout "$compare_commit"
-compare_case comparison_build
+compare_case comparison_checkout refs/heads/tag
+compare_case comparison_lfs_skip
+compare_case comparison_build_failure primary
+compare_case comparison_build_failure compare
+compare_case comparison_paths Inside.csproj Inside.csproj 0
+compare_case comparison_paths Outside.csproj '' 1
+compare_case comparison_paths Stub.csproj OutsideBuild 1
 compare_case comparison_alternates
-compare_case comparison_verdict fail:3 '0 passed, 1 failed, 0 selected nothing'
-compare_case comparison_verdict empty '0 passed, 0 failed, 1 selected nothing'
+for side in primary compare; do
+  compare_case comparison_verdict "$side" fail:3 '0 passed, 1 failed, 0 selected nothing'
+  compare_case comparison_verdict "$side" empty '0 passed, 0 failed, 1 selected nothing'
+done
+compare_case comparison_summary
+compare_case legacy_environment
+compare_case comparison_event_gate pull_request_target
+compare_case comparison_event_gate workflow_run
+compare_case comparison_short_tag
+compare_case comparison_input_failure
+compare_case comparison_worktree_failure
 compare_case comparison_bad_ref '   '
 compare_case comparison_bad_ref -baseline
 compare_case comparison_bad_ref 'baseline:refs/heads/unwanted'
 compare_case comparison_bad_path "PROJECT=$work/repo/Stub.csproj"
 compare_case comparison_bad_path BUILD_TARGET=../Stub.csproj
 compare_case comparison_conflict
-compare_case comparison_bad_checkout non-commit 'compare-ref must resolve to a commit'
-compare_case comparison_bad_checkout missing-project 'project Stub.csproj does not exist on the comparison ref'
-compare_case comparison_bad_checkout missing-ref 'compare-ref could not be fetched'
+compare_case comparison_bad_checkout non-commit 'compare-ref must resolve to a commit' peel
+compare_case comparison_bad_checkout missing-project 'project Stub.csproj does not exist on the comparison ref' 'compare project'
+compare_case comparison_bad_checkout missing-ref 'compare-ref could not be fetched' fetch
 
 [ "$wiring_failed" -eq 0 ] && [ "$compare_failures" -eq 0 ] || exit 1
 echo "stress-test-workflow tests: $pass passed"

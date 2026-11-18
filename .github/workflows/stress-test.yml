@@ -11,6 +11,8 @@ name: stress-test
 #   gh workflow run stress-test.yml --ref <branch> \
 #     -f project=<Tests project>.csproj -f filter="FullyQualifiedName~<Name>" -f iterations=50 -f load=4
 #
+# Compare mode is manual dispatch only. Use trusted code from the caller repository for both refs.
+#
 # Inputs reach the scripts only through env, never by expression interpolation into a run line, so a filter
 # holding shell metacharacters cannot inject a command.
 
@@ -82,6 +84,25 @@ jobs:
     env:
       GITHUB_PACKAGES_PAT: ${{ secrets.packages-token }}
     steps:
+      - name: Check comparison inputs
+        if: inputs.compare-ref != ''
+        env:
+          COMPARE_REF: ${{ inputs.compare-ref }}
+        run: |
+          results="$RUNNER_TEMP/stress"
+          mkdir -p "$results"
+          progress="$results/progress.txt"
+          {
+            printf 'primary ref: %q\n' "$GITHUB_REF"
+            printf 'compare ref: %q\n' "$COMPARE_REF"
+            printf 'caller event: %s\n' "$GITHUB_EVENT_NAME"
+          } > "$progress"
+          trap 'printf "comparison validation: exit %s\n" "$?" >> "$progress"' EXIT
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            echo "::error::compare-ref requires a workflow_dispatch caller"
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup .NET
@@ -119,6 +140,10 @@ jobs:
           SUPPORT_COST: ${{ inputs.support-cost }}
           ARTIFACT_ENV: ${{ inputs.artifact-env }}
         run: |
+          if [ -n "$COMPARE_REF" ]; then
+            progress="$RUNNER_TEMP/stress/progress.txt"
+            trap 'printf "input validation: exit %s\n" "$?" >> "$progress"' EXIT
+          fi
           case "$CONFIGURATION" in Release|Debug) ;; *) echo "::error::configuration must be Release or Debug"; exit 1 ;; esac
           case "$ITERATIONS" in ''|*[!0-9]*) echo "::error::iterations must be a whole number"; exit 1 ;; esac
           case "$LOAD" in ''|*[!0-9]*) echo "::error::load must be a whole number"; exit 1 ;; esac
@@ -127,6 +152,7 @@ jobs:
           if [ -n "$COMPARE_REF" ]; then
             # Require one source ref so fetch writes one entry to FETCH_HEAD.
             case "$COMPARE_REF" in
+              tag) echo "::error::compare-ref tag requires a fully qualified ref such as refs/heads/tag"; exit 1 ;;
               -*|+*|[[:space:]]*) echo "::error::compare-ref must name a branch, tag or commit"; exit 1 ;;
             esac
             if ! git check-ref-format --allow-onelevel "$COMPARE_REF"; then
@@ -189,21 +215,28 @@ jobs:
           PROJECT: ${{ inputs.project }}
           COMPARE_REF: ${{ inputs.compare-ref }}
         run: |
+          results="$RUNNER_TEMP/stress"
+          progress="$results/progress.txt"
+          stage='primary commit'
+          trap 'printf "%s: exit %s\n" "$stage" "$?" >> "$progress"' EXIT
+          primary_commit=$(git rev-parse HEAD)
+          printf 'primary commit: %s\n' "$primary_commit" >> "$progress"
+
+          stage=fetch
           if ! git fetch --depth=1 --no-tags --no-recurse-submodules --refmap= -- origin "$COMPARE_REF"; then
             echo "::error::compare-ref could not be fetched from the caller repository"
             exit 1
           fi
+          printf 'fetch: exit 0\n' >> "$progress"
+
+          stage=peel
           if ! compare_commit=$(git rev-parse --verify 'FETCH_HEAD^{commit}'); then
             echo "::error::compare-ref must resolve to a commit"
             exit 1
           fi
-          primary_commit=$(git rev-parse HEAD)
-          compare_checkout="$RUNNER_TEMP/stress-compare"
-          git worktree add --detach "$compare_checkout" "$compare_commit"
+          printf 'peel: exit 0\ncompare commit: %s\n' "$compare_commit" >> "$progress"
 
-          # Write the evidence before either build so a build failure can still upload it.
-          results="$RUNNER_TEMP/stress"
-          mkdir -p "$results"
+          stage=metadata
           processor_model=''
           if [ -r /proc/cpuinfo ]; then
             processor_model=$(awk -F ': *' '/^model name[[:space:]]*:/ {print $2; exit}' /proc/cpuinfo)
@@ -214,6 +247,13 @@ jobs:
             printf 'Processor model: %s\n' "${processor_model:-unknown}"
             printf 'Logical processors: %s\n' "$(getconf _NPROCESSORS_ONLN)"
           } > "$results/refs.txt"
+
+          stage=worktree
+          compare_checkout="$RUNNER_TEMP/stress-compare"
+          GIT_LFS_SKIP_SMUDGE=1 git worktree add --detach "$compare_checkout" "$compare_commit"
+          printf 'worktree: exit 0\n' >> "$progress"
+
+          stage='compare project'
           if [ ! -f "$compare_checkout/$PROJECT" ]; then
             echo "::error::project $PROJECT does not exist on the comparison ref"
             exit 1
@@ -230,27 +270,73 @@ jobs:
           COMPARE_REF: ${{ inputs.compare-ref }}
         run: |
           export -n COMPARE_REF
-          build() {
-            local target="$BUILD_TARGET"
+          select_target() {
+            target="$BUILD_TARGET"
             if [ -z "$target" ]; then
               set -- $(ls *.slnx *.sln 2>/dev/null)
               if [ "$#" -eq 1 ]; then target="$1"; else target="$PROJECT"; fi
             fi
-            if [ ! -e "$target" ]; then echo "::error::build target $target does not exist on this ref"; exit 1; fi
-            echo "building $target"
-            dotnet build "$target" -c "$CONFIGURATION"
+            if [ ! -e "$target" ]; then
+              echo "::error::build target $target does not exist on this ref" >&2
+              return 1
+            fi
           }
-          build
-          if [ -n "$COMPARE_REF" ]; then
-            (
-              cd "$RUNNER_TEMP/stress-compare"
-              # A package may have different content under the same version on the two refs.
-              export NUGET_PACKAGES="$RUNNER_TEMP/stress-compare-packages"
-              if [ -f scripts/evict-stale-vendored.sh ]; then sh scripts/evict-stale-vendored.sh; fi
-              if [ -f nuget.config ] && grep -q 'local-feed' nuget.config; then mkdir -p local-feed; fi
-              build
-            )
+          build() {
+            echo "building $1"
+            dotnet build "$1" -c "$CONFIGURATION"
+          }
+          if [ -z "$COMPARE_REF" ]; then
+            select_target
+            build "$target"
+            exit
           fi
+
+          # Check both inputs in both trees before either build starts.
+          verify_path() {
+            local kind="$1" path="$2" root="$3" resolved
+            if ! resolved=$(realpath -- "$path"); then
+              echo "::error::$kind $path could not be resolved" >&2
+              return 1
+            fi
+            case "$resolved" in
+              "$root"|"$root"/*) ;;
+              *) echo "::error::$kind $path resolves outside its checkout" >&2; return 1 ;;
+            esac
+          }
+          verify_tree() (
+            cd "$1" || exit
+            root=$(pwd -P) || exit
+            verify_path project "$PROJECT" "$root" || exit
+            select_target || exit
+            verify_path 'build target' "$target" "$root" || exit
+            printf '%s\n' "$target"
+          )
+
+          progress="$RUNNER_TEMP/stress/progress.txt"
+          compare_checkout="$RUNNER_TEMP/stress-compare"
+          stage='primary paths'
+          trap 'printf "%s: exit %s\n" "$stage" "$?" >> "$progress"' EXIT
+          primary_target=$(verify_tree "$PWD")
+          printf 'primary paths: exit 0\n' >> "$progress"
+          stage='compare paths'
+          compare_target=$(verify_tree "$compare_checkout")
+          printf 'compare paths: exit 0\n' >> "$progress"
+
+          stage='primary build'
+          printf 'primary build: started\n' >> "$progress"
+          build "$primary_target"
+          printf 'primary build: exit 0\n' >> "$progress"
+
+          stage='compare build'
+          printf 'compare build: started\n' >> "$progress"
+          (
+            cd "$compare_checkout"
+            # A package may have different content under the same version on the two refs.
+            export NUGET_PACKAGES="$RUNNER_TEMP/stress-compare-packages"
+            if [ -f scripts/evict-stale-vendored.sh ]; then sh scripts/evict-stale-vendored.sh; fi
+            if [ -f nuget.config ] && grep -q 'local-feed' nuget.config; then mkdir -p local-feed; fi
+            build "$compare_target"
+          )
 
       # A run passes only when dotnet test exits 0 AND the selection executed at least one test: dotnet test
       # exits 0 when a filter matches nothing, so a typo would otherwise report a clean sweep.
@@ -272,16 +358,15 @@ jobs:
           export -n COMPARE_REF
           results="$RUNNER_TEMP/stress"
           mkdir -p "$results"
-          checkouts=("$PWD")
           result_dirs=("$results")
           labels=("")
           if [ -n "$COMPARE_REF" ]; then
-            checkouts+=("$RUNNER_TEMP/stress-compare")
+            compare_checkout="$RUNNER_TEMP/stress-compare"
             result_dirs=("$results/primary" "$results/compare")
             labels=("primary " "compare ")
             mkdir -p "${result_dirs[@]}"
             primary_commit=$(git rev-parse HEAD)
-            compare_commit=$(git -C "${checkouts[1]}" rev-parse HEAD)
+            compare_commit=$(git -C "$compare_checkout" rev-parse HEAD)
           fi
 
           passed=(0 0)
@@ -307,8 +392,11 @@ jobs:
               export DOTNET_TieredCompilation=0
               export KHAOZ_SUPPORT_COST_ARTIFACT="$results/support-cost/run-$n.json"
             fi
-            if (cd "${checkouts[side]}" && "$@" dotnet test "$PROJECT" -c "$CONFIGURATION" --no-build --filter "$FILTER" \
-                --logger "trx;LogFileName=run-$n.trx" --results-directory "$results") >> "$log" 2>&1; then
+            if (
+              if [ "$side" -eq 1 ]; then cd "$compare_checkout" || exit; fi
+              "$@" dotnet test "$PROJECT" -c "$CONFIGURATION" --no-build --filter "$FILTER" \
+                --logger "trx;LogFileName=run-$n.trx" --results-directory "$results"
+            ) >> "$log" 2>&1; then
               status=0
             else
               status=$?
@@ -363,6 +451,11 @@ jobs:
             local side="$1"
             echo "${passed[side]} passed, ${failed[side]} failed, ${empty[side]} selected nothing, of $ITERATIONS runs"
           }
+          literal_ref() {
+            local value="$1" fence='`'
+            while [[ "$value" == *"$fence"* ]]; do fence+='`'; done
+            printf '%s %s %s' "$fence" "$value" "$fence"
+          }
           {
             echo "## stress-test"
             echo ""
@@ -370,8 +463,8 @@ jobs:
             echo "- filter: \`$FILTER\`"
             echo "- load: $LOAD busy loops"
             if [ -n "$COMPARE_REF" ]; then
-              echo "- primary: \`$GITHUB_REF\` (\`$primary_commit\`), $(result 0)"
-              echo "- compare: \`$COMPARE_REF\` (\`$compare_commit\`), $(result 1)"
+              echo "- primary: $(literal_ref "$GITHUB_REF") (\`$primary_commit\`), $(result 0)"
+              echo "- compare: $(literal_ref "$COMPARE_REF") (\`$compare_commit\`), $(result 1)"
             else
               echo "- result: $(result 0)"
               if [ -n "$ARTIFACT_ENV" ]; then
