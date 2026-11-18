@@ -700,21 +700,24 @@ also `publish_docs`. For a job with ID `publish_docs` and display name `Publish 
 `allow-skipped-always: publish_docs` to `allow-skipped-always: '["publish_docs", "Publish docs"]'` when moving
 the pin. The Jobs API exposes the display name and `needs` uses IDs, so each must match in its own list check.
 
-The jobs API can add failures for unfinished, failed, timed out or cancelled jobs. It exempts the finishing
-job only when its `job.check_run_id` matches the API row ID. The finishing job's name does not grant an
-exemption. The API does not list a job still waiting on `CI passed` itself.
+The jobs API exempts the finishing job only when its `job.check_run_id` uniquely matches an API row ID.
+The finishing job's name grants no exemption. A missing or unmatched ID makes a full audit incomplete.
+On a partial run it leaves unfinished rows ambiguous, so the audit checks only completed failures and the
+verdict from `needs`. With an ID match, an unfinished dependency also fails the partial verdict.
 
-A full run must complete the jobs audit and refuses every unapproved skip. The audit reads up to three pages
-of 100 jobs and tries a failed request up to three times with one second between attempts. An unreadable page,
-inconsistent count, unusable row or missing finishing job identity fails the verdict. The job log gives the
-cause under `jobs-audit-incomplete` and asks for a re-run. On a partial run, a failed jobs API read leaves the
-verdict from `needs` in place. The summary can fall back to `needs` without losing audit failures. The APIs
-otherwise supply the summary's names, times and its `Full suite last passed` footer, which counts only
-markers from runs of this repository's own code. Summary cells escape text from git or the API.
+The audit examines available rows even when a later page, the page count or the page limit is unusable.
+A full run requires every other job to be completed with `success` or with an exact-name skip exception.
+Any other state or an incomplete audit fails the full verdict. The audit reads up to three pages of 100
+jobs and tries a failed request up to three times with one second between attempts. An incomplete audit
+logs the cause under `jobs-audit-incomplete` and asks for a re-run. Unreadable data is ignored on partial
+runs. The summary can fall back to `needs` without losing audit failures. The APIs otherwise supply the
+summary's names, times and its `Full suite last passed` footer, which counts only markers from runs of this
+repository's own code. Summary cells escape text from git or the API.
 
-The action writes the summary first, then uploads a marker artifact holding the tree and the run's link, kept
-30 days, then fails the job when the run did not pass. A failed run still shows its summary. A full run that
-passed, with the jobs API read, uploads `ci-passed-full-TREE`. A full run where a job in `needs` reports `failure` uploads
+The action writes the summary, uploads any marker, then fails the job if the verdict failed. A marker holds
+the tree and the run's link and is kept for 30 days. The `ci-passed-full-TREE` marker requires a full run,
+a passed verdict, a complete jobs audit, a summary built without fallback and a readable checkout tree.
+A full run where a job in `needs` reports `failure` uploads
 `ci-failed-full-TREE`, so `ci-tested-tree` does not reuse an older pass of a tree whose newest full run
 failed. A run whose only problems are cancelled or wrongly skipped jobs, and a partial run, upload no
 marker.

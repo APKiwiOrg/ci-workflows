@@ -2,10 +2,10 @@ name: ci-finish
 description: Give a CI run one verdict and one summary, and mark the tree after a full run.
 
 # Runs as the last job under `if: always()`. Its needs must include each job that can run before the
-# verdict. The jobs API can add failures, with only the current check run ID exempt. On a full run an
-# incomplete jobs audit fails the verdict, and a skipped API job fails unless its exact name is always
-# allowed. A partial run keeps the needs verdict when the API cannot be read. Only a full passing run
-# whose audit completed uploads ci-passed-full-TREE. A full run with a failed job in needs uploads
+# verdict. A full run requires every other API job to have completed with success or an exact-name skip
+# exception. An incomplete audit fails a full run. A partial run adds only established failures to the
+# needs verdict, including failures read before an API error. Only a full passing run whose audit and
+# summary completed and whose tree is readable uploads ci-passed-full-TREE. A full run with a failed job in needs uploads
 # ci-failed-full-TREE. The calling job checks the repository out and grants `actions: read`.
 
 inputs:
@@ -28,8 +28,9 @@ inputs:
     default: ''
   full:
     description: >-
-      true when ci-scope made this a full run, so every segment job must run and the tree is marked, false
-      otherwise. Any other value fails the run.
+      true for a full run, false for a partial run. Any other value fails. Full runs require the runner's
+      check run ID to match the finishing job's API row. Without that match, a partial run ignores
+      unfinished rows and still counts completed failures and the needs verdict.
     required: true
   segments:
     description: The JSON list of segments ci-scope selected, used to explain skipped test segments

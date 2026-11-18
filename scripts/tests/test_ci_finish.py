@@ -7,8 +7,10 @@ Every refusal sits beside a control that differs only in that one thing. A fake 
 dictionaries, so no test reaches the network. The one real-process test points the API at a closed local
 port.
 """
+import contextlib
 import datetime
 import importlib.util
+import io
 import itertools
 import json
 import os
@@ -652,8 +654,7 @@ class FinishTests(unittest.TestCase):
                 env = settings(CI_FINISH_NEEDS=needs(scope="success", test_unit="success"))
                 outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
                 self.assertIs(outcome.passed, False)
-                self.assertEqual(outcome.problems,
-                                 ["Unlisted and slow has not finished and needs does not wait for it"])
+                self.assertTrue(any("Unlisted and slow" in problem for problem in outcome.problems))
                 self.assertIn("| CI passed | \U0001F534 Failed |", outcome.summary)
 
     def test_unfinished_job_missing_from_needs_withholds_the_pass_marker(self):
@@ -669,12 +670,13 @@ class FinishTests(unittest.TestCase):
         self.assertIs(outcome.passed, True)
         self.assertEqual(outcome.problems, [])
 
-    def test_unfinished_job_does_not_change_a_failed_verdict(self):
+    def test_known_unfinished_job_is_audited_even_when_needs_failed(self):
         jobs = [job("Scope"), job("Test: unit", "failure"), job("Package", None), own_job()]
         env = settings(CI_FINISH_NEEDS=needs(scope="success", test_unit="failure", test_api="skipped"))
         outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, False)
-        self.assertEqual(outcome.problems, ["test-unit: failure"])
+        self.assertIn("test-unit: failure", outcome.problems)
+        self.assertTrue(any("Package" in problem for problem in outcome.problems))
 
     def test_unrelated_running_job_is_not_exempted_by_the_configured_name(self):
         jobs = [job("Scope"), job("Verdict", None), own_job()]
@@ -713,7 +715,6 @@ class FinishTests(unittest.TestCase):
         self.assertEqual(len(outcome.problems), 1)
         self.assertIn("jobs-audit-incomplete", outcome.problems[0])
         self.assertIn("HTTP 404", outcome.problems[0])
-        self.assertIn("Re-run this job", outcome.problems[0])
 
     @mock.patch("time.sleep")
     def test_transient_jobs_api_error_can_recover_to_a_full_pass(self, _sleep):
@@ -798,12 +799,111 @@ class FinishTests(unittest.TestCase):
         self.assertEqual((outcome.passed, outcome.upload), (False, False))
         self.assertTrue(any("CI passed" in problem for problem in outcome.problems))
 
-    def test_full_run_refuses_an_ambiguous_verdict_name_without_identity(self):
-        env = self.full()
-        del env["CI_FINISH_CHECK_RUN_ID"]
-        jobs = FULL_JOBS + [job("CI passed", None)]
+    def test_full_run_requires_matching_finishing_identity_even_if_all_rows_completed(self):
+        jobs = FULL_JOBS[:-1] + [own_job(conclusion="success")]
+        for identity, passes in ((str(OWN_ID), True), ("999", False)):
+            with self.subTest(identity=identity):
+                env = self.full()
+                env["CI_FINISH_CHECK_RUN_ID"] = identity
+                outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (passes, passes))
+                if not passes:
+                    self.assertTrue(any("jobs-audit-incomplete" in problem for problem in outcome.problems))
+
+    def test_known_and_unknown_conclusions_follow_the_full_and_partial_rules(self):
+        # GitHub status check conclusions, plus a future value and an absent conclusion.
+        cases = (
+            ("success", True, True),
+            ("skipped", False, True),
+            ("neutral", False, True),
+            ("failure", False, False),
+            ("cancelled", False, False),
+            ("timed_out", False, False),
+            ("action_required", False, False),
+            ("stale", False, False),
+            ("startup_failure", False, False),
+            ("example-future-result", False, True),
+            (None, False, True),
+        )
+        name = "checks / Verify output"
+        for conclusion, full_passes, partial_passes in cases:
+            jobs = FULL_JOBS + [dict(job(name), conclusion=conclusion)]
+            for full, passes in ((True, full_passes), (False, partial_passes)):
+                with self.subTest(conclusion=conclusion, full=full):
+                    env = self.full() if full else settings(CI_FINISH_NEEDS=needs(scope="success"))
+                    outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+                    self.assertEqual((outcome.passed, outcome.upload), (passes, full and passes))
+                    if not passes:
+                        self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_partial_audit_keeps_a_returned_failure_when_the_count_is_inconsistent(self):
+        name = "checks / Verify output"
+        for conclusion, passes in (("success", True), ("failure", False)):
+            with self.subTest(conclusion=conclusion):
+                fetch = FakeFetch(FULL_JOBS + [job(name, conclusion)], ARTIFACTS)
+                fetch.answers[JOBS_PATH % (REPO, RUN_ID, 1)]["total_count"] += 1
+                outcome = finish.finish(settings(), fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (passes, False))
+                if not passes:
+                    self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_partial_audit_keeps_a_returned_failure_when_a_later_page_cannot_be_read(self):
+        name = "checks / Verify output"
+        jobs = FULL_JOBS + [job(name, "failure")] + [job("Check %d" % n) for n in range(95)]
+        fetch = FakeFetch(jobs, ARTIFACTS)
+        fetch.answers[JOBS_PATH % (REPO, RUN_ID, 1)]["total_count"] = 101
+        outcome = finish.finish(settings(), fetch, good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertTrue(any(name in problem for problem in outcome.problems))
+
+    def test_partial_audit_does_not_guess_unfinished_job_identity(self):
+        for identity in (None, "", "invalid", "999", str(OWN_ID)):
+            with self.subTest(identity=identity):
+                env = settings()
+                if identity is None:
+                    del env["CI_FINISH_CHECK_RUN_ID"]
+                else:
+                    env["CI_FINISH_CHECK_RUN_ID"] = identity
+                outcome = finish.finish(env, FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.problems, outcome.upload), (True, [], False))
+
+    def test_completed_failure_still_counts_when_partial_identity_is_missing(self):
+        name = "checks / Verify output"
+        jobs = JOBS + [job(name, "failure")]
+        env = settings(CI_FINISH_CHECK_RUN_ID="")
         outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertEqual((outcome.passed, outcome.upload), (False, False))
+        self.assertEqual(len(outcome.problems), 1)
+        self.assertIn(name, outcome.problems[0])
+
+    def test_allow_list_decoder_recursion_writes_a_named_refusal(self):
+        text = "[" * 5000 + "]" * 5000
+        loads = json.loads
+
+        def decode(value):
+            # Older supported Python releases raise RecursionError on this input.
+            if value == text:
+                raise RecursionError("decoder depth")
+            return loads(value)
+
+        env = self.full()
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = text
+        fetch = FakeFetch(FULL_JOBS, ARTIFACTS)
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "outputs")
+            summary_path = os.path.join(tmp, "summary")
+            env.update(GITHUB_OUTPUT=output_path, GITHUB_STEP_SUMMARY=summary_path)
+            log = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(finish.json, "loads", decode), \
+                    mock.patch.object(github_api, "fetch_from_env", return_value=fetch), contextlib.redirect_stdout(log):
+                self.assertEqual(finish.main(), 0)
+            self.assertIn("[invalid-allow-list]", log.getvalue())
+            self.assertIn("allow-skipped-always", log.getvalue())
+            with open(output_path, encoding="utf-8") as output:
+                values = dict(line.strip().split("=", 1) for line in output)
+            self.assertEqual((values["passed"], values["upload"]), ("false", "false"))
+            with open(summary_path, encoding="utf-8") as summary:
+                self.assertIn("| CI passed |", summary.read())
 
     def test_full_run_refuses_an_ambiguous_exact_skip_exception(self):
         name = "checks / Optional report"

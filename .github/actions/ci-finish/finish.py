@@ -4,11 +4,11 @@
 The verdict starts from the calling job's `needs`: a job that failed or was cancelled fails the run, and
 input that is not a JSON object naming at least one job fails it, as does a `full` input other than true or
 false. A skipped job fails it unless its id is in the segment list on a run that is not full, or in the
-always-allowed list and not the segment list. The jobs API can add failures for unfinished, failed,
-timed out or cancelled jobs. On full runs every API job must be auditable. A skip fails unless its exact
-API name is always allowed, including jobs inside reusable workflows. The current check run ID identifies
-the finishing job. An incomplete audit fails a full run and leaves a partial verdict from needs intact.
-The summary uses the job data when available and falls back to needs without changing the verdict.
+always-allowed list and not the segment list. Every available API row is audited. A full run requires
+every other job to complete with success or an explicitly allowed skip. Unreadable data fails a full run.
+On a partial run, only known failures and identifiable unfinished jobs add to the needs verdict. The
+current check run ID identifies the finishing job. Without a match, a partial run cannot tell which
+unfinished row is its own, but still counts completed failures. Summary fallback preserves the verdict.
 
 A full run that passed prepares the ci-passed-full-TREE marker, but only when the jobs API was read, since
 otherwise a job missing from `needs` could have failed unseen. A full run that failed with at least one job
@@ -40,8 +40,8 @@ import github_api  # noqa: E402
 DEFAULT_JOB_NAME = "CI passed"
 MARKER_PREFIX = "ci-passed-full-"
 FAILED_MARKER_PREFIX = "ci-failed-full-"
-# Job conclusions from the API that fail the run when `needs` does not report the job.
-FAILING_CONCLUSIONS = ("failure", "timed_out", "cancelled")
+# Known API conclusions that constitute a failure even on a partial run.
+FAILING_CONCLUSIONS = ("failure", "timed_out", "cancelled", "action_required", "stale", "startup_failure")
 NOT_AN_OBJECT = "needs input is not a JSON object"
 BAD_FULL = "full input is not true or false"
 NOT_AFFECTED = "Not affected by this change"
@@ -147,45 +147,59 @@ def any_failure(needs):
 
 
 def audit_jobs(jobs, own_id, full, allowed_names):
-    # type: (Sequence[Any], Optional[int], bool, Set[str]) -> Tuple[List[str], Optional[str]]
-    """Read usable rows even if another row or a later page prevented a complete audit."""
-    names = Counter(job["name"] for job in jobs
-                    if isinstance(job, dict) and isinstance(job.get("name"), str))
-    seen = set()
+    # type: (Sequence[Any], Optional[int], bool, Set[str]) -> Tuple[List[str], List[str], Optional[int]]
+    """Audit all available rows before deciding whether the jobs list was complete."""
+    ids = Counter(job["id"] for job in jobs if isinstance(job, dict) and type(job.get("id")) is int)
+    names = Counter(job["name"] for job in jobs if isinstance(job, dict) and isinstance(job.get("name"), str))
+    if ids[own_id] != 1:
+        own_id = None
+
     problems = []
-    error = None
+    incomplete = []
+    if full and own_id is None:
+        incomplete.append("the finishing job's check run ID could not be uniquely matched in the jobs API")
     for index, job in enumerate(jobs, 1):
+        label = "jobs API row %d" % index
         if not isinstance(job, dict):
-            error = error or "jobs API row %d is not an object" % index
+            if full:
+                incomplete.append("%s is not an object" % label)
             continue
         job_id, name = job.get("id"), job.get("name")
         status, conclusion = job.get("status"), job.get("conclusion")
-        if full:
-            if type(job_id) is not int or job_id <= 0 or job_id in seen:
-                error = error or "jobs API row %d has an invalid or duplicate ID" % index
-                continue
-            seen.add(job_id)
-            if not isinstance(name, str) or not name or not isinstance(status, str) or not status:
-                error = error or "job %d has no usable API name or status" % job_id
-                continue
-        if own_id is not None and job_id == own_id:
+        valid_id = type(job_id) is int and job_id > 0
+        if valid_id and job_id == own_id:
             continue
+        if isinstance(name, str) and name:
+            label = name
+        elif full:
+            incomplete.append("%s has no usable API name" % label)
+        if full and (not valid_id or ids[job_id] != 1):
+            incomplete.append("%s has an invalid or duplicate ID" % label)
+
         if status != "completed":
-            problems.append("%s has not finished and needs does not wait for it" % name)
-        elif conclusion in FAILING_CONCLUSIONS:
-            problems.append("%s: %s, not reported by needs (missing from needs or allowed to fail)"
-                            % (name, conclusion))
-        elif full and conclusion == "skipped":
-            if name not in allowed_names:
+            if full or own_id is not None:
+                problems.append("%s has not finished and needs does not wait for it" % label)
+            continue
+
+        if not full:
+            if conclusion in FAILING_CONCLUSIONS:
+                problems.append("%s: %s, not reported by needs (missing from needs or allowed to fail)"
+                                % (label, conclusion))
+            continue
+
+        if conclusion == "success":
+            continue
+        if conclusion == "skipped":
+            if not isinstance(name, str) or name not in allowed_names:
                 problems.append("%s was skipped on a full run. List its exact API name in allow-skipped-always "
-                                "only if the job does not test." % name)
+                                "only if the job does not test." % label)
             elif names[name] != 1:
-                error = error or "skip exception %s matches more than one API job" % name
-        elif full and (not isinstance(conclusion, str) or not conclusion):
-            error = error or "%s is completed with no usable conclusion" % name
-    if full and own_id not in seen:
-        error = error or "the finishing job's check run ID could not be found in the jobs API"
-    return problems, error
+                incomplete.append("skip exception %s matches more than one API job" % label)
+        elif conclusion in FAILING_CONCLUSIONS or conclusion == "neutral":
+            problems.append("%s concluded %s on a full run" % (label, conclusion))
+        else:
+            incomplete.append("%s has an unusable conclusion %r" % (label, conclusion))
+    return problems, incomplete, own_id
 
 
 def stage_of(name):
@@ -201,7 +215,6 @@ def stage_of(name):
 def _word(conclusion):
     if conclusion is None:
         return "Running"
-    # Other API conclusions such as timed_out are shown as failures. They never reach the verdict.
     return WORDS.get(conclusion, "Failed")
 
 
@@ -375,7 +388,7 @@ def fetch_jobs(repo, run_id, fetch, attempts=1):
 def _string_list(text):
     try:
         value = json.loads(text) if text else None
-    except ValueError:
+    except Exception:  # noqa: BLE001 Any decoder failure makes the whole input unusable.
         return None
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return value
@@ -442,20 +455,20 @@ def finish(env, fetch, tree_of, now):
     check_run_id = env.get("CI_FINISH_CHECK_RUN_ID", "")
     own_id = int(check_run_id) if re.fullmatch(r"[1-9][0-9]{0,19}", check_run_id) else None
     jobs, read_error = fetch_jobs(repo, env.get("GITHUB_RUN_ID", ""), fetch, JOBS_ATTEMPTS if full else 1)
+    job_problems, incomplete, own_id = audit_jobs(jobs, own_id, full, allowed_names)
+    problems.extend(job_problems)
     notes = []
-    audit_error = None
-    if full or (not problems and read_error is None):
-        job_problems, audit_error = audit_jobs(jobs, own_id, full, allowed_names)
-        problems.extend(job_problems)
-    if full and (read_error or audit_error):
-        cause = ". ".join(error for error in (read_error, audit_error) if error)
+    if full and (read_error or incomplete):
+        cause = ". ".join(([read_error] if read_error else []) + incomplete)
         problems.append("[jobs-audit-incomplete] %s. Re-run this job." % cause)
     if read_error:
         notes.append("Jobs API unavailable, summary built from needs: %s" % read_error)
-    if own_id is not None and any(isinstance(job, dict) and job.get("id") == own_id for job in jobs):
+    if own_id is not None:
         notes.append("Finishing job check run ID matched jobs API: %d" % own_id)
+    elif not full and jobs:
+        notes.append("Finishing job identity unavailable, unfinished jobs omitted from the verdict.")
     passed = not problems
-    jobs_read = read_error is None and audit_error is None
+    jobs_read = read_error is None and not incomplete
     footer = "not recorded"
     if full and passed and jobs_read:
         footer = "this run"
