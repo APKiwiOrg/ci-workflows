@@ -708,9 +708,12 @@ verdict from `needs`. With an ID match, an unfinished dependency also fails the 
 The audit examines available rows even when a later page, the page count or the page limit is unusable.
 A full run requires every other job to be completed with `success` or with an exact-name skip exception.
 Any other state or an incomplete audit fails the full verdict. The audit reads up to three pages of 100
-jobs and tries a failed request up to three times with one second between attempts. An incomplete audit
-logs the cause under `jobs-audit-incomplete` and asks for a re-run. Unreadable data is ignored on partial
-runs. The summary can fall back to `needs` without losing audit failures. The APIs otherwise supply the
+jobs. On full runs it tries transient network errors, timeouts, HTTP 429 and 5xx up to three times, with
+one second between attempts. Permanent HTTP errors and invalid bodies are refused on the first attempt.
+All jobs requests, waits, response bodies and the optional artifact footer share a 45-second wall-clock
+budget, leaving time to write the summary and outputs in a five-minute job. An incomplete audit logs its
+cause under `jobs-audit-incomplete` and asks for a re-run. Unreadable data is ignored on partial runs.
+The summary can fall back to `needs` without losing audit failures. The APIs otherwise supply the
 summary's names, times and its `Full suite last passed` footer, which counts only markers from runs of this
 repository's own code. Summary cells escape text from git or the API.
 

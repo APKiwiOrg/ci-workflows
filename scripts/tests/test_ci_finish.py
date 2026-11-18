@@ -17,7 +17,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -461,6 +463,38 @@ class FetchJobsTests(unittest.TestCase):
         self.assertIsNotNone(error)
 
 
+class ApiResponse(io.BytesIO):
+    status = 200
+
+
+def response(payload):
+    return ApiResponse(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+
+
+def http_error(status):
+    return urllib.error.HTTPError("https://api.example.test/jobs", status, "error", {}, io.BytesIO())
+
+
+class JobsTransport:
+    """Serve the supplied jobs responses through the real GitHub HTTP adapter."""
+
+    def __init__(self, *replies):
+        self.jobs_requests = []
+        self.replies = iter(replies)
+        self.fetch = github_api.make_fetch("", "https://api.example.test", self.open_url)
+
+    def open_url(self, request, timeout):
+        if request.selector == ARTIFACTS_PATH:
+            return response({"artifacts": ARTIFACTS})
+        self.jobs_requests.append(request.selector)
+        item = next(self.replies, None)
+        if item is None:
+            item = http_error(404)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
 def settings(**overrides):
     env = {
         "CI_FINISH_NEEDS": needs(scope="success", test_unit="success", test_api="skipped"),
@@ -717,19 +751,56 @@ class FinishTests(unittest.TestCase):
         self.assertIn("HTTP 404", outcome.problems[0])
 
     @mock.patch("time.sleep")
-    def test_transient_jobs_api_error_can_recover_to_a_full_pass(self, _sleep):
-        good_fetch = FakeFetch(FULL_JOBS, ARTIFACTS)
-        first = True
+    def test_transient_jobs_request_can_recover_to_a_full_pass(self, _sleep):
+        for first_error in (http_error(429), http_error(503),
+                            urllib.error.URLError(ConnectionResetError()), TimeoutError()):
+            with self.subTest(error=first_error):
+                transport = JobsTransport(first_error, response({"total_count": len(FULL_JOBS), "jobs": FULL_JOBS}))
+                outcome = finish.finish(self.full(), transport.fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+                self.assertEqual(len(transport.jobs_requests), 2)
 
-        def fetch(path):
-            nonlocal first
-            if first and path == JOBS_PATH % (REPO, RUN_ID, 1):
-                first = False
-                raise github_api.ApiError("HTTP 503")
-            return good_fetch(path)
+    @mock.patch("time.sleep")
+    def test_permanent_jobs_response_is_refused_without_retry(self, _sleep):
+        for payload, status in ((http_error(401), 401), (http_error(403), 403), (http_error(404), 404),
+                                (response(b"<html>"), 200), (response([]), 200)):
+            with self.subTest(status=status):
+                transport = JobsTransport(payload)
+                outcome = finish.finish(self.full(), transport.fetch, good_tree, NOW)
+                self.assertEqual((outcome.passed, outcome.upload), (False, False))
+                self.assertEqual(len(transport.jobs_requests), 1)
+                self.assertIn("jobs-audit-incomplete", outcome.problems[0])
+                self.assertIn("HTTP %d" % status, outcome.problems[0])
 
-        outcome = finish.finish(self.full(), fetch, good_tree, NOW)
-        self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+    def test_jobs_audit_budget_covers_a_later_response_body(self):
+        jobs = FULL_JOBS + [job("Check %d" % n) for n in range(97)]
+        entered_body = threading.Event()
+        release_body = threading.Event()
+        closed_body = threading.Event()
+
+        class SlowBody(ApiResponse):
+            def read(self):
+                entered_body.set()
+                release_body.wait(0.8)
+                return super().read()
+
+            def close(self):
+                super().close()
+                closed_body.set()
+
+        transport = JobsTransport(
+            response({"total_count": 101, "jobs": jobs[:100]}),
+            SlowBody(json.dumps({"total_count": 101, "jobs": jobs[100:]}).encode()))
+        try:
+            with mock.patch.object(finish, "AUDIT_BUDGET_SECONDS", 0.25, create=True):
+                outcome = finish.finish(self.full(), transport.fetch, good_tree, NOW)
+            self.assertTrue(entered_body.is_set())
+            self.assertEqual((outcome.passed, outcome.upload), (False, False))
+            self.assertIn("jobs-audit-incomplete", outcome.problems[0])
+            self.assertIn("0.25", outcome.problems[0])
+        finally:
+            release_body.set()
+            closed_body.wait(1)
 
     @mock.patch("time.sleep")
     def test_skip_found_before_a_later_page_error_is_preserved(self, _sleep):

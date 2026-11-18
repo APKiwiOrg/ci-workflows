@@ -26,10 +26,12 @@ library only.
 import datetime
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from typing import Any, Callable, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
@@ -49,6 +51,7 @@ JOBS_PER_PAGE = 100
 JOB_PAGES = 3
 JOBS_ATTEMPTS = 3
 JOBS_RETRY_SECONDS = 1
+AUDIT_BUDGET_SECONDS = 45
 
 _JOB_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 _STAGE = re.compile(r"(?:Scope|Build|Build and test|Test|Package|CI passed|(?:Test|Package|Deploy): \S.*)")
@@ -346,24 +349,63 @@ def render(title, event, passed, rows, footer, seconds=None):
     return "\n".join(out)
 
 
-def _fetch_job_page(path, fetch, attempts):
-    for _ in range(attempts - 1):
+class AuditFetch:
+    """Share one deadline across job pages, retries and the optional artifact footer."""
+
+    def __init__(self, fetch, attempts):
+        self.fetch = fetch
+        self.attempts = attempts
+        self.deadline = time.monotonic() + AUDIT_BUDGET_SECONDS
+
+    def _timeout(self):
+        return github_api.ApiError("API audit exceeded its %g-second budget" % AUDIT_BUDGET_SECONDS)
+
+    def _remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._timeout()
+        return remaining
+
+    def request(self, path):
+        self._remaining()
+        result = queue.Queue(maxsize=1)
+
+        def read():
+            try:
+                result.put((self.fetch(path), None))
+            except Exception as error:  # noqa: BLE001 The caller handles the API failure.
+                result.put((None, error))
+
+        # urllib's socket timeout is not a total body timeout. The short-lived action
+        # can return its verdict even if a network read is still blocked.
+        threading.Thread(target=read, daemon=True).start()
         try:
-            return fetch(path)
-        except Exception:  # noqa: BLE001 A failed request can be retried without losing earlier pages.
-            time.sleep(JOBS_RETRY_SECONDS)
-    return fetch(path)
+            answer, error = result.get(timeout=self._remaining())
+        except queue.Empty:
+            raise self._timeout()
+        if error is not None:
+            raise error
+        return answer
+
+    def jobs(self, path):
+        for attempt in range(self.attempts):
+            try:
+                return self.request(path)
+            except github_api.ApiError as error:
+                if not error.retryable or attempt == self.attempts - 1:
+                    raise
+                time.sleep(min(JOBS_RETRY_SECONDS, self._remaining()))
 
 
-def fetch_jobs(repo, run_id, fetch, attempts=1):
-    # type: (str, str, github_api.Fetch, int) -> Tuple[List[Any], Optional[str]]
+def fetch_jobs(repo, run_id, fetch):
+    # type: (str, str, github_api.Fetch) -> Tuple[List[Any], Optional[str]]
     """Return the rows read and the reason if they do not cover the reported count."""
     jobs = []  # type: List[Any]
     total = None
     for page in range(1, JOB_PAGES + 1):
         path = "/repos/%s/actions/runs/%s/jobs?per_page=%d&page=%d" % (repo, run_id, JOBS_PER_PAGE, page)
         try:
-            answer = _fetch_job_page(path, fetch, attempts)
+            answer = fetch(path)
         except Exception as error:  # noqa: BLE001 The verdict still needs the earlier pages.
             return jobs, "jobs API page %d could not be read: %s" % (page, error)
         batch = answer.get("jobs") if isinstance(answer, dict) else None
@@ -454,7 +496,8 @@ def finish(env, fetch, tree_of, now):
     repo = env.get("GITHUB_REPOSITORY", "")
     check_run_id = env.get("CI_FINISH_CHECK_RUN_ID", "")
     own_id = int(check_run_id) if re.fullmatch(r"[1-9][0-9]{0,19}", check_run_id) else None
-    jobs, read_error = fetch_jobs(repo, env.get("GITHUB_RUN_ID", ""), fetch, JOBS_ATTEMPTS if full else 1)
+    api = AuditFetch(fetch, JOBS_ATTEMPTS if full else 1)
+    jobs, read_error = fetch_jobs(repo, env.get("GITHUB_RUN_ID", ""), api.jobs)
     job_problems, incomplete, own_id = audit_jobs(jobs, own_id, full, allowed_names)
     problems.extend(job_problems)
     notes = []
@@ -474,7 +517,7 @@ def finish(env, fetch, tree_of, now):
         footer = "this run"
     else:
         try:
-            answer = fetch("/repos/%s/actions/artifacts?per_page=100" % repo)
+            answer = api.request("/repos/%s/actions/artifacts?per_page=100" % repo)
             artifacts = answer.get("artifacts")
             footer = last_full_pass(artifacts if isinstance(artifacts, list) else [], now)
         except Exception as error:  # noqa: BLE001 Only the footer depends on this.
