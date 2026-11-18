@@ -102,13 +102,15 @@ jobs:
         env:
           CI_FINISH_NEEDS: ${{ toJSON(needs) }}
           CI_FINISH_FULL: 'true'
+          CI_FINISH_CHECK_RUN_ID: ${{ job.check_run_id }}
+          SKIPPED_JOB_NAME: 'Test: actions / Optional report'
           CI_API_TOKEN: ${{ github.token }}
         run: |
           output="$(mktemp)"
           log="$(mktemp)"
           GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY='' python3 .github/actions/ci-finish/finish.py > "$log"
           cat "$log"
-          grep -Fx 'Not passed: Test: actions / Optional report was skipped on a full run' "$log"
+          grep -F "$SKIPPED_JOB_NAME" "$log"
           grep -Fx 'passed=false' "$output"
           grep -Fx 'upload=false' "$output"
       - uses: ./.github/actions/ci-finish

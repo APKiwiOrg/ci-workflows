@@ -665,13 +665,13 @@ as the last job, `CI passed`.
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `needs` | required | The calling job's `${{ toJSON(needs) }}`. |
-| `allow-skipped` | empty | Job ids skipped when their segment is not selected, separated by spaces or commas. |
-| `allow-skipped-always` | empty | Job ids that may be skipped on any run, separated by spaces or commas, or a JSON array of job ids and exact API names. |
+| `allow-skipped` | empty | Direct job IDs in `needs` that may skip on partial runs. |
+| `allow-skipped-always` | empty | IDs and exact API names of jobs that do not test and may skip on any run. |
 | `full` | required | `true` when `ci-scope` made this a full run, so every segment job must run, `false` otherwise. Any other value fails the run. |
 | `segments` | empty | The JSON list of segments `ci-scope` selected, used to explain skipped test segments. |
 | `scope-reason` | empty | The reason `ci-scope` gave, shown on the `Scope` row. |
 | `title` | empty | Summary heading. Empty means the repository's name followed by `CI`. |
-| `job-name` | `CI passed` | Display name of the job that runs the action, so its row is the verdict and comes last. It must match, or the job counts itself as unfinished and the run fails. |
+| `job-name` | `CI passed` | Legacy input accepted for compatibility. The action identifies itself by check run ID. |
 | `token` | `${{ github.token }}` | Token that can read the run's jobs and the repository's artifacts. |
 
 It has no outputs. The calling job runs under `if: always()`, needs `actions: read` and `contents: read`, and
@@ -683,34 +683,41 @@ The verdict starts from `needs`. A job that succeeded passes. A failed or cancel
 does empty or malformed `needs` or a `full` value other than `true` or `false`. A skipped job fails the run
 unless its id is listed:
 
-- `allow-skipped` names the `Test: SEGMENT` jobs, which are skipped when their segment is not selected. On a
-  full run every segment runs, so a skip of one of them fails the run, even when its id is in
-  `allow-skipped-always` too.
-- `allow-skipped-always` names jobs that do not test and may skip on any run, such as a deploy that runs
-  only on the default branch. Use the job id for `needs` and its exact name from the jobs API for the
-  full-run scan. Include both if they differ. For a job inside a reusable workflow, use its full API name,
-  including the caller prefix, for example `allow-skipped-always: '["checks / Publish docs"]'`. The JSON
-  array preserves spaces and commas in job names.
+- `allow-skipped` holds only IDs of direct jobs in `needs`. A skip of one of them fails a full run,
+  even if its ID is also listed in `allow-skipped-always`.
+- `allow-skipped-always` is for jobs that do not test, such as a deploy that runs only on the default
+  branch. Use the direct job ID for `needs` and the exact jobs API display name for the full-run audit.
+  A nested job is excused only by its exact API name, including the caller prefix, for example
+  `allow-skipped-always: '["checks / Publish docs"]'`. Duplicate API names make a skip exception ambiguous
+  and fail the audit.
 
-The jobs API can then only turn a pass into a fail, never the reverse. A job of the run that has not
-finished, or that failed, timed out or was cancelled, and that `needs` does not report, fails the run. That
-catches a job missing from `needs` whether it already failed or is still going, and it means a job allowed to
-fail (`continue-on-error`) does not belong in the workflow whose verdict this is. On a full run, an
-unapproved skip reported by the jobs API also fails the verdict and withholds the pass marker, including
-a skipped job inside a reusable workflow. On partial runs the API skips do not affect the verdict. While
-`CI passed` runs, the jobs API does not list a job that needs it, so such a job never counts. An API error
-leaves the verdict from `needs` unchanged and withholds the pass marker, since a job missing from `needs`
-could have failed unseen. The APIs otherwise supply the summary's names, times and its
-`Full suite last passed` footer, which counts only markers from runs of this
-repository's own code. Text from git or the API is escaped in the summary, so a file or job name cannot
-render as a link or other Markdown.
+Both inputs take job IDs matching `[A-Za-z_][A-Za-z0-9_-]*`, separated by spaces or commas, or a JSON array
+of strings. Only `allow-skipped-always` accepts display names in the JSON form, which preserves spaces and
+commas. A malformed list fails the verdict with the input name and grants no exemptions.
+
+**Moving the pin.** A full run can still use `allow-skipped-always: publish_docs` when the API job name is
+also `publish_docs`. For a job with ID `publish_docs` and display name `Publish docs`, change the old
+`allow-skipped-always: publish_docs` to `allow-skipped-always: '["publish_docs", "Publish docs"]'` when moving
+the pin. The Jobs API exposes the display name and `needs` uses IDs, so each must match in its own list check.
+
+The jobs API can add failures for unfinished, failed, timed out or cancelled jobs. It exempts the finishing
+job only when its `job.check_run_id` matches the API row ID. The finishing job's name does not grant an
+exemption. The API does not list a job still waiting on `CI passed` itself.
+
+A full run must complete the jobs audit and refuses every unapproved skip. The audit reads up to three pages
+of 100 jobs and tries a failed request up to three times with one second between attempts. An unreadable page,
+inconsistent count, unusable row or missing finishing job identity fails the verdict. The job log gives the
+cause under `jobs-audit-incomplete` and asks for a re-run. On a partial run, a failed jobs API read leaves the
+verdict from `needs` in place. The summary can fall back to `needs` without losing audit failures. The APIs
+otherwise supply the summary's names, times and its `Full suite last passed` footer, which counts only
+markers from runs of this repository's own code. Summary cells escape text from git or the API.
 
 The action writes the summary first, then uploads a marker artifact holding the tree and the run's link, kept
 30 days, then fails the job when the run did not pass. A failed run still shows its summary. A full run that
 passed, with the jobs API read, uploads `ci-passed-full-TREE`. A full run where a job in `needs` reports `failure` uploads
 `ci-failed-full-TREE`, so `ci-tested-tree` does not reuse an older pass of a tree whose newest full run
 failed. A run whose only problems are cancelled or wrongly skipped jobs, and a partial run, upload no
-marker. A job inside a reusable workflow is matched as `CALLER / NAME` when `job-name` is set to its name.
+marker.
 
 ```yaml
 - uses: actions/checkout@<full commit sha>
@@ -815,7 +822,7 @@ The wiring that matters:
 - `allow-skipped` lists the `Test: SEGMENT` jobs, which skip when their segment is not selected. A skip of
   one of them fails a full run.
 - `allow-skipped-always` lists jobs that do not test and skip by design, such as a deploy that runs only on
-  `main`. It is empty here because every job runs on every run.
+  `main`. It is empty here because every job runs on a full run.
 - `CI passed` passes `full` from `Scope`, so only a full run leaves the marker that `ci-tested-tree` reads.
   The input is required, and an empty value, as when `Scope` failed, fails the run.
 - A job allowed to fail does not belong in this workflow: `CI passed` fails when any job of the run fails,
