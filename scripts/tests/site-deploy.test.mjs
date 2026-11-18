@@ -213,6 +213,12 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     ['an empty fragment', 'https://example.test#'],
     ['a missing host', 'https:///example.test'],
     ['an invalid port', 'https://example.test:65536'],
+    ['a hexadecimal host', 'https://0xc0000201'],
+    ['a decimal host', 'https://3221225985'],
+    ['an explicit default port', 'https://example.test:443'],
+    ['an internationalized host', 'https://münich.example'],
+    ['a Unicode case rewrite', 'https://K.example.test'],
+    ['a percent-encoded host', 'https://%65xample.test'],
     ['a line break', 'https://example.test\n'],
   ]) {
     test('the refresh guard refuses invalid SITE_ORIGIN with ' + label + ' before any request', () => {
@@ -221,22 +227,23 @@ describe('disabled and unverified SHAs cannot deploy', () => {
       assert.deepEqual(result.calls, [])
       assert.deepEqual(result.fetch, [])
       assert.equal(result.output, '')
-      assert.match(result.stderr, /^::error::SITE_ORIGIN must be the site's https origin\b/mu)
+      assert.match(result.stderr, /^::error::SITE_ORIGIN must be the site's https origin as the browser shows it\b/mu)
       assert.ok(!result.stderr.includes(value))
     })
   }
 
-  for (const value of [
-    'https://example.test',
-    'https://example.test/',
-    'https://example.test:8443',
-    'https://[2001:db8::1]:8443/',
+  for (const [value, expectedOrigin] of [
+    ['https://example.test', 'https://example.test'],
+    ['https://Example.TEST', 'https://example.test'],
+    ['https://example.test/', 'https://example.test'],
+    ['https://example.test:8443', 'https://example.test:8443'],
+    ['https://[2001:db8::1]:8443/', 'https://[2001:db8::1]:8443'],
   ]) {
     test('a refresh deploys when the requested green SHA is live at ' + value, () => {
       const result = guardStep(selectStep, { ...refresh, SITE_ORIGIN: value }, { runs: '1' })
       assert.equal(result.status, 0, result.stderr)
       assert.equal(result.output, `sha=${sha}\n`)
-      assert.equal(result.fetch.at(-1), value.replace(/\/$/u, '') + '/_catalog/snapshot.json')
+      assert.equal(result.fetch.at(-1), expectedOrigin + '/_catalog/snapshot.json')
       assert.equal(result.fetch[result.fetch.indexOf('--max-time') + 1], '30')
       assert.equal(envExpression('guard', 'REFRESH'), 'inputs.refresh')
       assert.equal(envExpression('guard', 'SITE_ORIGIN'), 'inputs.site-origin')

@@ -107,14 +107,14 @@ jobs:
             fi
             if [ "$REFRESH" = "true" ]; then
               if ! snapshot_origin=$(node --input-type=module -e '
-                const input = process.env.SITE_ORIGIN
-                // Check the supplied form before URL parsing can normalize it.
-                const bareHttps = /^https:\/\/(?:\[[a-f0-9:.]+\]|[^:\/?#@\\[\]\s\p{Cc}]+)(?::[0-9]+)?\/?$/iu
-                const url = bareHttps.test(input) ? URL.parse(input) : null
-                if (!url) process.exit(1)
+                const input = process.env.SITE_ORIGIN ?? ""
+                const url = URL.parse(input)
+                // Fold ASCII case only so Unicode hostname rewrites still fail the comparison.
+                const writtenOrigin = input.replace(/\/$/u, "").replace(/[A-Z]/gu, (letter) => letter.toLowerCase())
+                if (url?.protocol !== "https:" || url.origin !== writtenOrigin) process.exit(1)
                 console.log(url.origin)
               '); then
-                echo "::error::SITE_ORIGIN must be the site's https origin with no credentials, query, fragment or path beyond /." >&2
+                echo "::error::SITE_ORIGIN must be the site's https origin as the browser shows it. Use the scheme, host and any port shown." >&2
                 exit 1
               fi
             fi

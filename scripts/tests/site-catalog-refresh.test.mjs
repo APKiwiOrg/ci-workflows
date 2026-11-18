@@ -114,6 +114,12 @@ for (const [label, value] of [
   ['an empty fragment', 'https://example.test#'],
   ['a missing host', 'https:///example.test'],
   ['an invalid port', 'https://example.test:65536'],
+  ['a hexadecimal host', 'https://0xc0000201'],
+  ['a decimal host', 'https://3221225985'],
+  ['an explicit default port', 'https://example.test:443'],
+  ['an internationalized host', 'https://münich.example'],
+  ['a Unicode case rewrite', 'https://K.example.test'],
+  ['a percent-encoded host', 'https://%65xample.test'],
   ['a line break', 'https://example.test\n'],
 ]) {
   test('the refresh refuses invalid SITE_ORIGIN with ' + label + ' before any request', () => {
@@ -121,7 +127,7 @@ for (const [label, value] of [
     assert.equal(result.status, 1)
     assert.deepEqual(result.requests, [])
     assert.equal(result.stdout, '')
-    assert.match(result.stderr, /^::error::SITE_ORIGIN must be the site's https origin\b[^\n]*\n$/u)
+    assert.match(result.stderr, /^::error::SITE_ORIGIN must be the site's https origin as the browser shows it\b[^\n]*\n$/u)
     assert.ok(!result.stderr.includes(value))
   })
 }
@@ -195,11 +201,12 @@ test('a transport error prevents a dispatch even if a body was written', () => {
   assert.equal(result.stdout, '')
 })
 
-for (const value of [
-  'https://example.test',
-  'https://example.test/',
-  'https://example.test:8443',
-  'https://[2001:db8::1]:8443/',
+for (const [value, expectedOrigin] of [
+  ['https://example.test', 'https://example.test'],
+  ['https://Example.TEST', 'https://example.test'],
+  ['https://example.test/', 'https://example.test'],
+  ['https://example.test:8443', 'https://example.test:8443'],
+  ['https://[2001:db8::1]:8443/', 'https://[2001:db8::1]:8443'],
 ]) {
   test('an all-completed page dispatches deploy.yml with origin ' + value, () => {
     const result = runRefresh({
@@ -208,7 +215,7 @@ for (const value of [
     assert.equal(result.status, 0, result.stderr)
     assert.equal(result.stdout, 'workflow\nrun\ndeploy.yml\n--ref\nmain\n-f\nsha=' + sha + '\n-f\nrefresh=true\n')
     const curlArgs = result.stderr.trim().split('\n')
-    assert.equal(curlArgs.at(-1), value.replace(/\/$/u, '') + '/_catalog/snapshot.json')
+    assert.equal(curlArgs.at(-1), expectedOrigin + '/_catalog/snapshot.json')
     assert.equal(curlArgs[curlArgs.indexOf('--max-time') + 1], '30')
     assert.ok(!curlArgs.includes('--location'))
     assert.ok(!curlArgs.includes('-L'))
