@@ -63,8 +63,9 @@ need(checkout and step_order.index('Cache NuGet packages') < step_order.index(ch
      'comparison checkout stays outside primary cache key calculation and both builds precede testing')
 need(free_disk.get('if') == "inputs.compare-ref != ''",
      'disk cleanup runs only in compare mode')
-need(free_disk and step_order.index('Check the inputs') < step_order.index(free_disk['name'])
-     < step_order.index('Build once'), 'disk cleanup follows input checks and precedes both builds')
+need(free_disk and checkout and step_order.index('Check the inputs') < step_order.index(free_disk['name'])
+     < step_order.index(checkout['name']) < step_order.index('Build once'),
+     'disk cleanup follows input checks and precedes the comparison checkout and both builds')
 need(free_disk and not free_disk.get('continue-on-error') and 'if' not in steps['Build once']
      and 'if' not in repeat, 'disk cleanup failure skips both builds and the runs')
 need(repeat.get('timeout-minutes') == "${{ inputs.compare-ref != '' && 150 || (inputs.artifact-env != '' && 60 || 90) }}",
@@ -488,6 +489,13 @@ comparison_disk_floor() {
   says "$stress/progress.txt" "disk-before-freeing-$1${tab}524288"
   says "$stress/progress.txt" "disk-after-freeing-$1${tab}$available"
   [ ! -e "$work/case/builds" ] && [ ! -e "$work/case/count" ] || fail 'a build or run started during preflight'
+  [ "$required" = 16777216 ] || fail 'the comparison floor is not 16 GiB'
+
+  # One kibibyte under the floor is refused with both figures, and the floor itself is accepted.
+  start_compare 'pass pass'
+  printf '%s\n' 524288 16777215 > "$work/case/disk/$1"
+  run_case_step free-disk.sh 1
+  says "$work/case/out" '16777215 KiB available, 16777216 KiB required'
 
   start_compare 'pass pass'
   printf '%s\n' 524288 "$required" > "$work/case/disk/$1"
