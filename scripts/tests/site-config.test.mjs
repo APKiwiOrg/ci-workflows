@@ -147,34 +147,45 @@ const [deployPath] = workflows[1]
 
 describe('capabilities control the consumer steps', () => {
   test('every CI job depends on validated config before any install', () => {
-    for (const id of ['checks', 'repo', 'secrets', 'infra', 'audit', 'sql']) {
+    for (const id of ['checks', 'repo', 'secrets', 'infra']) {
       assert.match(jobBlock(ciPath, id), /^ {4}needs: config$/mu)
     }
-    assert.match(jobBlock(ciPath, 'e2e'), /^ {4}needs: \[config, checks\]$/mu)
   })
 
-  test('SQL runs only for accounts sites after config validation', () => {
-    const source = jobBlock(ciPath, 'sql').match(/^ {4}if: (.+)$/mu)?.[1]
-    assert.equal(source, "needs.config.outputs.has-accounts == 'true'")
-    for (const [capability, expected] of [['false', false], ['true', true]]) {
+  test('SQL runs only for accounts with full or SQL scope after config validation', () => {
+    const source = jobBlock(ciPath, 'checks').match(/^ {6}RUN_SQL: \$\{\{ (.+) \}\}$/mu)?.[1]
+    assert.ok(source, 'SQL has a capability and scope condition')
+    for (const capability of ['false', 'true']) {
       const outputs = fixtureOutputs(ciPath, 'config', { ...values, 'has-accounts': capability })
-      assert.equal(runInNewContext(source.replaceAll('outputs.has-accounts', "outputs['has-accounts']"), {
-        needs: { config: { outputs } },
-      }), expected)
+      for (const [full, segments, selected] of [[false, ['site'], false], [false, ['sql'], true], [true, [], true]]) {
+        assert.equal(runInNewContext(source.replaceAll('outputs.has-accounts', "outputs['has-accounts']"), {
+          needs: { config: { outputs } },
+          inputs: { full, segments: JSON.stringify(segments) },
+          contains: (list, item) => list.includes(item),
+          fromJSON: JSON.parse,
+        }), capability === 'true' && selected)
+      }
     }
   })
 
-  test('theme and token builds only run for their capabilities', () => {
-    const plain = fixtureOutputs(ciPath, 'config', values)
-    const themed = fixtureOutputs(ciPath, 'config', { ...values, 'has-theme': 'true', analytics: 'cloudflare' })
-    assert.equal(condition(ciPath, 'checks', 'Theme conventions', plain), false)
-    assert.equal(condition(ciPath, 'checks', 'Theme conventions', themed), true)
-    for (const id of ['checks', 'e2e']) {
-      assert.equal(condition(ciPath, id, 'Build with analytics', plain), false)
-      assert.equal(condition(ciPath, id, 'Build with analytics', themed), true)
-      assert.equal(condition(ciPath, id, 'Build', plain), true)
-      assert.equal(condition(ciPath, id, 'Build', themed), false)
+  test('CI runs the theme check only when config says it applies', () => {
+    const name = "'Test: site'"
+    const source = stepBlock(ciPath, 'checks', name).match(/^ {10}HAS_THEME: \$\{\{ (.+) \}\}$/mu)?.[1]
+    assert.ok(source, 'CI reads the theme capability')
+    for (const capability of ['false', 'true']) {
+      const outputs = fixtureOutputs(ciPath, 'config', { ...values, 'has-theme': capability })
+      const theme = runInNewContext(source.replaceAll('outputs.has-theme', "outputs['has-theme']"), {
+        needs: { config: { outputs } },
+      })
+      const folder = fixture()
+      writeFileSync(join(folder, 'npm'), '#!/bin/sh\nprintf "%s\\n" "$*"\n', { mode: 0o700 })
+      const result = run(folder, stepScript(ciPath, 'checks', name), { PATH: `${folder}:${process.env.PATH}`, HAS_THEME: theme })
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.stdout.split('\n').includes('run check:theme'), capability === 'true')
     }
+  })
+
+  test('deploy keeps both analytics capability paths', () => {
     const deploy = fixtureOutputs(deployPath, 'config', values)
     assert.equal(condition(deployPath, 'build', 'Build site with analytics', deploy), false)
     assert.equal(condition(deployPath, 'build', 'Build site with analytics', { ...deploy, analytics: 'cloudflare' }), true)
@@ -198,12 +209,14 @@ describe('capabilities control the consumer steps', () => {
     writeFileSync(join(folder, 'npm'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$NPM_LOG"\n', { mode: 0o700 })
     const log = join(folder, 'npm-log')
     const env = { PATH: `${folder}:${process.env.PATH}`, NPM_LOG: log }
-    const script = ['Install api', 'Typecheck api', 'Test api'].map((name) => stepScript(ciPath, 'checks', name)).join('\n')
+    const script = ['Install api', "'Test: site'"].map((name) => stepScript(ciPath, 'checks', name)).join('\n')
+    const apiCalls = () => readFileSync(log, 'utf8').trim().split('\n').filter((call) => call.endsWith('--prefix api'))
     assert.equal(run(folder, script, env).status, 0)
-    assert.throws(() => readFileSync(log), { code: 'ENOENT' })
+    assert.deepEqual(apiCalls(), [])
     mkdirSync(join(folder, 'api'))
+    rmSync(log)
     assert.equal(run(folder, script, env).status, 0)
-    assert.equal(readFileSync(log, 'utf8'), 'ci --prefix api\nrun typecheck --prefix api\ntest --prefix api\n')
+    assert.deepEqual(apiCalls(), ['ci --prefix api', 'run typecheck --prefix api', 'test --prefix api'])
   })
 
   test('every params file is compiled and a missing or failing one fails the step', () => {
@@ -226,24 +239,27 @@ describe('capabilities control the consumer steps', () => {
     assert.match(missing.stderr, /infra\/params\/preview\.bicepparam/u)
   })
 
-  test('audit installs under policy and audits root and an api directory only when present', () => {
+  test('audit follows a successful install and audits the root and any API package', () => {
     const folder = fixture()
     writeFileSync(join(folder, 'npm'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$NPM_LOG"\nexit "${NPM_EXIT:-0}"\n', { mode: 0o700 })
     const log = join(folder, 'npm-log')
     const env = { PATH: `${folder}:${process.env.PATH}`, NPM_LOG: log }
-    const script = stepScript(ciPath, 'audit', 'Install and audit')
+    const name = "'Test: audit'"
+    const script = stepScript(ciPath, 'checks', name)
     assert.equal(run(folder, script, env).status, 0)
-    assert.equal(readFileSync(log, 'utf8'), 'ci\naudit --omit=dev --audit-level=high\naudit --audit-level=critical\n')
+    assert.equal(readFileSync(log, 'utf8'), 'audit --omit=dev --audit-level=high\naudit --audit-level=critical\n')
     mkdirSync(join(folder, 'api'))
     rmSync(log)
     assert.equal(run(folder, script, env).status, 0)
-    assert.equal(readFileSync(log, 'utf8'), 'ci\naudit --omit=dev --audit-level=high\naudit --audit-level=critical\n'
-      + 'ci --prefix api\naudit --omit=dev --audit-level=high --prefix api\naudit --audit-level=critical --prefix api\n')
+    assert.equal(readFileSync(log, 'utf8'), 'audit --omit=dev --audit-level=high\naudit --audit-level=critical\n'
+      + 'audit --omit=dev --audit-level=high --prefix api\naudit --audit-level=critical --prefix api\n')
     rmSync(log)
     assert.notEqual(run(folder, script, { ...env, NPM_EXIT: '1' }).status, 0)
-    assert.equal(readFileSync(log, 'utf8'), 'ci\n')
-    const audit = jobBlock(ciPath, 'audit')
-    assert.ok(audit.indexOf('node scripts/check-npm-policy.mjs') < audit.indexOf('npm ci'))
+    assert.equal(readFileSync(log, 'utf8'), 'audit --omit=dev --audit-level=high\n')
+    const checks = jobBlock(ciPath, 'checks')
+    assert.ok(checks.includes('node scripts/check-npm-policy.mjs'))
+    assert.ok(checks.indexOf('node scripts/check-npm-policy.mjs') < checks.indexOf('npm ci'))
+    assert.match(stepBlock(ciPath, 'checks', name), /inputs\.full && steps\.install-api\.outcome == 'success'/u)
   })
 
   test('deploy discovers an api directory independently of form capability', () => {

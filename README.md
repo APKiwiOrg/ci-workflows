@@ -153,38 +153,31 @@ selected tests. Check the retained TRX count before treating a run as evidence.
 
 ## site-ci
 
-Runs a site's CI. `config` validates the site config before any install. `checks` lints, typechecks, tests
-and builds, then holds the build to the asset budget. `audit` installs and audits the root and any api package.
-`repo` runs the repository convention checks, the site template drift check and the shell script tests.
-`sql` runs the api SQL and blob integration tests only when `has-accounts` is true.
-`secrets` scans every commit with a checksum-verified gitleaks. `infra` compiles the Bicep template and
-parameters and checks the infrastructure policy. `e2e` builds and runs the browser smoke after `checks`
-passes. Every checkout drops its credentials.
+The calling site owns the triggers, scope and final `CI passed` job. Keep its workflow file
+`.github/workflows/ci.yml` and name `CI` if it calls the shared deploy workflow. The deploy guard
+uses both to identify successful main-push runs.
 
-A site adds this caller as `.github/workflows/ci.yml`, pinned to a commit of this repository. `site-deploy`
-accepts only successful main-push runs of a workflow in that file named `CI`:
+Call `APKiwiOrg/ci-workflows/.github/workflows/site-ci.yml@<full commit sha>` with `contents: read`.
+Pass `full` (boolean, default true) and `segments` (JSON array string, default `[]`) from the caller's
+scope decision. A full run selects every applicable stage. A partial run selects the stages below.
+An empty partial selection still validates config, checks repository conventions and scans commit history.
 
-```yaml
-name: CI
-on:
-  push:
-    branches: [main]
-  pull_request:
-permissions:
-  contents: read
-jobs:
-  ci:
-    uses: APKiwiOrg/ci-workflows/.github/workflows/site-ci.yml@<full commit sha>
-```
+| Segment | Selected work |
+| --- | --- |
+| `site` | Build, asset budget, lint, types, unit tests, theme policy and Playwright smoke |
+| `sql` | SQL and blob integration tests when the site has accounts |
+| `infra` | Bicep template, params and infrastructure policy |
 
-GitHub names a called job `<caller job> / <job name>`, for example `ci / Lint, typecheck, test and build`, so
-a ruleset that requires checks by their old names needs updating when a site moves to this caller.
+Full runs also audit dependencies. The Node stages share a job with one install per required package
+and one frontend build. Playwright uses that build in the same workspace after the core checks pass.
+Config validation runs before any install and the workflow exposes the validated `has-accounts` output
+for the caller's summary. Every checkout drops its credentials. Give the final caller job the outcome
+of this reusable call and run the [summary action](#ci-finish) there to keep one verdict.
 
-Optional inputs and their defaults are `node-version-file` (`.nvmrc`), `analytics-test-token`
-(`00000000000000000000000000000000`) and `bicep-file` (`infra/main.bicep`). The config job always uses
-`.nvmrc`. The version input applies to later jobs. Builds and tests receive the fixture token as
-`VITE_CLOUDFLARE_ANALYTICS_TOKEN` only when analytics is `cloudflare`. The registered site token never
-reaches CI.
+The three operational inputs are `node-version-file` (default `.nvmrc`), `analytics-test-token`
+(default `00000000000000000000000000000000`) and `bicep-file` (default `infra/main.bicep`).
+The config job always uses `.nvmrc`. The version input applies to the other Node jobs. Cloudflare
+builds and tests receive the fixture analytics token. Builds for other modes have no analytics token.
 
 Both site workflows call `site-config.yml` through `./.github/workflows/site-config.yml`. GitHub resolves
 this local reusable workflow from the same commit as its calling workflow, so validation stays on the
@@ -199,7 +192,7 @@ any install. The CLI validates the config and appends these six `key=value` line
 | `app-location` | `build/client` or `out` | Asset budget, artifact upload and deployment folder |
 | `has-form` | `true` or `false` | Exposed capability, independent of the api directory |
 | `has-theme` | `true` or `false` | Run the theme check only when true |
-| `has-accounts` | `true` or `false` | Run the SQL integration job only when true |
+| `has-accounts` | `true` or `false` | Run the SQL integration stage only when true |
 | `analytics` | `cloudflare` or `none` | Pass a build token only for cloudflare |
 | `infra-params` | Compact JSON array such as `["infra/params/site.bicepparam"]` | Compile every params file |
 
@@ -208,22 +201,21 @@ array must be nonempty and contain repo-relative `.bicepparam` paths without emp
 Absolute paths, backslashes and control characters are refused. Every listed params file must exist.
 There are no default capabilities or output folders.
 
-The SQL job starts a digest-pinned SQL Server 2022 container on the hosted runner with a random, masked
+The SQL stage starts a digest-pinned SQL Server 2022 container on the hosted runner with a random, masked
 SA password. It tries up to 30 logins, two seconds apart, and fails if SQL never answers. After a login
 succeeds, it publishes an encrypted, local `ACCOUNTS_SQL_TEST_SERVER` connection string through
 `GITHUB_ENV`. It then starts a digest-pinned Azurite storage emulator running only the blob service on
 `127.0.0.1:10000`, with the API version check off because the storage SDK can send a newer version than the
 emulator knows. It probes the blob endpoint up to 30 times, two seconds apart, treats any HTTP status as
-ready and fails if nothing answers. It checks npm policy, runs `npm ci --prefix api`, then
+ready and fails if nothing answers. After the shared npm policy check and API install, it runs
 `npm run test:sql --prefix api` with that connection string and `MEDIA_BLOB_TEST_CONNECTION` set to the
 SDK's emulator shorthand `UseDevelopmentStorage=true` in the test environment, so no emulator key appears in
 the workflow. The blob integration tests use that variable. Accounts sites must supply this api script. Sites
-with `has-accounts` set to `false` skip the whole job.
+with `has-accounts` set to `false` skip this stage.
 
-This is a breaking caller contract. The `app-location`, `has-api`, `has-e2e`, `has-infra` and `bicep-params`
-inputs have been removed. The deploy workflow also removes `api-location`, since the checkout determines
-whether `api/` exists. Existing callers keep their old SHA pin until the template provides the CLI contract,
-removes those inputs and re-pins them in a later task. Update the template and its synced callers together.
+Site config supplies `app-location` and `infra-params`. API presence comes from the checkout.
+The former `app-location`, `has-api`, `has-e2e`, `has-infra` and `bicep-params` inputs are unsupported.
+The deploy workflow likewise determines `api-location` from the checkout.
 
 The calling repository supplies `scripts/check-npm-policy.mjs` and `scripts/check-assets.mjs`, which
 receives the absolute `app-location` folder after the build. The asset folder, Bicep template and params
@@ -232,9 +224,9 @@ checkout are refused. Names with spaces or leading hyphens remain single path ar
 It also supplies the npm scripts `lint`, `typecheck`,
 `test`, `build` and `test:e2e`, plus `check:theme` when `has-theme` is true, and the convention checks `scripts/check-dashes.sh`,
 `scripts/check-prose.sh`, `scripts/check-scratch.sh` and `scripts/check-agent-instructions.sh`, each run with
-`--tree`. A site made from APKiwiOrg/site-template carries `site-template.lock.json`, and `repo` then runs its
+`--tree`. A synced site carries `site-template.lock.json`, and the repo stage then runs its
 `scripts/check-site-template.mjs`, which fails when a template-managed file differs from the lock. A
-repository with no lock prints one skip line instead. `repo` runs every `scripts/tests/*.test.sh` and fails
+repository with no lock prints one skip line instead. The repo stage runs every `scripts/tests/*.test.sh` and fails
 when there is none. When an `api/` directory exists, it is an npm package with `typecheck` and `test` scripts.
 Every site supplies e2e and infrastructure checks. The infra job compiles every configured params file
 with `--outfile` to a separate indexed deployment parameters JSON file in `/tmp/site-infra/`, a mode 0700
@@ -243,8 +235,8 @@ directory. The output must parse as JSON with a `parameters` object before the c
 `scripts/check-infra.mjs <compiled-template.json> <compiled-params.json>` once per params file, in config
 order, including the bandwidth alert policy. The checker uses the compiled parameters to skip resources
 that file disables. A missing params file, a compilation failure, an invalid output or a policy failure fails the job and
-names the params file. A failed policy check stops later checks. The audit job runs the npm policy check
-before `npm ci`, then two audits in the root and, when present, in `api/`: `npm audit --omit=dev
+names the params file. A failed policy check stops later checks. After the shared install, the audit stage
+runs two audits in the root and, when present, in `api/`: `npm audit --omit=dev
 --audit-level=high` for production dependencies and `npm audit --audit-level=critical` for every dependency. A high
 advisory in dev tooling alone reaches no deployed code, so it is left to the weekly osv-scanner report rather than
 failing every site, while a critical one, malware included, fails wherever it sits.

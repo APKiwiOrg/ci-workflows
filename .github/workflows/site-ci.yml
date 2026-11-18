@@ -1,11 +1,7 @@
 name: site-ci
 
-# The shared CI for every site. A site calls it from a small caller of its own (see README.md) named CI in
-# .github/workflows/ci.yml, whose successful main-push runs are what site-deploy.yml accepts.
-#
-# Config validation gates every job. The site capabilities select the theme, analytics and SQL checks.
-# The api steps run when the checkout has an api directory. Infrastructure and e2e are required.
-#
+# The caller supplies scope and owns the final verdict. Config validates capabilities before any product
+# work. The site, browser, audit and accounts integration stages share one workspace and dependency install.
 # Inputs reach scripts only through env, never by expression interpolation into a run line.
 
 on:
@@ -26,87 +22,82 @@ on:
         required: false
         default: infra/main.bicep
         type: string
+      full:
+        description: Run every applicable stage
+        default: true
+        type: boolean
+      segments:
+        description: JSON array of selected segments for a partial run (site, sql, infra)
+        default: '[]'
+        type: string
+    outputs:
+      has-accounts:
+        description: Validated accounts capability
+        value: ${{ jobs.config.outputs.has-accounts }}
 
 permissions: {}
 
 jobs:
   config:
-    name: Validate site config
+    name: Site config
     uses: ./.github/workflows/site-config.yml
     permissions:
       contents: read
 
   checks:
     needs: config
-    name: Lint, typecheck, test and build
+    name: Site build and checks
     runs-on: ubuntu-26.04
+    timeout-minutes: 20
     permissions:
       contents: read
+    env:
+      RUN_SITE: ${{ inputs.full || contains(fromJSON(inputs.segments), 'site') }}
+      RUN_SQL: ${{ needs.config.outputs.has-accounts == 'true' && (inputs.full || contains(fromJSON(inputs.segments), 'sql')) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.RUN_SITE == 'true' || env.RUN_SQL == 'true' || inputs.full
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Set up Node
+        if: env.RUN_SITE == 'true' || env.RUN_SQL == 'true' || inputs.full
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ inputs.node-version-file }}
           cache: npm
 
       - name: npm install policy
+        if: env.RUN_SITE == 'true' || env.RUN_SQL == 'true' || inputs.full
         run: node scripts/check-npm-policy.mjs
 
       - name: Install
+        if: env.RUN_SITE == 'true' || inputs.full
         run: npm ci
 
-      # Before lint, because the api files are linted with their own types.
+      # Before lint, because the API files are linted with their own types.
       - name: Install api
+        id: install-api
+        if: env.RUN_SITE == 'true' || env.RUN_SQL == 'true' || inputs.full
         run: |
-          if [ -d api ]; then
+          if [ -d api ] || [ "$RUN_SQL" = true ]; then
             npm ci --prefix api
           fi
 
-      - name: Lint
-        run: npm run lint
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Typecheck api
-        run: |
-          if [ -d api ]; then
-            npm run typecheck --prefix api
-          fi
-
-      - name: Test
-        env:
-          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ needs.config.outputs.analytics == 'cloudflare' && inputs.analytics-test-token || '' }}
-        run: npm test
-
-      - name: Test api
-        run: |
-          if [ -d api ]; then
-            npm test --prefix api
-          fi
-
-      - name: Theme conventions
-        if: needs.config.outputs.has-theme == 'true'
-        run: npm run check:theme
-
-      - name: Build
-        if: needs.config.outputs.analytics == 'none'
-        run: npm run build
-
       # Browser fixtures intercept telemetry locally. Use only the fixture token in CI.
-      - name: Build with analytics
-        if: needs.config.outputs.analytics == 'cloudflare'
+      - name: Build
+        if: env.RUN_SITE == 'true'
         env:
-          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-test-token }}
-        run: npm run build
-
-      - name: Asset budget
-        env:
+          ANALYTICS: ${{ needs.config.outputs.analytics }}
+          ANALYTICS_TEST_TOKEN: ${{ inputs.analytics-test-token }}
           APP_LOCATION: ${{ needs.config.outputs.app-location }}
         run: |
+          if [ "$ANALYTICS" = cloudflare ]; then
+            export VITE_CLOUDFLARE_ANALYTICS_TOKEN="$ANALYTICS_TEST_TOKEN"
+          else
+            unset VITE_CLOUDFLARE_ANALYTICS_TOKEN
+          fi
+          npm run build
           node --input-type=module <<'NODE'
           import { realpathSync } from 'node:fs'
           import { resolve, sep } from 'node:path'
@@ -125,31 +116,53 @@ jobs:
           process.exit(result.status ?? 1)
           NODE
 
-  sql:
-    needs: config
-    if: needs.config.outputs.has-accounts == 'true'
-    name: SQL integration tests
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - name: 'Test: site'
+        if: ${{ !cancelled() && env.RUN_SITE == 'true' && steps.install-api.outcome == 'success' }}
+        env:
+          HAS_THEME: ${{ needs.config.outputs.has-theme }}
+          ANALYTICS_TEST_TOKEN: ${{ needs.config.outputs.analytics == 'cloudflare' && inputs.analytics-test-token || '' }}
+        run: |
+          npm run lint
+          npm run typecheck
+          if [ -d api ]; then
+            npm run typecheck --prefix api
+          fi
+          VITE_CLOUDFLARE_ANALYTICS_TOKEN="$ANALYTICS_TEST_TOKEN" npm test
+          if [ -d api ]; then
+            npm test --prefix api
+          fi
+          if [ "$HAS_THEME" = true ]; then
+            npm run check:theme
+          fi
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: ${{ inputs.node-version-file }}
-          cache: npm
+      - name: Install Chromium
+        id: chromium
+        if: env.RUN_SITE == 'true'
+        run: npx playwright install --with-deps chromium
 
-      - name: npm install policy
-        run: node scripts/check-npm-policy.mjs
+      - name: 'Test: browser'
+        if: env.RUN_SITE == 'true' && steps.chromium.outcome == 'success'
+        env:
+          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ needs.config.outputs.analytics == 'cloudflare' && inputs.analytics-test-token || '' }}
+        run: npm run test:e2e
 
-      - name: Install api
-        run: npm ci --prefix api
+      # Production dependencies fail at high, every dependency at critical. A high advisory in dev tooling alone,
+      # such as a ReDoS in a build tool's glob matcher fed only repository paths, reaches no deployed code, so it
+      # waits for the weekly osv-scanner report instead of blocking every site. Critical ones, malware included,
+      # still fail here wherever they sit.
+      - name: 'Test: audit'
+        if: ${{ !cancelled() && inputs.full && steps.install-api.outcome == 'success' }}
+        run: |
+          npm audit --omit=dev --audit-level=high
+          npm audit --audit-level=critical
+          if [ -d api ]; then
+            npm audit --omit=dev --audit-level=high --prefix api
+            npm audit --audit-level=critical --prefix api
+          fi
 
       - name: Start SQL Server
+        id: start-sql
+        if: ${{ !cancelled() && env.RUN_SQL == 'true' && steps.install-api.outcome == 'success' }}
         run: |
           set -eu
           sql_password="$(openssl rand -hex 24)"
@@ -176,6 +189,8 @@ jobs:
       # Blob integration tests run against the storage emulator. Only the blob service runs. The storage
       # SDK can send a newer API version than the emulator knows, so the version check is off.
       - name: Start Azurite
+        id: start-azurite
+        if: ${{ !cancelled() && steps.start-sql.outcome == 'success' }}
         run: |
           set -eu
           # MCR stores this image as a Docker v2 manifest list, and that served digest pulls by digest.
@@ -196,7 +211,8 @@ jobs:
           exit 1
 
       # UseDevelopmentStorage=true is the storage SDK's emulator shorthand, so no emulator key is written here.
-      - name: SQL integration tests
+      - name: 'Test: sql'
+        if: ${{ !cancelled() && steps.start-azurite.outcome == 'success' }}
         env:
           ACCOUNTS_SQL_TEST_SERVER: ${{ env.ACCOUNTS_SQL_TEST_SERVER }}
           MEDIA_BLOB_TEST_CONNECTION: UseDevelopmentStorage=true
@@ -204,8 +220,9 @@ jobs:
 
   repo:
     needs: config
-    name: Repository conventions
+    name: 'Test: repo'
     runs-on: ubuntu-26.04
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -216,6 +233,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ inputs.node-version-file }}
+          package-manager-cache: false
 
       - name: Dashes
         run: sh scripts/check-dashes.sh --tree
@@ -229,8 +247,7 @@ jobs:
       - name: Agent instruction budget
         run: sh scripts/check-agent-instructions.sh --tree
 
-      # A site made from APKiwiOrg/site-template carries site-template.lock.json and the checker that
-      # hashes its template-managed files against it. A repository with no lock is not a template site.
+      # A synced site carries a lock and the checker that hashes its template-managed files against it.
       - name: Site template drift
         run: |
           if [ -f site-template.lock.json ]; then
@@ -246,51 +263,11 @@ jobs:
             sh "$test"
           done
 
-  e2e:
-    needs: [config, checks]
-    name: End-to-end smoke
-    runs-on: ubuntu-26.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: ${{ inputs.node-version-file }}
-          cache: npm
-
-      - name: npm install policy
-        run: node scripts/check-npm-policy.mjs
-
-      - name: Install
-        run: npm ci
-
-      - name: Build
-        if: needs.config.outputs.analytics == 'none'
-        run: npm run build
-
-      # Browser fixtures intercept telemetry locally. Use only the fixture token in CI.
-      - name: Build with analytics
-        if: needs.config.outputs.analytics == 'cloudflare'
-        env:
-          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ inputs.analytics-test-token }}
-        run: npm run build
-
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
-
-      - name: End-to-end tests
-        env:
-          VITE_CLOUDFLARE_ANALYTICS_TOKEN: ${{ needs.config.outputs.analytics == 'cloudflare' && inputs.analytics-test-token || '' }}
-        run: npm run test:e2e
-
   secrets:
     needs: config
-    name: Secret scan
+    name: 'Test: secrets'
     runs-on: ubuntu-26.04
+    timeout-minutes: 5
     permissions:
       contents: read
     env:
@@ -313,8 +290,10 @@ jobs:
 
   infra:
     needs: config
-    name: Compile Bicep
+    if: inputs.full || contains(fromJSON(inputs.segments), 'infra')
+    name: 'Test: infra'
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -325,6 +304,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ inputs.node-version-file }}
+          package-manager-cache: false
 
       - name: Build template
         env:
@@ -419,38 +399,3 @@ jobs:
             }
           }
           NODE
-
-  audit:
-    name: Dependency audit
-    needs: config
-    runs-on: ubuntu-26.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: ${{ inputs.node-version-file }}
-          cache: npm
-
-      - name: npm install policy
-        run: node scripts/check-npm-policy.mjs
-
-      # Production dependencies fail at high, every dependency at critical. A high advisory in dev tooling alone,
-      # such as a ReDoS in a build tool's glob matcher fed only repository paths, reaches no deployed code, so it
-      # waits for the weekly osv-scanner report instead of blocking every site. Critical ones, malware included,
-      # still fail here wherever they sit.
-      - name: Install and audit
-        run: |
-          npm ci
-          npm audit --omit=dev --audit-level=high
-          npm audit --audit-level=critical
-          if [ -d api ]; then
-            npm ci --prefix api
-            npm audit --omit=dev --audit-level=high --prefix api
-            npm audit --audit-level=critical --prefix api
-          fi

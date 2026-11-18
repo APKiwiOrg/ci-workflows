@@ -12,8 +12,10 @@ import { jobBlock, stepBlock, stepScript } from './workflow-steps.mjs'
 const workflowPath = fileURLToPath(new URL('../../.github/workflows/site-ci.yml', import.meta.url))
 const workflow = () => readFileSync(workflowPath, 'utf8')
 const job = (id) => jobBlock(workflowPath, id)
-const jobIds = ['checks', 'repo', 'secrets', 'infra', 'e2e', 'audit', 'sql']
-const apiSteps = ['Install api', 'Typecheck api', 'Test api']
+const jobIds = ['checks', 'repo', 'secrets', 'infra']
+const siteStep = "'Test: site'"
+const browserStep = "'Test: browser'"
+const sqlStep = "'Test: sql'"
 const driftStep = 'Site template drift'
 const folders = []
 
@@ -51,23 +53,66 @@ describe('every job is hardened', () => {
   })
 })
 
+describe('site work is selected without repeating installs or builds', () => {
+  test('unscoped callers get a full run and can read the accounts capability', () => {
+    assert.match(workflow(), /^ {6}full:\n(?: {8}.+\n)* {8}default: true$/mu)
+    assert.match(workflow(), /^ {6}segments:\n(?: {8}.+\n)* {8}default: '\[\]'$/mu)
+    assert.match(workflow(), /value: \$\{\{ jobs\.config\.outputs\.has-accounts \}\}/u)
+  })
+
+  test('the full Node path installs each package and builds once', () => {
+    const source = workflow()
+    assert.equal(source.match(/\bnpm ci(?! --prefix api)\b/gu)?.length, 1, 'one root install')
+    assert.equal(source.match(/\bnpm ci --prefix api\b/gu)?.length, 1, 'one API install')
+    assert.equal(source.match(/\bnpm run build\b/gu)?.length, 1, 'one frontend build')
+  })
+
+  test('empty partial scope skips setup and installations but keeps the three guards', () => {
+    const checks = job('checks')
+    assert.match(checks, /RUN_SITE: \$\{\{ inputs\.full \|\| contains\(fromJSON\(inputs\.segments\), 'site'\) \}\}/u)
+    assert.match(checks, /RUN_SQL: \$\{\{ needs\.config\.outputs\.has-accounts == 'true' && \(inputs\.full \|\| contains\(fromJSON\(inputs\.segments\), 'sql'\)\) \}\}/u)
+    assert.match(step('checks', 'Set up Node'), /if: env\.RUN_SITE == 'true' \|\| env\.RUN_SQL == 'true' \|\| inputs\.full/u)
+    assert.match(step('checks', 'Install'), /if: env\.RUN_SITE == 'true' \|\| inputs\.full/u)
+    assert.match(step('checks', 'Install api'), /if: env\.RUN_SITE == 'true' \|\| env\.RUN_SQL == 'true' \|\| inputs\.full/u)
+    assert.match(step('checks', 'Build'), /if: env\.RUN_SITE == 'true'/u)
+    assert.match(job('infra'), /if: inputs\.full \|\| contains\(fromJSON\(inputs\.segments\), 'infra'\)/u)
+    for (const id of ['config', 'repo', 'secrets']) assert.doesNotMatch(job(id), /^ {4}if:/mu)
+  })
+
+  test('the instruction checks run for a matching PR and only main pushes', () => {
+    const source = readFileSync(new URL('../../.github/workflows/agent-instructions.yml', import.meta.url), 'utf8')
+    assert.match(source, /^  push:\n    branches: \[main\]\n    paths:/mu)
+    assert.match(source, /^  pull_request:\n    paths:/mu)
+    assert.match(source, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/u)
+  })
+})
+
 describe('config controls the site layout', () => {
   test('every api step checks for the api directory', () => {
-    for (const name of apiSteps) assert.match(step('checks', name), /if \[ -d api \]/u)
+    assert.match(step('checks', 'Install api'), /if \[ -d api \] \|\| \[ "\$RUN_SQL" = true \]/u)
+    assert.match(step('checks', siteStep), /if \[ -d api \]; then\n +npm run typecheck --prefix api/u)
+    assert.match(step('checks', siteStep), /if \[ -d api \]; then\n +npm test --prefix api/u)
     assert.doesNotMatch(workflow(), /inputs\.has-api/u)
   })
 
-  test('e2e and infra are required after config validation', () => {
-    for (const id of ['e2e', 'infra']) assert.doesNotMatch(job(id), /^ {4}if:/mu)
+  test('browser runs from the same build after core checks and Chromium succeed', () => {
+    const checks = job('checks')
+    const positions = ['Build', siteStep, 'Install Chromium', browserStep]
+      .map((name) => checks.indexOf(`      - name: ${name}\n`))
+    assert.ok(positions.every((index) => index >= 0))
+    assert.deepEqual([...positions].sort((a, b) => a - b), positions)
+    assert.match(step('checks', 'Install Chromium'), /if: env\.RUN_SITE == 'true'/u)
+    assert.match(step('checks', browserStep), /if: env\.RUN_SITE == 'true' && steps\.chromium\.outcome == 'success'/u)
+    assert.match(step('checks', browserStep), /run: npm run test:e2e/u)
   })
 
-  test('the checks and browser tests receive a token only for cloudflare', () => {
+  test('root and browser tests receive the fixture token only for cloudflare', () => {
     assert.doesNotMatch(workflow(), /^env:/mu)
-    for (const id of ['checks', 'e2e']) {
-      assert.match(step(id, 'Build with analytics'), /if: needs\.config\.outputs\.analytics == 'cloudflare'/u)
-      assert.match(step(id, 'Build with analytics'), /VITE_CLOUDFLARE_ANALYTICS_TOKEN: \$\{\{ inputs\.analytics-test-token \}\}/u)
-      assert.match(step(id, 'Build'), /if: needs\.config\.outputs\.analytics == 'none'/u)
-    }
+    assert.match(step('checks', siteStep),
+      /ANALYTICS_TEST_TOKEN: \$\{\{ needs\.config\.outputs\.analytics == 'cloudflare' && inputs\.analytics-test-token \|\| '' \}\}/u)
+    assert.match(step('checks', siteStep), /VITE_CLOUDFLARE_ANALYTICS_TOKEN="\$ANALYTICS_TEST_TOKEN" npm test/u)
+    assert.match(step('checks', browserStep),
+      /VITE_CLOUDFLARE_ANALYTICS_TOKEN: \$\{\{ needs\.config\.outputs\.analytics == 'cloudflare' && inputs\.analytics-test-token \|\| '' \}\}/u)
   })
 
   test('the infra job compiles the template input and all config params through env', () => {
@@ -79,16 +124,16 @@ describe('config controls the site layout', () => {
   })
 
   test('the asset budget checks the config app-location through env', () => {
-    const budget = step('checks', 'Asset budget')
+    const budget = step('checks', 'Build')
     assert.match(budget, /APP_LOCATION: \$\{\{ needs\.config\.outputs\.app-location \}\}/u)
   })
 
-  test('only operational inputs remain', () => {
-    const inputs = workflow().split('    inputs:\n')[1].split('\npermissions:')[0]
+  test('operational inputs stay available beside scope inputs', () => {
+    const inputs = workflow().split('    inputs:\n')[1].split('    outputs:\n')[0]
     assert.deepEqual(inputs.match(/^ {6}[a-z-]+:/gmu)?.map((line) => line.trim()), [
-      'node-version-file:', 'analytics-test-token:', 'bicep-file:',
+      'node-version-file:', 'analytics-test-token:', 'bicep-file:', 'full:', 'segments:',
     ])
-    for (const id of ['checks', 'repo', 'infra', 'e2e', 'audit', 'sql']) {
+    for (const id of ['checks', 'repo', 'infra']) {
       assert.match(job(id), /node-version-file: \$\{\{ inputs\.node-version-file \}\}/u)
     }
   })
@@ -118,7 +163,7 @@ const attempts = readFileSync(process.env.DOCKER_LOG, 'utf8').trim().split('\\n'
 process.exit(attempts >= Number(process.env.READY_AFTER) ? 0 : 1)
 `, { mode: 0o700 })
   writeFileSync(join(folder, 'sleep'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$WAITS"\n', { mode: 0o700 })
-  const result = spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'sql', 'Start SQL Server')], {
+  const result = spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'checks', 'Start SQL Server')], {
     cwd: folder, encoding: 'utf8', env: {
       PATH: `${folder}:${process.env.PATH}`, GITHUB_ENV: githubEnv, DOCKER_LOG: log, WAITS: waits,
       READY_AFTER: String(readyAfter), START_EXIT: String(startExit),
@@ -142,11 +187,11 @@ describe('accounts SQL integration job', () => {
     assert.ok(start.args.includes('ACCEPT_EULA=Y'))
     assert.ok(start.args.includes('127.0.0.1:1433:1433'))
     assert.match(start.args.at(-1), /^mcr\.microsoft\.com\/mssql\/server@sha256:[a-f0-9]{64}$/u)
-    assert.match(stepScript(workflowPath, 'sql', 'Start SQL Server'), /mcr\.microsoft\.com\/mssql\/server@sha256:[a-f0-9]{64} # 2022-latest$/mu)
-    assert.doesNotMatch(job('sql'), /^ {4}services:/mu)
+    assert.match(stepScript(workflowPath, 'checks', 'Start SQL Server'), /mcr\.microsoft\.com\/mssql\/server@sha256:[a-f0-9]{64} # 2022-latest$/mu)
+    assert.doesNotMatch(job('checks'), /^ {4}services:/mu)
     assert.ok(start.password.length >= 8 && start.password.length <= 128)
     for (const pattern of [/[A-Z]/u, /[a-z]/u, /[0-9]/u, /[^A-Za-z0-9]/u]) assert.match(start.password, pattern)
-    assert.match(stepScript(workflowPath, 'sql', 'Start SQL Server'), /openssl rand/u)
+    assert.match(stepScript(workflowPath, 'checks', 'Start SQL Server'), /openssl rand/u)
     assert.equal(result.stdout, `::add-mask::${start.password}\n`)
     assert.equal(result.stderr, '')
     assert.equal(logins.length, 3)
@@ -181,23 +226,23 @@ describe('accounts SQL integration job', () => {
   })
 
   test('SQL installs the api under npm policy and runs its SQL suite using the step environment', () => {
-    const sql = job('sql')
+    const sql = job('checks')
     assert.match(sql, /permissions:\n {6}contents: read\n/u)
     assert.ok(sql.indexOf('node scripts/check-npm-policy.mjs') < sql.indexOf('npm ci --prefix api'))
-    assert.match(step('sql', 'Install api'), /run: npm ci --prefix api/u)
-    assert.match(step('sql', 'SQL integration tests'), /run: npm run test:sql --prefix api/u)
-    assert.match(step('sql', 'SQL integration tests'), /ACCOUNTS_SQL_TEST_SERVER: \$\{\{ env\.ACCOUNTS_SQL_TEST_SERVER \}\}/u)
+    assert.match(step('checks', 'Install api'), /^ {12}npm ci --prefix api$/mu)
+    assert.match(step('checks', sqlStep), /run: npm run test:sql --prefix api/u)
+    assert.match(step('checks', sqlStep), /ACCOUNTS_SQL_TEST_SERVER: \$\{\{ env\.ACCOUNTS_SQL_TEST_SERVER \}\}/u)
   })
 
   test('the integration tests receive the emulator shorthand and no emulator key', () => {
-    const tests = step('sql', 'SQL integration tests')
+    const tests = step('checks', sqlStep)
     assert.match(tests, /^ {10}MEDIA_BLOB_TEST_CONNECTION: UseDevelopmentStorage=true$/mu)
     assert.doesNotMatch(workflow(), /AccountKey|Eby8vdM02/u)
   })
 
   test('Azurite starts after SQL Server and before the integration tests', () => {
-    const sql = job('sql')
-    const order = ['Start SQL Server', 'Start Azurite', 'SQL integration tests']
+    const sql = job('checks')
+    const order = ['Start SQL Server', 'Start Azurite', sqlStep]
       .map((name) => sql.indexOf(`      - name: ${name}\n`))
     assert.ok(order.every((index) => index >= 0), JSON.stringify(order))
     assert.deepEqual([...order].sort((a, b) => a - b), order)
@@ -226,7 +271,7 @@ if (attempts < Number(process.env.READY_AFTER)) {
 process.stdout.write(process.env.READY_CODE)
 `, { mode: 0o700 })
   writeFileSync(join(folder, 'sleep'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$WAITS"\n', { mode: 0o700 })
-  const result = spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'sql', 'Start Azurite')], {
+  const result = spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'checks', 'Start Azurite')], {
     cwd: folder, encoding: 'utf8', env: {
       PATH: `${folder}:${process.env.PATH}`, DOCKER_LOG: log, PROBES: probes, WAITS: waits,
       READY_AFTER: String(readyAfter), READY_CODE: readyCode, START_EXIT: String(startExit),
@@ -250,7 +295,7 @@ describe('Azurite for blob integration tests', () => {
     assert.match(args[image], /^mcr\.microsoft\.com\/azure-storage\/azurite@sha256:[a-f0-9]{64}$/u)
     assert.deepEqual(args.slice(image + 1),
       ['azurite-blob', '--blobHost', '0.0.0.0', '--blobPort', '10000', '--skipApiVersionCheck'])
-    assert.match(stepScript(workflowPath, 'sql', 'Start Azurite'),
+    assert.match(stepScript(workflowPath, 'checks', 'Start Azurite'),
       /mcr\.microsoft\.com\/azure-storage\/azurite@sha256:[a-f0-9]{64} # \d+\.\d+\.\d+$/mu)
     assert.equal(result.probes.length, 3)
     for (const probe of result.probes) {
@@ -326,7 +371,7 @@ describe('the repo job fails on template drift', () => {
   })
 })
 
-function runBudget(path, symlink = false) {
+function runBudget(path, symlink = false, analytics = 'none') {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'ciwf-assets-')))
   folders.push(base)
   const folder = join(base, 'checkout')
@@ -335,12 +380,25 @@ function runBudget(path, symlink = false) {
   mkdirSync(target, { recursive: true })
   if (symlink) symlinkSync(target, join(folder, path))
   writeFileSync(join(folder, 'scripts/check-assets.mjs'), 'console.log(JSON.stringify(process.argv.slice(2)))\n')
-  const inline = step('checks', 'Asset budget').match(/^ {8}run: ([^|\n].*)$/mu)?.[1]
-  const script = inline ?? stepScript(workflowPath, 'checks', 'Asset budget')
+  const npm = join(base, 'npm')
+  writeFileSync(npm, '#!/bin/sh\n[ "$*" = "run build" ] || exit 2\nprintf "%s\\n" "${VITE_CLOUDFLARE_ANALYTICS_TOKEN-unset}" > "$BUILD_TOKEN_LOG"\n', { mode: 0o700 })
+  const script = stepScript(workflowPath, 'checks', 'Build')
   const result = spawnSync('bash', ['-e', '-c', script], {
-    cwd: folder, encoding: 'utf8', env: { PATH: process.env.PATH, APP_LOCATION: path },
+    cwd: folder, encoding: 'utf8', env: {
+      PATH: `${base}:${process.env.PATH}`, APP_LOCATION: path, ANALYTICS: analytics,
+      ANALYTICS_TEST_TOKEN: 'fixture', VITE_CLOUDFLARE_ANALYTICS_TOKEN: 'ambient',
+      BUILD_TOKEN_LOG: join(base, 'build-token'),
+    },
   })
-  return { ...result, folder }
+  return { ...result, folder, buildToken: readFileSync(join(base, 'build-token'), 'utf8').trim() }
+}
+
+for (const [analytics, token] of [['none', 'unset'], ['cloudflare', 'fixture']]) {
+  test(`Build exposes the expected token in ${analytics} mode`, () => {
+    const result = runBudget('out', false, analytics)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.buildToken, token)
+  })
 }
 
 for (const path of ['out', 'build/client', '-assets', 'built assets']) {
