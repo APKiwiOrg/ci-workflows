@@ -23,6 +23,11 @@ on:
         required: false
         default: ''
         type: string
+      refresh:
+        description: Refresh only if the selected SHA is still live
+        required: false
+        default: false
+        type: boolean
       node-version-file:
         description: File naming the Node version build and deploy install
         required: false
@@ -89,6 +94,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_SHA: ${{ inputs.dispatch-sha || github.sha }}
+          REFRESH: ${{ inputs.refresh }}
+          SITE_ORIGIN: ${{ inputs.site-origin }}
           TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
           TRIGGER_EVENT: ${{ github.event_name }}
         run: |
@@ -104,6 +111,36 @@ jobs:
             if [ "$runs" != "1" ]; then
               echo "No successful main-push CI run for $REQUESTED_SHA. Deployment refused." >&2
               exit 1
+            fi
+            if [ "$REFRESH" = "true" ]; then
+              if [ -z "$SITE_ORIGIN" ]; then
+                echo "::error::Catalog refresh requires SITE_ORIGIN." >&2
+                exit 1
+              fi
+
+              snapshot_file=$(mktemp)
+              trap 'rm -f "$snapshot_file"' EXIT
+              status=$(curl --disable --silent --show-error --max-time 30 --globoff \
+                --output "$snapshot_file" --write-out '%{http_code}' -- "${SITE_ORIGIN%/}/_catalog/snapshot.json")
+              if [ "$status" != "200" ]; then
+                echo "::error::Catalog snapshot request returned HTTP $status. Expected HTTP 200 from SITE_ORIGIN." >&2
+                exit 1
+              fi
+
+              # Validate the decoded string before command substitution can strip trailing newlines.
+              if ! live_sha=$(jq -ers '
+                select(length == 1)
+                | .[0].deployedSha
+                | select(type == "string" and test("\\A[a-f0-9]{40}\\z"))
+              ' "$snapshot_file"); then
+                echo "::error::Catalog refresh requires a published snapshot with a full lowercase deployedSha." >&2
+                exit 1
+              fi
+
+              if [ "$live_sha" != "$REQUESTED_SHA" ]; then
+                echo "::notice::Catalog refresh skipped because the deployed SHA changed."
+                exit 0
+              fi
             fi
             echo "Deploying $REQUESTED_SHA, the SHA the manual run requested."
             echo "sha=$REQUESTED_SHA" >> "$GITHUB_OUTPUT"
@@ -128,6 +165,7 @@ jobs:
   config:
     name: Validate site config
     needs: guard
+    if: needs.guard.outputs.sha != ''
     uses: ./.github/workflows/site-config.yml
     permissions:
       contents: read

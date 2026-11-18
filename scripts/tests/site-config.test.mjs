@@ -111,7 +111,7 @@ for (const [path, jobId] of workflows) {
       assert.notEqual(readConfig(path, jobId, values, { exit: 7 }).status, 0)
     })
 
-    for (const key of Object.keys(values)) {
+    for (const key of Object.keys(values).filter((key) => key !== 'has-catalog')) {
       test(`missing ${key} fails with a reason`, () => {
         const output = { ...values }
         delete output[key]
@@ -123,7 +123,7 @@ for (const [path, jobId] of workflows) {
 
     for (const [key, invalid] of [
       ['app-location', 'dist'], ['has-form', 'TRUE'], ['has-theme', '0'], ['has-accounts', 'TRUE'],
-      ['has-catalog', 'TRUE'], ['analytics', 'other'],
+      ['has-catalog', 'TRUE'], ['has-catalog', ''], ['analytics', 'other'],
       ['infra-params', 'not-json'], ['infra-params', '{}'], ['infra-params', '[]'],
       ['infra-params', '[null]'], ['infra-params', '["/tmp/site.bicepparam"]'],
       ['infra-params', '["../site.bicepparam"]'], ['infra-params', '["infra/../site.bicepparam"]'],
@@ -184,6 +184,23 @@ describe('capabilities control the consumer steps', () => {
       assert.equal(result.status, 0, result.stderr)
       assert.equal(result.stdout.split('\n').includes('run check:theme'), capability === 'true')
     }
+  })
+
+  test('a green pre-catalog rollback skips snapshot capture and runs the ordinary build', () => {
+    const legacy = { ...values }
+    delete legacy['has-catalog']
+    const outputs = fixtureOutputs(deployPath, 'config', legacy)
+    assert.deepEqual(outputs, { ...legacy, 'has-catalog': 'false' })
+    assert.equal(condition(deployPath, 'build', 'Capture catalog snapshot', outputs), false)
+    assert.equal(condition(deployPath, 'build', 'Build site', outputs), true)
+
+    const folder = fixture()
+    writeFileSync(join(folder, 'npm'), '#!/bin/sh\nprintf "%s\\n" "$*"\n', { mode: 0o700 })
+    const result = run(folder, stepScript(deployPath, 'build', 'Build site'), {
+      PATH: `${folder}:${process.env.PATH}`, BUILD_COMMAND: 'npm run build',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout, 'ci\nrun build\n')
   })
 
   test('deploy keeps both analytics capability paths', () => {

@@ -15,6 +15,7 @@ const sha = '1234567890abcdef1234567890abcdef12345678'
 const newerSha = 'abcdef1234567890abcdef1234567890abcdef12'
 const olderSha = '0987654321fedcba0987654321fedcba09876543'
 const repository = 'APKiwiOrg/site'
+const siteOrigin = 'https://site.example'
 const selectStep = 'Select the green main SHA to deploy'
 const snapshotStep = 'Capture catalog snapshot'
 const workflowPath = fileURLToPath(new URL('../../.github/workflows/site-deploy.yml', import.meta.url))
@@ -72,6 +73,7 @@ function runStep(jobId, name, env = {}, gh = {}) {
   folders.push(folder)
   const output = join(folder, 'output')
   const args = join(folder, 'args')
+  const curlArgs = join(folder, 'curl-args')
   writeFileSync(output, '')
   writeFileSync(join(folder, 'gh'), [
     '#!/bin/sh',
@@ -80,6 +82,18 @@ function runStep(jobId, name, env = {}, gh = {}) {
     '  *"/commits "*) printf "%s\\n" "$TEST_GH_COMMITS"; exit "$TEST_GH_COMMITS_EXIT" ;;',
     '  *) printf "%s\\n" "$TEST_GH_RUNS"; exit "$TEST_GH_RUNS_EXIT" ;;',
     'esac',
+    '',
+  ].join('\n'), { mode: 0o700 })
+  writeFileSync(join(folder, 'curl'), [
+    '#!/bin/sh',
+    'printf "%s\\n" "$@" >> "$TEST_CURL_ARGS"',
+    'while [ "$#" -gt 0 ]; do',
+    '  case "$1" in',
+    '    --output) printf "%s\\n" "$TEST_SNAPSHOT" > "$2"; shift ;;',
+    '    --write-out) [ "$2" = "%{http_code}" ] && printf "%s" "$TEST_HTTP_STATUS"; shift ;;',
+    '  esac',
+    '  shift',
+    'done',
     '',
   ].join('\n'), { mode: 0o700 })
   writeFileSync(join(folder, 'npm'), [
@@ -93,13 +107,16 @@ function runStep(jobId, name, env = {}, gh = {}) {
     env: {
       PATH: `${folder}:${process.env.PATH}`, GITHUB_OUTPUT: output,
       GITHUB_REPOSITORY: repository, TEST_GH_ARGS: args, TEST_NPM_EXIT: '0',
+      REFRESH: 'false', TEST_CURL_ARGS: curlArgs, TEST_HTTP_STATUS: '200',
+      TEST_SNAPSHOT: JSON.stringify({ source: 'live', deployedSha: sha, snapshot: {} }),
       TEST_GH_COMMITS: gh.commits ?? '', TEST_GH_COMMITS_EXIT: String(gh.commitsExit ?? 0),
       TEST_GH_RUNS: gh.runs ?? '', TEST_GH_RUNS_EXIT: String(gh.runsExit ?? 0), ...env,
     },
   })
   const log = existsSync(args) ? readFileSync(args, 'utf8') : ''
   const calls = log.split('@@\n').slice(0, -1).map((call) => call.trim().split('\n'))
-  return { ...result, output: readFileSync(output, 'utf8'), calls, log }
+  const fetch = existsSync(curlArgs) ? readFileSync(curlArgs, 'utf8').trim().split('\n') : []
+  return { ...result, output: readFileSync(output, 'utf8'), calls, log, fetch }
 }
 
 const guardStep = (name, env, gh) => runStep('guard', name, env, gh)
@@ -157,7 +174,7 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     assert.equal(admitted(input), false)
   })
 
-  test('manual runs query successful main-push CI for the selected SHA', () => {
+  test('a manual dispatch uses the exact green SHA without reading the live snapshot', () => {
     const input = context('workflow_dispatch')
     input.github.event = {}
     input.github.sha = sha
@@ -168,6 +185,7 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     assert.equal(result.status, 0)
     assert.equal(result.output, `sha=${sha}\n`)
     assert.ok(result.stdout.includes(`Deploying ${sha}, the SHA the manual run requested.`))
+    assert.deepEqual(result.fetch, [])
     assert.deepEqual(result.calls, [[
       'api', '--method', 'GET', `repos/${repository}/actions/workflows/ci.yml/runs`,
       '-f', 'branch=main', '-f', 'event=push', '-f', `head_sha=${sha}`,
@@ -179,6 +197,60 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     const unavailable = guardStep(selectStep, manual, { runsExit: 1 })
     assert.notEqual(unavailable.status, 0)
     assert.equal(unavailable.output, '')
+  })
+
+  const refresh = { REQUESTED_SHA: sha, TRIGGER_EVENT: 'workflow_dispatch', REFRESH: 'true', SITE_ORIGIN: siteOrigin }
+
+  test('a refresh deploys when the requested green SHA is still live', () => {
+    const result = guardStep(selectStep, refresh, { runs: '1' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.output, `sha=${sha}\n`)
+    assert.equal(result.fetch.at(-1), siteOrigin + '/_catalog/snapshot.json')
+    assert.equal(result.fetch[result.fetch.indexOf('--max-time') + 1], '30')
+    assert.equal(envExpression('guard', 'REFRESH'), 'inputs.refresh')
+    assert.equal(envExpression('guard', 'SITE_ORIGIN'), 'inputs.site-origin')
+  })
+
+  test('a queued refresh exits green and skips deployment if the live SHA moved', () => {
+    const result = guardStep(selectStep, {
+      ...refresh, TEST_SNAPSHOT: JSON.stringify({ source: 'live', deployedSha: newerSha, snapshot: {} }),
+    }, { runs: '1' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.output, '')
+    assert.match(result.stdout, /^::notice::/mu)
+
+    const condition = job('config').match(/^ {4}if: (.+)$/mu)?.[1]
+    assert.ok(condition, 'the config job requires a selected SHA')
+    for (const [selected, expected] of [['', false], [sha, true]]) {
+      assert.equal(expression(condition, { needs: { guard: { outputs: { sha: selected } } } }), expected)
+    }
+  })
+
+  for (const [label, env] of [
+    ['has no origin', { SITE_ORIGIN: '' }],
+    ['has no readable SHA', { TEST_SNAPSHOT: JSON.stringify({ source: 'live', snapshot: {} }) }],
+  ]) {
+    test('a refresh fails when it ' + label, () => {
+      const result = guardStep(selectStep, { ...refresh, ...env }, { runs: '1' })
+      assert.equal(result.status, 1, result.stderr)
+      assert.equal(result.output, '')
+    })
+  }
+
+  for (const status of ['302', '206']) {
+    test('the refresh guard refuses HTTP ' + status + ' with a valid body', () => {
+      const result = guardStep(selectStep, { ...refresh, TEST_HTTP_STATUS: status }, { runs: '1' })
+      assert.equal(result.status, 1)
+      assert.equal(result.output, '')
+      assert.match(result.stderr, new RegExp(`\\bHTTP ${status}\\b`, 'u'))
+    })
+  }
+
+  test('a refresh with no green CI exits before any live read', () => {
+    const result = guardStep(selectStep, refresh, { runs: '0' })
+    assert.equal(result.status, 1)
+    assert.equal(result.output, '')
+    assert.deepEqual(result.fetch, [])
   })
 
   test('refuses a branch name instead of an immutable deployment SHA', () => {
@@ -193,7 +265,9 @@ describe('disabled and unverified SHAs cannot deploy', () => {
     input.github.event.workflow_run = {}
     input.inputs['dispatch-sha'] = sha
     assert.match(workflow(), /\n {6}dispatch-sha:\n(?: {8}.+\n)* {8}default: ''\n/u)
-    assert.match(caller(), /workflow_dispatch: \{ inputs: \{ sha: \{ type: string, required: false \} \} \}/u)
+    assert.match(caller(), /^ {2}workflow_dispatch:\n {4}inputs:\n {6}sha: \{ type: string, required: false \}$/mu)
+    assert.match(caller(), /^ {6}refresh: \{ type: boolean, default: false \}$/mu)
+    assert.match(caller(), /^ {6}refresh: \$\{\{ inputs\.refresh == true \}\}$/mu)
     assert.ok(caller().includes('dispatch-sha: ${{ inputs.sha }}'))
     assert.equal(expression(envExpression('guard', 'REQUESTED_SHA'), input), sha)
   })
@@ -413,6 +487,7 @@ describe('the build never sees the deploy token', () => {
     assert.doesNotMatch(inputs, /\n {6}(?:app-location|api-location|has-api|has-e2e|has-infra|bicep-params):/u)
     assert.match(source, /\n {6}enabled:\n(?: {8}.+\n)* {8}required: true\n/u)
     assert.match(source, /\n {6}enabled:\n(?: {8}.+\n)* {8}type: boolean\n/u)
+    assert.match(source, /\n {6}refresh:\n(?: {8}.+\n)* {8}default: false\n {8}type: boolean\n/u)
   })
 
   test('the deploy job installs nothing and uploads the downloaded artifact', () => {

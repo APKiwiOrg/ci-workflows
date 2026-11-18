@@ -71,19 +71,24 @@ jobs:
           fi
           node scripts/site-config.mjs --github-output
           node --input-type=module <<'NODE'
-          import { readFileSync } from 'node:fs'
+          import { appendFileSync, readFileSync } from 'node:fs'
           const fail = (reason) => {
             console.error(`Invalid site config output: ${reason}`)
             process.exit(1)
           }
+          const outputFile = process.env.GITHUB_OUTPUT
+          const rawOutput = readFileSync(outputFile, 'utf8')
           const outputs = new Map()
-          for (const line of readFileSync(process.env.GITHUB_OUTPUT, 'utf8').split('\n')) {
+          for (const line of rawOutput.split('\n')) {
             if (line === '') continue
             const match = /^([a-z][a-z-]*)=(.*)$/u.exec(line)
             if (!match) fail('expected key=value lines')
             if (outputs.has(match[1])) fail(`duplicate ${match[1]}`)
             outputs.set(match[1], match[2])
           }
+          // Older CLIs reject the catalog profile before emitting outputs. Current CLIs always emit this key.
+          const missingCatalogOutput = !outputs.has('has-catalog')
+          if (missingCatalogOutput) outputs.set('has-catalog', 'false')
           for (const [key, allowed] of Object.entries({
             'app-location': ['build/client', 'out'],
             'has-form': ['true', 'false'],
@@ -106,5 +111,9 @@ jobs:
                 !/[\u0000-\u001f\u007f\\:]/u.test(path) &&
                 path.split('/').every((part) => part !== '' && part !== '.' && part !== '..'))) {
             fail('infra-params must be a nonempty compact JSON array of repo-relative .bicepparam paths')
+          }
+          if (missingCatalogOutput) {
+            const separator = rawOutput.endsWith('\n') ? '' : '\n'
+            appendFileSync(outputFile, `${separator}has-catalog=false\n`)
           }
           NODE

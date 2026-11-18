@@ -38,14 +38,32 @@ jobs:
             exit 0
           fi
 
-          snapshot=$(curl --fail --silent --show-error --max-time 30 --globoff -- "${SITE_ORIGIN%/}/_catalog/snapshot.json")
+          # An existing deploy refreshes the catalog. Keep its place in the deploy concurrency group.
+          for deploy_status in requested pending queued waiting in_progress; do
+            count=$(gh api --method GET "repos/$GH_REPO/actions/workflows/deploy.yml/runs" \
+              -f status="$deploy_status" -f per_page=1 --jq '.workflow_runs | length')
+            if [ "$count" != "0" ]; then
+              echo "::notice::Catalog refresh skipped because a deployment is active."
+              exit 0
+            fi
+          done
+
+          snapshot_file=$(mktemp)
+          trap 'rm -f "$snapshot_file"' EXIT
+          status=$(curl --disable --silent --show-error --max-time 30 --globoff \
+            --output "$snapshot_file" --write-out '%{http_code}' -- "${SITE_ORIGIN%/}/_catalog/snapshot.json")
+          if [ "$status" != "200" ]; then
+            echo "::error::Catalog snapshot request returned HTTP $status. Expected HTTP 200 from SITE_ORIGIN." >&2
+            exit 1
+          fi
+
           # Validate the decoded string before command substitution can strip trailing newlines.
-          if ! sha=$(jq -ers '
+          if ! live_sha=$(jq -ers '
             select(length == 1)
             | .[0].deployedSha
             | select(type == "string" and test("\\A[a-f0-9]{40}\\z"))
-          ' <<< "$snapshot"); then
+          ' "$snapshot_file"); then
             echo "::error::Catalog refresh requires a published snapshot with a full lowercase deployedSha." >&2
             exit 1
           fi
-          gh workflow run deploy.yml --ref main -f sha="$sha"
+          gh workflow run deploy.yml --ref main -f sha="$live_sha" -f refresh=true
