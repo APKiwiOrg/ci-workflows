@@ -584,14 +584,16 @@ The job reads `/_catalog/snapshot.json` at the site's https origin and validates
 time out after 30 seconds. A failed fetch or a SHA other than exactly 40 lowercase hexadecimal
 characters fails the run.
 
-The job checks the caller's `deploy.yml` runs immediately before dispatch and skips with a notice if
-any is active. When the check finds no active run, the job dispatches `deploy.yml` on `main` with the
-published SHA and `refresh=true` using the caller's `actions: write` token.
+Immediately before dispatch, the job reads the caller's newest 100 `deploy.yml` runs in one request.
+If any run's status differs from `completed`, the job skips with a notice. Otherwise it dispatches
+`deploy.yml` on `main` with the published SHA and `refresh=true` using the caller's `actions: write` token.
 
-One API round trip remains between the last active-run query and dispatch. If two deploys arrive
-in that gap, the refresh can replace a pending run in `deploy-main`. The guard requires green
-main-push CI and rechecks the live SHA inside `deploy-main`, so the refresh keeps the deployed
-code in place. A displaced CI deploy can wait until the next push.
+Every `deploy.yml` run shares `deploy-main`, so the newest run normally waits behind an active deploy.
+The 100-run page leaves room for cancellations and startup failures during an older deploy's job
+timeouts. One API round trip remains between the lookup and dispatch. If two deploys arrive in that
+gap, the refresh can replace a pending run in `deploy-main`. The guard requires green main-push CI
+and rechecks the live SHA inside `deploy-main`, so the refresh keeps the deployed code in place.
+A displaced CI deploy can wait until the next push.
 
 A catalog site adds this caller as `.github/workflows/catalog-refresh.yml`, pinned to a commit of this
 repository. The schedule lands early in the morning in New Zealand:

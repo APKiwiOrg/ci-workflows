@@ -57,15 +57,14 @@ jobs:
             exit 1
           fi
 
-          # One API round trip remains between the last active-run query and dispatch. Two deploys
-          # arriving in that gap can leave a pending run the refresh replaces. The guard rechecks the
-          # live SHA inside deploy-main and skips the refresh if another run moved it.
-          for deploy_status in requested pending queued waiting in_progress; do
-            count=$(gh api --method GET "repos/$GH_REPO/actions/workflows/deploy.yml/runs" \
-              -f status="$deploy_status" -f per_page=1 --jq '.workflow_runs | length')
-            if [ "$count" != "0" ]; then
-              echo "::notice::Catalog refresh skipped because a deployment is active."
-              exit 0
-            fi
-          done
+          # Every deploy.yml run shares deploy-main, so the newest run normally waits behind an
+          # active deploy. The 100-run page leaves room for cancellations and startup failures.
+          # One API round trip remains between lookup and dispatch. The guard rechecks the live
+          # SHA inside deploy-main and skips the refresh if another run moved it.
+          active_deploys=$(gh api --method GET "repos/$GH_REPO/actions/workflows/deploy.yml/runs" \
+            -f per_page=100 --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+          if [ "$active_deploys" != "0" ]; then
+            echo "::notice::Catalog refresh skipped because a deployment is active."
+            exit 0
+          fi
           gh workflow run deploy.yml --ref main -f sha="$live_sha" -f refresh=true
