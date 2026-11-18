@@ -59,6 +59,10 @@ on:
         description: Environment variable naming each run's retained directory, empty for none
         default: ''
         type: string
+      compare_ref:
+        description: Second branch, tag or commit to test on the same machine, empty for none
+        default: ''
+        type: string
 permissions:
   contents: read
 jobs:
@@ -73,6 +77,7 @@ jobs:
       support-cost: ${{ inputs.support-cost }}
       build-target: ${{ inputs.build-target }}
       artifact-env: ${{ inputs.artifact-env }}
+      compare-ref: ${{ inputs.compare_ref }}
 ```
 
 A caller whose `nuget.config` restores from GitHub Packages also passes
@@ -150,6 +155,56 @@ timing or load run, stays with the caller.
 Quote the whole filter for the shell, without embedded quotes around a simple unit name. Embedded quotes
 can be stripped while dotnet forwards the filter to the test adapter, leaving an invalid condition and no
 selected tests. Check the retained TRX count before treating a run as evidence.
+
+The optional `compare-ref` string defaults to empty and preserves the single-ref behavior. Set it to a
+branch, tag or commit in the caller repository to compare it with the dispatched ref on one runner.
+Compare mode requires manual workflow dispatch. Use trusted code from the caller repository for both refs.
+Use a fully qualified ref such as `refs/heads/tag` or `refs/tags/v1.2.3` for reserved names like `tag`,
+names beginning with `+`, or names shared by a branch and a tag.
+
+The workflow checks out the comparison in a detached worktree outside the primary checkout and builds
+both refs before any tests. Each ref resolves its own build target and runs the applicable package
+and local feed setup. The comparison uses a separate NuGet package directory so packages with the same
+version can differ between refs. Use checkout-relative paths for `project` and `build-target`.
+The test project must exist on both refs. Both paths must resolve inside their respective checkout,
+including through symlinks. `support-cost` cannot be combined with `compare-ref`.
+
+Each iteration runs the same selection once per ref. Odd iterations run primary first and even
+iterations run comparison first. Any configured load runs throughout the loop. The comparison test
+process gets its resolved commit in `GITHUB_SHA`. The primary test process keeps the runner's value.
+The summary reports both refs, their commits and each side's passed, failed and selected-nothing counts.
+Any run that fails or selects nothing fails the step.
+
+The upload step attempts to retain the whole `stress` tree as one `stress-compare` artifact for seven days
+on success, failure or cancellation. `progress.txt` records the requested refs before validation and
+adds validation, checkout and build outcomes as they become known. It gives early failures an artifact
+even before tests run. Once both commits resolve, `refs.txt` records each side, requested ref and commit,
+followed by the processor model and logical processor count. The tree keeps the logs and TRX files
+each run writes, including passing runs, plus test-written files when `artifact-env` is set.
+Cancellation or a job timeout can interrupt the upload or end the job before it starts.
+
+```text
+stress/
+  progress.txt
+  refs.txt
+  primary/
+    run-N.log
+    run-N.trx
+    artifacts/run-N/
+  compare/
+    run-N.log
+    run-N.trx
+    artifacts/run-N/
+```
+
+Compare mode runs twice as many tests and allows up to 180 minutes for the job and 150 minutes for
+the repeat step. Get the owner's explicit permission before starting any load or stress run, including
+this comparison. For an approved two-iteration proof with no load, set `PRIMARY_BRANCH`,
+`BASELINE_SHA`, `TEST_PROJECT` and `TEST_NAME` in your shell and use the caller's `compare_ref` dispatch input.
+
+```bash
+gh workflow run stress-test.yml --ref "$PRIMARY_BRANCH" -f compare_ref="$BASELINE_SHA" -f project="$TEST_PROJECT" -f filter="FullyQualifiedName=$TEST_NAME" -f iterations=2 -f load=0 -f configuration=Release
+```
 
 ## site-ci
 
