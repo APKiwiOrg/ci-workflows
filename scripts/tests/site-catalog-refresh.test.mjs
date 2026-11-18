@@ -102,6 +102,30 @@ for (const [label, env] of [
   })
 }
 
+for (const [label, value] of [
+  ['http', 'http://example.test'],
+  ['credentials', 'https://member:sample-password@example.test'],
+  ['empty userinfo', 'https://@example.test'],
+  ['a path', 'https://example.test/catalog'],
+  ['a dot path', 'https://example.test/.'],
+  ['a query', 'https://example.test?key=value'],
+  ['an empty query', 'https://example.test?'],
+  ['a fragment', 'https://example.test#catalog'],
+  ['an empty fragment', 'https://example.test#'],
+  ['a missing host', 'https:///example.test'],
+  ['an invalid port', 'https://example.test:65536'],
+  ['a line break', 'https://example.test\n'],
+]) {
+  test('the refresh refuses invalid SITE_ORIGIN with ' + label + ' before any request', () => {
+    const result = runRefresh({ SITE_ORIGIN: value })
+    assert.equal(result.status, 1)
+    assert.deepEqual(result.requests, [])
+    assert.equal(result.stdout, '')
+    assert.match(result.stderr, /^::error::SITE_ORIGIN must be the site's https origin\b[^\n]*\n$/u)
+    assert.ok(!result.stderr.includes(value))
+  })
+}
+
 for (const status of ['requested', 'queued', 'pending', 'waiting', 'in_progress']) {
   test('skips the refresh when a deploy is ' + status, () => {
     const result = runRefresh({ TEST_DEPLOY_RUNS: runsPage(status) })
@@ -171,15 +195,22 @@ test('a transport error prevents a dispatch even if a body was written', () => {
   assert.equal(result.stdout, '')
 })
 
-test('an all-completed page dispatches deploy.yml on main with the published SHA', () => {
-  const result = runRefresh({
-    SITE_ORIGIN: origin + '/', TEST_DEPLOY_RUNS: runsPage('completed', 'completed'),
+for (const value of [
+  'https://example.test',
+  'https://example.test/',
+  'https://example.test:8443',
+  'https://[2001:db8::1]:8443/',
+]) {
+  test('an all-completed page dispatches deploy.yml with origin ' + value, () => {
+    const result = runRefresh({
+      SITE_ORIGIN: value, TEST_DEPLOY_RUNS: runsPage('completed', 'completed'),
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout, 'workflow\nrun\ndeploy.yml\n--ref\nmain\n-f\nsha=' + sha + '\n-f\nrefresh=true\n')
+    const curlArgs = result.stderr.trim().split('\n')
+    assert.equal(curlArgs.at(-1), value.replace(/\/$/u, '') + '/_catalog/snapshot.json')
+    assert.equal(curlArgs[curlArgs.indexOf('--max-time') + 1], '30')
+    assert.ok(!curlArgs.includes('--location'))
+    assert.ok(!curlArgs.includes('-L'))
   })
-  assert.equal(result.status, 0, result.stderr)
-  assert.equal(result.stdout, 'workflow\nrun\ndeploy.yml\n--ref\nmain\n-f\nsha=' + sha + '\n-f\nrefresh=true\n')
-  const curlArgs = result.stderr.trim().split('\n')
-  assert.equal(curlArgs.at(-1), origin + '/_catalog/snapshot.json')
-  assert.equal(curlArgs[curlArgs.indexOf('--max-time') + 1], '30')
-  assert.ok(!curlArgs.includes('--location'))
-  assert.ok(!curlArgs.includes('-L'))
-})
+}

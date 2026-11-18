@@ -10,7 +10,7 @@ on:
         default: false
         type: boolean
       site-origin:
-        description: The site's https origin, empty to skip. Callers pass vars.SITE_ORIGIN
+        description: The site's bare credential-free https origin, empty to skip. Callers pass vars.SITE_ORIGIN
         required: false
         default: ''
         type: string
@@ -38,10 +38,22 @@ jobs:
             exit 0
           fi
 
+          if ! snapshot_origin=$(node --input-type=module -e '
+            const input = process.env.SITE_ORIGIN
+            // Check the supplied form before URL parsing can normalize it.
+            const bareHttps = /^https:\/\/(?:\[[a-f0-9:.]+\]|[^:\/?#@\\[\]\s\p{Cc}]+)(?::[0-9]+)?\/?$/iu
+            const url = bareHttps.test(input) ? URL.parse(input) : null
+            if (!url) process.exit(1)
+            console.log(url.origin)
+          '); then
+            echo "::error::SITE_ORIGIN must be the site's https origin with no credentials, query, fragment or path beyond /." >&2
+            exit 1
+          fi
+
           snapshot_file=$(mktemp)
           trap 'rm -f "$snapshot_file"' EXIT
           status=$(curl --disable --silent --show-error --max-time 30 --globoff \
-            --output "$snapshot_file" --write-out '%{http_code}' -- "${SITE_ORIGIN%/}/_catalog/snapshot.json")
+            --output "$snapshot_file" --write-out '%{http_code}' -- "$snapshot_origin/_catalog/snapshot.json")
           if [ "$status" != "200" ]; then
             echo "::error::Catalog snapshot request returned HTTP $status. Expected HTTP 200 from SITE_ORIGIN." >&2
             exit 1

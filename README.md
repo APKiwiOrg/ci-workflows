@@ -376,13 +376,14 @@ Optional inputs and their defaults are `dispatch-sha` (empty), `refresh` (`false
 A catalog site's `deploy.yml` declares the boolean `refresh` dispatch input and forwards it to
 the reusable workflow, as above. For a refresh dispatch, the guard verifies the requested SHA's
 CI run and then reads `deployedSha` from `site-origin` inside `deploy-main`. A changed SHA skips
-the build and deploy successfully. An empty origin, failed fetch or invalid SHA fails the run.
+the build and deploy successfully. An invalid origin, failed fetch or invalid SHA fails the run.
 Manual dispatches with the default `refresh: false` still deploy the requested green SHA.
 
 When `has-catalog` is true, the build first runs the site's `scripts/catalog-snapshot.mjs` in deploy mode
 with `site-origin` and the selected SHA. The script writes `.catalog/snapshot.json` for the static build.
 The step adds the script's source line to the run summary and fails the build if the script fails. Catalog
-deploys require `SITE_ORIGIN` to hold the site's https origin.
+deploys and refreshes require `SITE_ORIGIN` to hold the site's bare credential-free https origin.
+A port and a trailing slash are optional. Any path beyond `/`, a query or a fragment fails validation.
 
 The build command runs as one bash command line after `npm ci`. Only `analytics: cloudflare` passes the
 analytics token in `VITE_CLOUDFLARE_ANALYTICS_TOKEN`. With `none`, the build receives no analytics token.
@@ -579,10 +580,11 @@ gh workflow run maintenance.yml --ref main
 Refreshes the static catalog nightly using the source commit already deployed. The job skips with
 a notice when `enabled` is false or `site-origin` is empty.
 
-The job reads `/_catalog/snapshot.json` at the site's https origin and validates the published
-`deployedSha`. Both snapshot reads require HTTP 200 from the configured origin, refuse redirects and
-time out after 30 seconds. A failed fetch or a SHA other than exactly 40 lowercase hexadecimal
-characters fails the run.
+Set `site-origin` to the site's bare credential-free https origin. A port and a trailing slash are
+optional. Any path beyond `/`, a query or a fragment fails validation before a request. The job reads
+`/_catalog/snapshot.json` and validates the published `deployedSha`. Both snapshot reads require HTTP
+200 from the configured origin, refuse redirects and time out after 30 seconds. A failed fetch or
+a SHA other than exactly 40 lowercase hexadecimal characters fails the run.
 
 Immediately before dispatch, the job reads the caller's newest 100 `deploy.yml` runs in one request.
 If any run's status differs from `completed`, the job skips with a notice. Otherwise it dispatches
