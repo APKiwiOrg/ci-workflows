@@ -287,6 +287,10 @@ describe('an automatic run deploys the newest green main commit', () => {
     })
   }
 
+  test('the deploy guard has a five-minute timeout', () => {
+    assert.equal(job('guard').match(/^ {4}timeout-minutes: (\d+)$/mu)?.[1], '5')
+  })
+
   test('the guard reads both APIs with read-only permissions and every later job needs it', () => {
     const guard = job('guard')
     assert.ok(guard.includes('TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}'))
