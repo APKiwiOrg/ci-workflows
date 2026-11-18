@@ -74,8 +74,6 @@ describe('site work is selected without repeating installs or builds', () => {
     assert.match(step('checks', 'Set up Node'), /if: env\.RUN_SITE == 'true' \|\| env\.RUN_SQL == 'true' \|\| inputs\.full/u)
     assert.match(step('checks', 'Install'), /if: env\.RUN_SITE == 'true' \|\| inputs\.full/u)
     assert.match(step('checks', 'Install api'), /if: env\.RUN_SITE == 'true' \|\| env\.RUN_SQL == 'true' \|\| inputs\.full/u)
-    assert.match(step('checks', 'Build'), /if: env\.RUN_SITE == 'true'/u)
-    assert.match(job('infra'), /if: inputs\.full \|\| contains\(fromJSON\(inputs\.segments\), 'infra'\)/u)
     for (const id of ['config', 'repo', 'secrets']) assert.doesNotMatch(job(id), /^ {4}if:/mu)
   })
 
@@ -86,6 +84,30 @@ describe('site work is selected without repeating installs or builds', () => {
     assert.match(source, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/u)
   })
 })
+
+const fullStageGates = [
+  ['Build', () => step('checks', 'Build'), "env.RUN_SITE == 'true'"],
+  ['Chromium', () => step('checks', 'Install Chromium'), "env.RUN_SITE == 'true'"],
+  ['browser', () => step('checks', browserStep), "env.RUN_SITE == 'true' && steps.chromium.outcome == 'success'"],
+  ['infra', () => job('infra'), "inputs.full || contains(fromJSON(inputs.segments), 'infra')"],
+]
+
+for (const [name, block, expected] of fullStageGates) {
+  test(name + ' keeps the full stage gate', () => {
+    assert.equal(block().match(/^ +if: (.+)$/mu)?.[1], expected)
+  })
+}
+
+for (const [name, expression] of [
+  ['ANALYTICS', 'needs.config.outputs.analytics'],
+  ['ANALYTICS_TEST_TOKEN', 'inputs.analytics-test-token'],
+]) {
+  test('Build wires ' + name + ' to the expected source', () => {
+    const prefix = '          ' + name + ': '
+    const binding = step('checks', 'Build').split('\n').find((line) => line.startsWith(prefix))
+    assert.equal(binding, prefix + '${{ ' + expression + ' }}')
+  })
+}
 
 describe('config controls the site layout', () => {
   test('every api step checks for the api directory', () => {
@@ -101,8 +123,6 @@ describe('config controls the site layout', () => {
       .map((name) => checks.indexOf(`      - name: ${name}\n`))
     assert.ok(positions.every((index) => index >= 0))
     assert.deepEqual([...positions].sort((a, b) => a - b), positions)
-    assert.match(step('checks', 'Install Chromium'), /if: env\.RUN_SITE == 'true'/u)
-    assert.match(step('checks', browserStep), /if: env\.RUN_SITE == 'true' && steps\.chromium\.outcome == 'success'/u)
     assert.match(step('checks', browserStep), /run: npm run test:e2e/u)
   })
 
