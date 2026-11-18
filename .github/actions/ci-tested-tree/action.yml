@@ -5,12 +5,14 @@ description: Say whether the checked-out git tree already passed a full run of t
 # `git rev-parse HEAD^{tree}`. Reuse is true only when that artifact is unexpired and the run that made it
 # concluded success, ran the `workflow` file on a push, pull_request, schedule, workflow_dispatch or
 # merge_group event, and belongs to this repository with its head here too. A pull_request_target or
-# workflow_run run can test code from a fork inside this repository, so it never vouches. Reuse is also
+# workflow_run run can test code from a fork inside this repository, so it never vouches. A push, schedule
+# or workflow_dispatch run's head commit must have the marker's tree. A pull request's merge commit is
+# not named by the runs API, so its tree still comes from the marker. Reuse is also
 # false when a ci-failed-full-TREE marker from a run that passes the same origin and event checks is as new as
 # the pass or newer, whether or not that run has completed, since the newest full run of the tree failed. A
 # pass whose run is still going, a failed run, a marker from another workflow file or repository, an expired
 # marker, more markers than one page of the API holds and any API error each give reuse false with the
-# reason. The calling job checks the repository out first and grants `actions: read`.
+# reason. The calling job checks the repository out first and grants `actions: read` and `contents: read`.
 
 inputs:
   workflow:
@@ -18,7 +20,7 @@ inputs:
     required: false
     default: .github/workflows/ci.yml
   token:
-    description: Token that can read the repository's Actions artifacts and runs
+    description: Token that can read the repository's Actions artifacts, workflow runs and git commits
     required: false
     default: ${{ github.token }}
 

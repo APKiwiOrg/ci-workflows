@@ -27,11 +27,13 @@ _spec.loader.exec_module(tested_tree)
 github_api = tested_tree.github_api
 
 REPO = "example-org/example-app"
+HEAD = "b" * 40
 TREE = "c" * 40
 WORKFLOW = ".github/workflows/ci.yml"
 NOW = datetime.datetime(2026, 1, 20, 12, 0, 0, tzinfo=datetime.timezone.utc)
 RUN_URL = "https://github.com/example-org/example-app/actions/runs/%d"
 ARTIFACTS_PATH = "/repos/%s/actions/artifacts?name=ci-passed-full-%s&per_page=100" % (REPO, TREE)
+COMMIT_PATH = "/repos/%s/git/commits/%s" % (REPO, HEAD)
 FAILED_PATH = "/repos/%s/actions/artifacts?name=ci-failed-full-%s&per_page=100" % (REPO, TREE)
 
 
@@ -56,6 +58,7 @@ def run(run_id=101, conclusion="success", path=WORKFLOW, repo=REPO, head_repo=RE
         "status": "completed" if conclusion else "in_progress",
         "conclusion": conclusion,
         "event": event,
+        "head_sha": HEAD,
         "path": path,
         "html_url": RUN_URL % run_id,
         "repository": {"full_name": repo},
@@ -67,7 +70,10 @@ class FakeFetch(object):
     """Answers API paths from a dictionary. A missing path or an exception value raises ApiError."""
 
     def __init__(self, artifacts=None, runs=(), raw=None, failures=()):
-        self.answers = {FAILED_PATH: {"total_count": len(failures), "artifacts": list(failures)}}
+        self.answers = {
+            FAILED_PATH: {"total_count": len(failures), "artifacts": list(failures)},
+            COMMIT_PATH: {"sha": HEAD, "tree": {"sha": TREE}},
+        }
         self.answers.update(raw or {})
         if artifacts is not None:
             self.answers[ARTIFACTS_PATH] = {"total_count": len(artifacts), "artifacts": artifacts}
@@ -189,6 +195,37 @@ class FindPassTests(unittest.TestCase):
             with self.subTest(event=event):
                 reuse, _, _ = check(FakeFetch([artifact()], [run(event=event)]))
                 self.assertIs(reuse, True)
+
+    def test_marker_for_another_commit_tree_is_no_reuse(self):
+        other_commit = {"sha": HEAD, "tree": {"sha": "d" * 40}}
+        for event in ("push", "schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                result = check(FakeFetch([artifact()], [run(event=event)], raw={COMMIT_PATH: other_commit}))
+                self.assertNoReuse(result)
+                self.assertIn("head commit has a different tree", result[1])
+
+    def test_commit_lookup_failure_is_no_reuse(self):
+        result = check(FakeFetch([artifact()], [run()], raw={COMMIT_PATH: github_api.ApiError("HTTP 404")}))
+        self.assertNoReuse(result)
+        self.assertIn("HTTP 404", result[1])
+
+    def test_commit_without_a_tree_is_no_reuse(self):
+        result = check(FakeFetch([artifact()], [run()], raw={COMMIT_PATH: {"sha": HEAD}}))
+        self.assertNoReuse(result)
+        self.assertIn("head commit has no readable tree", result[1])
+
+    def test_run_without_a_head_commit_is_no_reuse(self):
+        item = run()
+        del item["head_sha"]
+        result = check(FakeFetch([artifact()], [item]))
+        self.assertNoReuse(result)
+        self.assertIn("run 101 has no readable head SHA", result[1])
+
+    def test_pull_request_marker_can_vouch_for_a_different_tree_from_its_head(self):
+        other_commit = {"sha": HEAD, "tree": {"sha": "d" * 40}}
+        reuse, _, run_url = check(FakeFetch([artifact()], [run(event="pull_request")],
+                                           raw={COMMIT_PATH: other_commit}))
+        self.assertEqual((reuse, run_url), (True, RUN_URL % 101))
 
     def test_pull_request_target_run_is_no_reuse(self):
         self.assertNoReuse(check(FakeFetch([artifact()], [run(event="pull_request_target")])))

@@ -7,7 +7,9 @@ The tree counts as tested only when such an artifact is unexpired and the run th
 pull_request, schedule, workflow_dispatch or merge_group), and belongs to this repository with its head in
 this repository too. A pull_request_target or workflow_run run executes in this repository while the code it
 tests can come from a fork, so it never vouches. A marker is uploaded before its run ends, so a run with no
-conclusion yet does not count.
+conclusion yet does not count. For push, schedule and workflow_dispatch runs, the run's head commit
+must have the marker's tree. A pull request normally tests the merge commit, which the run API does
+not name, so its marker still supplies the tree.
 
 A full run that failed leaves ci-failed-full-TREE. When such a marker is unexpired, its run passes the same
 origin and event checks, and it was made at or after the pass that would be reused, the newest evidence is a
@@ -34,9 +36,9 @@ import github_api  # noqa: E402
 DEFAULT_WORKFLOW = ".github/workflows/ci.yml"
 MARKER_PREFIX = "ci-passed-full-"
 FAILED_MARKER_PREFIX = "ci-failed-full-"
-# Events whose runs test this repository's own code at the run's head. pull_request is safe because a fork's
-# run reports the fork as its head repository and is refused for that.
-VOUCHING_EVENTS = ("push", "pull_request", "schedule", "workflow_dispatch", "merge_group")
+# Events whose runs can vouch for this repository's own code. Fork runs are refused separately.
+HEAD_TREE_EVENTS = ("push", "schedule", "workflow_dispatch")
+VOUCHING_EVENTS = HEAD_TREE_EVENTS + ("pull_request", "merge_group")
 # Older markers are only consulted when newer ones fail a check. This bounds the API calls one check makes.
 MAX_RUNS_CHECKED = 10
 ARTIFACTS_PER_PAGE = 100
@@ -81,6 +83,21 @@ def _run_problem(run, repo, workflow):
     if run.get("conclusion") != "success":
         return "concluded %s" % run.get("conclusion")
     return _origin_problem(run, repo, workflow)
+
+
+def _head_tree_problem(run, repo, tree, fetch):
+    """Why a run's head cannot vouch for the marker, or None when it can."""
+    head = run.get("head_sha")
+    if not isinstance(head, str) or not _TREE.fullmatch(head):
+        return "has no readable head SHA"
+    commit = fetch("/repos/%s/git/commits/%s" % (repo, head))
+    commit_tree = commit.get("tree")
+    sha = commit_tree.get("sha") if isinstance(commit_tree, dict) else None
+    if not isinstance(sha, str) or not _TREE.fullmatch(sha):
+        return "head commit has no readable tree"
+    if sha != tree:
+        return "head commit has a different tree"
+    return None
 
 
 def _artifacts(repo, name, fetch):
@@ -153,6 +170,10 @@ def find_pass(repo, tree, workflow, fetch, now=None):
             run = fetch("/repos/%s/actions/runs/%d" % (repo, run_id))
             problem = _run_problem(run, repo, workflow)
             if problem is None:
+                if run.get("event") in HEAD_TREE_EVENTS:
+                    tree_problem = _head_tree_problem(run, repo, tree, fetch)
+                    if tree_problem:
+                        return False, "Marker from run %d %s" % (run_id, tree_problem), ""
                 failure = newer_failure(repo, tree, workflow, created, fetch, now)
                 if failure:
                     return False, failure, ""
