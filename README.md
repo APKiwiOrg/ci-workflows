@@ -661,7 +661,7 @@ as the last job, `CI passed`.
 | --- | --- | --- |
 | `needs` | required | The calling job's `${{ toJSON(needs) }}`. |
 | `allow-skipped` | empty | Job ids skipped when their segment is not selected, separated by spaces or commas. |
-| `allow-skipped-always` | empty | Job ids that may be skipped on any run, separated by spaces or commas. |
+| `allow-skipped-always` | empty | Job ids that may be skipped on any run, separated by spaces or commas, or a JSON array of job ids and exact API names. |
 | `full` | required | `true` when `ci-scope` made this a full run, so every segment job must run, `false` otherwise. Any other value fails the run. |
 | `segments` | empty | The JSON list of segments `ci-scope` selected, used to explain skipped test segments. |
 | `scope-reason` | empty | The reason `ci-scope` gave, shown on the `Scope` row. |
@@ -682,15 +682,21 @@ unless its id is listed:
   full run every segment runs, so a skip of one of them fails the run, even when its id is in
   `allow-skipped-always` too.
 - `allow-skipped-always` names jobs that do not test and may skip on any run, such as a deploy that runs
-  only on the default branch.
+  only on the default branch. Use the job id for `needs` and its exact name from the jobs API for the
+  full-run scan. Include both if they differ. For a job inside a reusable workflow, use its full API name,
+  including the caller prefix, for example `allow-skipped-always: '["checks / Publish docs"]'`. The JSON
+  array preserves spaces and commas in job names.
 
 The jobs API can then only turn a pass into a fail, never the reverse. A job of the run that has not
 finished, or that failed, timed out or was cancelled, and that `needs` does not report, fails the run. That
 catches a job missing from `needs` whether it already failed or is still going, and it means a job allowed to
-fail (`continue-on-error`) does not belong in the workflow whose verdict this is. While `CI passed` runs, the
-jobs API does not list a job that needs it, so such a job never counts. An API error leaves the verdict from
-`needs` unchanged and withholds the pass marker, since a job missing from `needs` could have failed unseen. The APIs otherwise supply the
-summary's names, times and its `Full suite last passed` footer, which counts only markers from runs of this
+fail (`continue-on-error`) does not belong in the workflow whose verdict this is. On a full run, an
+unapproved skip reported by the jobs API also fails the verdict and withholds the pass marker, including
+a skipped job inside a reusable workflow. On partial runs the API skips do not affect the verdict. While
+`CI passed` runs, the jobs API does not list a job that needs it, so such a job never counts. An API error
+leaves the verdict from `needs` unchanged and withholds the pass marker, since a job missing from `needs`
+could have failed unseen. The APIs otherwise supply the summary's names, times and its
+`Full suite last passed` footer, which counts only markers from runs of this
 repository's own code. Text from git or the API is escaped in the summary, so a file or job name cannot
 render as a link or other Markdown.
 

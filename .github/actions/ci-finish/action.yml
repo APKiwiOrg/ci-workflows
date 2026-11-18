@@ -7,8 +7,8 @@ description: Give a CI run one verdict and one summary, and mark the tree after 
 # false. A skipped job fails it unless its id is in `allow-skipped` on a run that is not full, or in
 # `allow-skipped-always` and not in `allow-skipped`, since a full run runs every segment. The jobs API can
 # then only turn a pass into a fail: a job of this run that has not finished, or that failed, timed out or
-# was cancelled, and that `needs` does not report, fails the run. So a job allowed to fail does not belong
-# in the workflow whose verdict this is. An API error leaves the verdict from `needs` unchanged, thins the
+# was cancelled, and that `needs` does not report, fails the run. A skipped job also fails a full run unless
+# its exact API name is always allowed. An API error leaves the verdict from `needs` unchanged, thins the
 # summary and withholds the pass marker. The steps run in order: write the summary, upload the marker, then
 # fail when the run did not pass, so a failed run still shows its summary. A full run that passed uploads
 # ci-passed-full-TREE. A full run with a job in `needs` that failed uploads ci-failed-full-TREE, so
@@ -27,8 +27,8 @@ inputs:
     default: ''
   allow-skipped-always:
     description: >-
-      Job ids that may be skipped on any run, separated by spaces or commas, for a job that does not test,
-      such as a deploy that runs only on the default branch
+      Space- or comma-separated job ids, or a JSON array of job ids and exact API job names that may be
+      skipped on any run. Use only for jobs that do not test.
     required: false
     default: ''
   full:

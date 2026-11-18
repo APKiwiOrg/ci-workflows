@@ -5,9 +5,10 @@ The verdict starts from the calling job's `needs`: a job that failed or was canc
 input that is not a JSON object naming at least one job fails it, as does a `full` input other than true or
 false. A skipped job fails it unless its id is in the segment list on a run that is not full, or in the
 always-allowed list and not the segment list, since a full run runs every segment. The jobs API can then only
-turn a pass into a fail: a job of this run other than the finishing one that has not finished, or that
-finished as failed, timed out or cancelled, fails the run. `needs` reports neither, so the job is missing
-from `needs` or allowed to fail. A job that needs the finishing job is not listed by the API while the
+turn a pass into a fail. A job that has not finished, or that failed, timed out or was cancelled, fails
+the run. On a full run a skipped job also fails it unless its exact API name is always allowed. This
+includes jobs inside reusable workflows that are not individually in `needs`. A job that needs the
+finishing job is not listed by the API while the
 finishing job runs, so it is never counted. An API error leaves the verdict from `needs` as it is. The API
 otherwise supplies the summary's stage names and times, and the artifacts API its footer.
 
@@ -100,6 +101,15 @@ def parse_allowed(text):
     return {name for name in re.split(r"[\s,]+", text or "") if name}
 
 
+def parse_always_allowed(text):
+    # type: (str) -> Set[str]
+    """Accept the legacy job ID list or a JSON array with exact API names and job IDs."""
+    if not text.lstrip().startswith("["):
+        return parse_allowed(text)
+    values = _string_list(text)
+    return set(values) if values is not None else set()
+
+
 def verdict(needs, allowed, always=(), full=False):
     # type: (Any, Iterable[str], Iterable[str], bool) -> Tuple[bool, List[str]]
     """Returns (passed, problems). Passed only when every job in needs succeeded or was an allowed skip.
@@ -133,22 +143,26 @@ def any_failure(needs):
     return any(isinstance(entry, dict) and entry.get("result") == "failure" for entry in parsed.values())
 
 
-def unreported_problems(jobs, own_job_name):
-    # type: (Sequence[dict], str) -> List[str]
-    """A problem for each job of this run, other than the finishing one, that has not finished, or that
-    finished as failed, timed out or cancelled. Called only when needs reported a pass, so needs does not
-    report any of these: the job is missing from needs or is allowed to fail. A job that needs the finishing
-    job is not listed while it runs, so a listed job that has not finished is one the verdict does not wait
-    for."""
+def unreported_problems(jobs, own_job_name, full, allowed_skips):
+    # type: (Sequence[dict], str, bool, Set[str]) -> List[str]
+    """Problems visible in the jobs API after needs reported a pass."""
     problems = []
     for job in jobs:
-        if not isinstance(job, dict) or _is_own(job.get("name"), own_job_name):
+        if not isinstance(job, dict):
             continue
-        if job.get("status") != "completed":
-            problems.append("%s has not finished and needs does not wait for it" % job.get("name"))
-        elif job.get("conclusion") in FAILING_CONCLUSIONS:
+        name = job.get("name")
+        status = job.get("status")
+        conclusion = job.get("conclusion")
+        if status == "completed" and conclusion == "skipped":
+            if full and name not in allowed_skips:
+                problems.append("%s was skipped on a full run" % name)
+        elif _is_own(name, own_job_name):
+            continue
+        elif status != "completed":
+            problems.append("%s has not finished and needs does not wait for it" % name)
+        elif conclusion in FAILING_CONCLUSIONS:
             problems.append("%s: %s, not reported by needs (missing from needs or allowed to fail)"
-                            % (job.get("name"), job.get("conclusion")))
+                            % (name, conclusion))
     return problems
 
 
@@ -315,7 +329,7 @@ def fetch_jobs(repo, run_id, fetch):
     return jobs
 
 
-def _segments(text):
+def _string_list(text):
     try:
         value = json.loads(text) if text else None
     except ValueError:
@@ -346,7 +360,7 @@ def _verdict_from(env):
     full = parse_full(env.get("CI_FINISH_FULL"))
     passed, problems = verdict(
         env.get("CI_FINISH_NEEDS", ""), parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED", "")),
-        parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED_ALWAYS", "")), full is True)
+        parse_always_allowed(env.get("CI_FINISH_ALLOW_SKIPPED_ALWAYS", "")), full is True)
     if full is None:
         # Read as partial, `allow-skipped` would excuse every segment skip, so the run cannot pass.
         return False, [BAD_FULL] + problems
@@ -388,11 +402,13 @@ def finish(env, fetch, tree_of, now):
         jobs = None
     if passed and jobs is not None:
         # The API can only turn a pass into a fail, never the reverse.
-        unreported = unreported_problems(jobs, own_job_name)
+        allowed_skips = (parse_always_allowed(env.get("CI_FINISH_ALLOW_SKIPPED_ALWAYS", ""))
+                         - parse_allowed(env.get("CI_FINISH_ALLOW_SKIPPED", "")))
+        unreported = unreported_problems(jobs, own_job_name, full, allowed_skips)
         if unreported:
             passed, problems = False, problems + unreported
     all_rows = table(needs, jobs, own_job_name,
-                     _segments(env.get("CI_FINISH_SEGMENTS", "")), env.get("CI_FINISH_SCOPE_REASON", ""),
+                     _string_list(env.get("CI_FINISH_SEGMENTS", "")), env.get("CI_FINISH_SCOPE_REASON", ""),
                      passed, now)
     starts = [github_api.parse_time(j.get("started_at")) for j in jobs or [] if isinstance(j, dict)]
     starts = [s for s in starts if s is not None]

@@ -469,6 +469,7 @@ JOBS = [
     job("Test: api", "skipped", started="2026-01-20T11:58:10Z", completed="2026-01-20T11:58:10Z"),
     job("CI passed", None, started="2026-01-20T11:59:58Z"),
 ]
+FULL_JOBS = JOBS[:2] + [job("Test: api"), JOBS[-1]]
 ARTIFACTS = [{"name": "ci-passed-full-" + "d" * 40, "created_at": "2026-01-15T08:00:00Z",
               "expired": False, "expires_at": "2026-02-14T08:00:00Z",
               "workflow_run": {"id": 99, "repository_id": 1, "head_repository_id": 1}}]
@@ -509,7 +510,7 @@ class FinishTests(unittest.TestCase):
                             scope="success", test_unit="success", test_api="success"))
 
     def test_control_full_pass_uploads_the_marker(self):
-        outcome = finish.finish(self.full(), FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+        outcome = finish.finish(self.full(), FakeFetch(FULL_JOBS, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, True)
         self.assertIs(outcome.upload, True)
         self.assertEqual(outcome.tree, TREE)
@@ -539,9 +540,41 @@ class FinishTests(unittest.TestCase):
     def test_full_run_with_an_always_allowed_skip_passes_and_uploads_the_marker(self):
         env = self.full(scope="success", test_unit="success", test_api="success", deploy="skipped")
         env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = "deploy"
-        outcome = finish.finish(env, FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+        jobs = FULL_JOBS + [job("deploy", "skipped")]
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
         self.assertIs(outcome.passed, True)
         self.assertEqual(outcome.artifact, "ci-passed-full-" + TREE)
+
+    def test_full_run_rejects_a_skipped_nested_job(self):
+        jobs = [job("Scope"), job("checks / Publish docs, preview", "skipped"), job("CI passed", None)]
+        env = self.full(scope="success", checks="success")
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        with self.subTest("verdict"):
+            self.assertIs(outcome.passed, False)
+        with self.subTest("diagnostic"):
+            self.assertEqual(outcome.problems, ["checks / Publish docs, preview was skipped on a full run"])
+        with self.subTest("marker"):
+            self.assertEqual((outcome.upload, outcome.artifact), (False, ""))
+
+    def test_full_run_allows_a_skip_by_exact_nested_name(self):
+        jobs = [job("Scope"), job("checks / Publish docs, preview", "skipped"), job("CI passed", None)]
+        env = self.full(scope="success", checks="success")
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = '["checks / Publish docs, preview"]'
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.artifact), (True, "ci-passed-full-" + TREE))
+
+    def test_full_run_requires_the_caller_prefix_for_a_nested_skip(self):
+        jobs = [job("Scope"), job("checks / Publish docs, preview", "skipped"), job("CI passed", None)]
+        env = self.full(scope="success", checks="success")
+        env["CI_FINISH_ALLOW_SKIPPED_ALWAYS"] = '["Publish docs, preview"]'
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertIs(outcome.passed, False)
+
+    def test_partial_run_ignores_a_nested_skip(self):
+        jobs = [job("Scope"), job("checks / Publish docs, preview", "skipped"), job("CI passed", None)]
+        env = settings(CI_FINISH_NEEDS=needs(scope="success", checks="success"))
+        outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
+        self.assertEqual((outcome.passed, outcome.artifact), (True, ""))
 
     def test_full_run_that_failed_uploads_the_failed_marker(self):
         outcome = finish.finish(self.full(scope="success", test_unit="failure", test_api="success"),
@@ -709,7 +742,8 @@ class FinishTests(unittest.TestCase):
             with self.subTest(value=value):
                 env = self.full()
                 env["CI_FINISH_FULL"] = value
-                outcome = finish.finish(env, FakeFetch(JOBS, ARTIFACTS), good_tree, NOW)
+                jobs = FULL_JOBS if upload else JOBS
+                outcome = finish.finish(env, FakeFetch(jobs, ARTIFACTS), good_tree, NOW)
                 self.assertIs(outcome.passed, True)
                 self.assertIs(outcome.upload, upload)
 
@@ -722,7 +756,7 @@ class FinishTests(unittest.TestCase):
         self.assertIs(outcome.upload, False)
 
     def test_full_pass_without_a_tree_uploads_nothing_and_still_passes(self):
-        outcome = finish.finish(self.full(), FakeFetch(JOBS, ARTIFACTS), no_tree, NOW)
+        outcome = finish.finish(self.full(), FakeFetch(FULL_JOBS, ARTIFACTS), no_tree, NOW)
         self.assertIs(outcome.passed, True)
         self.assertIs(outcome.upload, False)
 
