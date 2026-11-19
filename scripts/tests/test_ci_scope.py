@@ -330,6 +330,16 @@ class WorkflowFromEnvTests(unittest.TestCase):
     def test_empty_environment(self):
         self.assertEqual(scope.workflow_from_env({}), scope.Workflow("", "", "", ""))
 
+    def test_base_events_come_from_the_environment(self):
+        self.assertEqual(scope.workflow_from_env({"CI_SCOPE_BASE_EVENTS": " push  schedule push "}).base_events,
+                         ("push", "schedule"))
+
+    def test_control_no_base_events_keeps_every_event_that_can_be_a_base(self):
+        for value in (None, "", "  "):
+            with self.subTest(value=value):
+                env = {} if value is None else {"CI_SCOPE_BASE_EVENTS": value}
+                self.assertEqual(scope.workflow_from_env(env).base_events, scope.BASE_EVENTS)
+
 
 class DecideTests(unittest.TestCase):
     """The table rows that need the event, the rules file, the API and git together."""
@@ -411,6 +421,41 @@ class DecideTests(unittest.TestCase):
                 runs = [passing_run(2, OTHER, event=event), passing_run(1, BASE, "2026-01-18T10:00:00Z")]
                 self.push(git=git, fetch=FakeFetch(runs))
                 self.assertEqual(git.calls[-1][-1], OTHER + ".." + HEAD)
+
+    # A manual run that takes inputs can pass without testing what a push tests. Here a push at OTHER
+    # failed, then a dispatch at OTHER passed. Compared with that dispatch, the next push would no longer
+    # hold the change that failed.
+    NARROWED = [passing_run(3, OTHER, "2026-01-19T12:00:00Z", event="workflow_dispatch"),
+                passing_run(2, OTHER, "2026-01-19T11:00:00Z", conclusion="failure"),
+                passing_run(1, BASE, "2026-01-18T10:00:00Z")]
+
+    def test_passing_run_of_an_event_left_out_of_base_events_is_not_the_base(self):
+        git = FakeGit(present=[BASE, OTHER], ancestors=[BASE, OTHER], diff=names("src/core/a.py"))
+        self.push(git=git, fetch=FakeFetch(self.NARROWED),
+                  workflow=WORKFLOW._replace(base_events=("push", "schedule")))
+        self.assertEqual(git.calls[-1][-1], BASE + ".." + HEAD)
+
+    def test_control_the_same_runs_with_every_event_allowed_use_the_dispatch_run(self):
+        git = FakeGit(present=[BASE, OTHER], ancestors=[BASE, OTHER], diff=names("src/core/a.py"))
+        self.push(git=git, fetch=FakeFetch(self.NARROWED))
+        self.assertEqual(git.calls[-1][-1], OTHER + ".." + HEAD)
+
+    def test_failed_run_of_an_event_left_out_of_base_events_is_still_a_full_run(self):
+        runs = [failed_full_run(event="workflow_dispatch"), passing_run(1, BASE, "2026-01-19T10:00:00Z")]
+        result, _ = self.push(fetch=FakeFetch(runs), workflow=WORKFLOW._replace(base_events=("push",)))
+        self.assertTrue(result.full)
+
+    def test_base_events_naming_an_event_that_cannot_be_a_base_is_a_full_run(self):
+        fetch = FakeFetch([passing_run()])
+        result, _ = self.push(fetch=fetch, workflow=WORKFLOW._replace(base_events=("push", "pull_request")))
+        self.assertTrue(result.full)
+        self.assertIn("pull_request", result.reason)
+        self.assertEqual(fetch.calls, [])
+
+    def test_control_base_events_naming_only_push_selects_from_a_passing_push(self):
+        result, _ = self.push(workflow=WORKFLOW._replace(base_events=("push",)))
+        self.assertEqual(result.segments, ["unit"])
+        self.assertFalse(result.full)
 
     # A run full by its event that failed has no change in the next diff to explain it, so it keeps the
     # next push full until a run passes.

@@ -685,6 +685,12 @@ with its base, so only the pull request's own changes count.
 | --- | --- | --- |
 | `rules` | `.github/ci-scope.txt` | Path to the rules file, relative to the workspace. |
 | `token` | `${{ github.token }}` | Token that can read the workflow's runs. |
+| `base-events` | empty | Events whose passing run may be the base of a push, a space separated subset of `push`, `schedule` and `workflow_dispatch`. Empty means all three. |
+
+Leave `workflow_dispatch` out of `base-events` when a manual run takes inputs that narrow what it tests. A
+passing narrowed run did not test what a push tests, so as a base it would hide every change before it. A
+failed run of an event left out still makes the next push a full run. A name outside the three makes every
+push a full run, with the name in the reason.
 
 | Output | Meaning |
 | --- | --- |

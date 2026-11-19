@@ -22,7 +22,11 @@ silently left untested. Otherwise the run needs the segments whose globs
 match a changed file. On a full run every test job runs, whatever `segments` lists. `segments` then holds the
 segments the rules name, which is empty when the rules file is missing or empty.
 
-Inputs come from the environment: CI_SCOPE_RULES (the rules file path), CI_API_TOKEN and the runner's
+A caller can name the events whose passing run may be that base, since a manual run that takes inputs can
+pass without testing what a push tests.
+
+Inputs come from the environment: CI_SCOPE_RULES (the rules file path), CI_SCOPE_BASE_EVENTS (those events,
+space separated, empty for push, schedule and workflow_dispatch), CI_API_TOKEN and the runner's
 GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REF_TYPE, GITHUB_REF_NAME, GITHUB_SHA, GITHUB_REPOSITORY,
 GITHUB_WORKFLOW_REF, GITHUB_RUN_ID, GITHUB_API_URL and GITHUB_OUTPUT. Outputs are appended to GITHUB_OUTPUT
 as full, segments (compact JSON), reason and changed. Python 3.8 or later, standard library only.
@@ -69,6 +73,9 @@ class Workflow(NamedTuple):
     path: str
     branch: str
     run_id: str
+    # Events whose passing run may be a push's base. A caller narrows this when one of its events can pass
+    # without testing what a push tests, such as a manual dispatch that takes inputs.
+    base_events: Tuple[str, ...] = BASE_EVENTS
 
 
 class Rules(NamedTuple):
@@ -252,6 +259,10 @@ def last_passing_base(workflow, head, fetch, git):
     run's own scope could not have seen that failure. Returns (base, "") or (None, the full-run reason)."""
     if not (workflow.repo and workflow.path and workflow.branch):
         return None, "Full run: cannot tell which workflow and branch this run belongs to"
+    unknown = sorted(set(workflow.base_events) - set(BASE_EVENTS))
+    if unknown:
+        return None, "Full run: base-events names %s, and only %s can be a base" % (
+            ", ".join(unknown), ", ".join(BASE_EVENTS))
     # Completed only, so runs still going (this one among them) do not use up the page.
     path = "/repos/%s/actions/workflows/%s/runs?branch=%s&status=completed&per_page=%d" % (
         workflow.repo, urllib.parse.quote(posixpath.basename(workflow.path), safe=""),
@@ -270,7 +281,9 @@ def last_passing_base(workflow, head, fetch, git):
             return None, _failed_reason(workflow, run)
         sha = run.get("head_sha")
         # A commit the clone does not hold is passed over: it was force-pushed away or never fetched.
-        if (run.get("conclusion") == "success" and _is_sha(sha)
+        # A passing run of an event the caller left out is passed over: it may not have tested what a push
+        # tests. Its failure still counts above, since a red run is never a reason to select less.
+        if (run.get("conclusion") == "success" and run.get("event") in workflow.base_events and _is_sha(sha)
                 and git(["cat-file", "-e", sha + "^{commit}"])[0] == 0
                 and git(["merge-base", "--is-ancestor", sha, head])[0] == 0):
             started = github_api.parse_time(run.get("created_at"))
@@ -389,7 +402,9 @@ def workflow_from_env(env):
     path = ""
     if repo and ref.startswith(repo + "/"):
         path = ref[len(repo) + 1:].split("@", 1)[0]
-    return Workflow(repo, path, env.get("GITHUB_REF_NAME", ""), env.get("GITHUB_RUN_ID", ""))
+    # An empty input keeps every event that can be a base. Names are checked where the base is chosen.
+    base_events = tuple(dict.fromkeys(env.get("CI_SCOPE_BASE_EVENTS", "").split())) or BASE_EVENTS
+    return Workflow(repo, path, env.get("GITHUB_REF_NAME", ""), env.get("GITHUB_RUN_ID", ""), base_events)
 
 
 def main():

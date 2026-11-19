@@ -21,6 +21,13 @@ inputs:
     description: Token that can read the workflow's runs
     required: false
     default: ${{ github.token }}
+  base-events:
+    description: >-
+      Events whose passing run may be the base a push is compared with, a space separated subset of
+      push, schedule and workflow_dispatch. Empty means all three. Leave out workflow_dispatch when a
+      manual run takes inputs that narrow what it tests.
+    required: false
+    default: ''
 
 outputs:
   full:
@@ -46,4 +53,5 @@ runs:
       env:
         CI_SCOPE_RULES: ${{ inputs.rules }}
         CI_API_TOKEN: ${{ inputs.token }}
+        CI_SCOPE_BASE_EVENTS: ${{ inputs.base-events }}
       run: python3 "$GITHUB_ACTION_PATH/scope.py"
