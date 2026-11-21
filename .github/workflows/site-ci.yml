@@ -159,6 +159,12 @@ jobs:
             npm audit --omit=dev --audit-level=high --prefix api
             npm audit --audit-level=critical --prefix api
           fi
+          # A catalog site's importer is its own package with its own lockfile. npm audit reads the lockfile, so the
+          # importer needs no install here.
+          if [ -d importer ]; then
+            npm audit --omit=dev --audit-level=high --prefix importer
+            npm audit --audit-level=critical --prefix importer
+          fi
 
       - name: Start SQL Server
         id: start-sql

@@ -303,8 +303,9 @@ directory. The output must parse as JSON with a `parameters` object before the c
 order, including the bandwidth alert policy. The checker uses the compiled parameters to skip resources
 that file disables. A missing params file, a compilation failure, an invalid output or a policy failure fails the job and
 names the params file. A failed policy check stops later checks. After the shared install, the audit stage
-runs two audits in the root and, when present, in `api/`: `npm audit --omit=dev
---audit-level=high` for production dependencies and `npm audit --audit-level=critical` for every dependency. A high
+runs two audits in the root and, when present, in `api/` and in a catalog site's `importer/`: `npm audit --omit=dev
+--audit-level=high` for production dependencies and `npm audit --audit-level=critical` for every dependency. npm
+audit reads the lockfile, so the importer is audited without being installed. A high
 advisory in dev tooling alone reaches no deployed code, so it is left to the weekly osv-scanner report rather than
 failing every site, while a critical one, malware included, fails wherever it sits.
 
@@ -626,6 +627,58 @@ Run it by hand from a site:
 
 ```bash
 gh workflow run catalog-refresh.yml --ref main
+```
+
+## site-catalog-import
+
+Runs the weekly catalog import of a site with the catalog profile. The import logic lives in the site's `importer/`
+package and its keyed import routes, so this workflow only installs and runs it. Its token reads contents only.
+
+The job checks out the calling repository with credentials not persisted and sets up Node from `.nvmrc` with no
+dependency cache. It runs the site's `scripts/check-npm-policy.mjs`, which covers the importer package, then
+`npm ci --prefix importer --ignore-scripts`, so no install script runs whatever the site's `.npmrc` says. Neither
+step sees the key. The last step runs `node importer/run.mjs` with `SITE_ORIGIN` and `CATALOG_IMPORT_KEY` in its
+environment. The importer refuses an origin that is not a bare canonical https origin before any request, sends the
+key only to the site's import routes, refuses redirects and calls `finish` until the stored run is final. It exits 0
+when the stored run is `applied` or `held`, with a notice for a held run, and 1 for any other outcome, so GitHub emails
+the repository owner. The job times out after two hours.
+
+While the `site-origin` input or the `import-key` secret is empty, the job skips with a notice and passes. A template
+repository and a site before its owner gate therefore stay green. The settings step writes `run` and `missing`, the
+empty settings by name, and every later step reads `run`.
+
+A catalog site adds this caller as `.github/workflows/catalog-import.yml`, pinned to a commit of this repository. The
+schedule lands early on Tuesday morning in New Zealand:
+
+```yaml
+name: Catalog import
+on:
+  schedule:
+    - cron: '5 13 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: catalog-import
+  cancel-in-progress: false
+jobs:
+  import:
+    uses: APKiwiOrg/ci-workflows/.github/workflows/site-catalog-import.yml@<full commit sha>
+    with:
+      site-origin: ${{ vars.SITE_ORIGIN }}
+    secrets:
+      import-key: ${{ secrets.CATALOG_IMPORT_KEY }}
+```
+
+The caller owns the `catalog-import` concurrency group and keeps a running import, so a manual run waits for the
+scheduled one instead of cancelling it. The site's import routes refuse a second active run anyway. `SITE_ORIGIN` is
+the repository variable the other site workflows read, and `CATALOG_IMPORT_KEY` is a repository secret holding the
+same value as the site's `catalog-import-key` Key Vault secret.
+
+Run it by hand from a site:
+
+```bash
+gh workflow run catalog-import.yml --ref main
 ```
 
 ## Stage names

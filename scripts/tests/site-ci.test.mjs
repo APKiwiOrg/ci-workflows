@@ -437,3 +437,53 @@ for (const path of ['../outside', '../checkout-sibling/outside', 'linked']) {
     assert.equal(result.stdout, '')
   })
 }
+
+// Runs the audit step in a temp site under bash -e against a stub npm that records each call. The listed folders
+// hold the packages the site has, and a failing call names the package whose audit fails.
+function runAudit(packages, failing = null) {
+  const base = mkdtempSync(join(tmpdir(), 'ciwf-audit-'))
+  folders.push(base)
+  const folder = join(base, 'site')
+  mkdirSync(folder)
+  for (const name of packages) mkdirSync(join(folder, name))
+  const calls = join(base, 'calls')
+  writeFileSync(join(base, 'npm'), [
+    '#!/bin/sh',
+    'printf "%s\\n" "$*" >> "$NPM_CALLS"',
+    'case " $* " in *" --prefix $NPM_FAIL "*) exit 1 ;; esac',
+  ].join('\n') + '\n', { mode: 0o700 })
+  const result = spawnSync('bash', ['-e', '-c', stepScript(workflowPath, 'checks', "'Test: audit'")], {
+    cwd: folder, encoding: 'utf8', env: { PATH: `${base}:${process.env.PATH}`, NPM_CALLS: calls, NPM_FAIL: failing ?? '-' },
+  })
+  let lines = []
+  try {
+    lines = readFileSync(calls, 'utf8').split('\n').filter(Boolean)
+  } catch {}
+  return { ...result, lines }
+}
+
+const audits = (prefix) => [
+  `audit --omit=dev --audit-level=high${prefix ? ` --prefix ${prefix}` : ''}`,
+  `audit --audit-level=critical${prefix ? ` --prefix ${prefix}` : ''}`,
+]
+
+describe('the audit stage covers every package the site has', () => {
+  for (const [label, packages, expected] of [
+    ['the root alone', [], audits(null)],
+    ['the root and the api', ['api'], [...audits(null), ...audits('api')]],
+    ['the root, the api and the catalog importer', ['api', 'importer'], [...audits(null), ...audits('api'), ...audits('importer')]],
+  ]) {
+    test(`audits ${label}`, () => {
+      const result = runAudit(packages)
+      assert.equal(result.status, 0, result.stderr)
+      assert.deepEqual(result.lines, expected)
+    })
+  }
+
+  test('a failing importer audit fails the stage beside the passing control', () => {
+    assert.equal(runAudit(['api', 'importer']).status, 0)
+    const result = runAudit(['api', 'importer'], 'importer')
+    assert.equal(result.status, 1)
+    assert.deepEqual(result.lines, [...audits(null), ...audits('api'), audits('importer')[0]])
+  })
+})

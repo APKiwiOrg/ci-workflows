@@ -1,0 +1,93 @@
+name: site-catalog-import
+
+# The weekly catalog import of a site with the catalog profile. A site calls it from a small scheduled caller of its
+# own (see README.md) that owns the schedule and the catalog-import concurrency group.
+#
+# It runs the site's own importer/run.mjs from the caller's checkout, as site-maintenance runs the maintenance script,
+# so the run protocol ships with the site's api and the adapter is the site's. The importer validates the origin
+# before any request, sends the key only to the site's import routes and exits 1 unless the stored run is applied or
+# held, so GitHub emails the repository owner. While the site origin or the key is empty the job skips with a notice
+# and passes, so a repository before its owner gate stays green.
+#
+# Inputs and the key reach scripts only through env, never by expression interpolation into a run line. The key is in
+# the settings step and the import step only, never in the install.
+
+on:
+  workflow_call:
+    inputs:
+      site-origin:
+        description: The site's https origin, empty to skip. Callers pass vars.SITE_ORIGIN
+        required: false
+        default: ''
+        type: string
+    secrets:
+      import-key:
+        description: The bearer key the site's import routes accept, empty to skip
+        required: false
+
+permissions: {}
+
+jobs:
+  import:
+    name: Run the catalog import
+    runs-on: ubuntu-26.04
+    # Source reads go at most one a second, and finish is called until the stored run is final.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      # A secret cannot appear in a job condition, so this step decides whether the rest run.
+      - name: Check the import settings
+        id: settings
+        env:
+          SITE_ORIGIN: ${{ inputs.site-origin }}
+          CATALOG_IMPORT_KEY: ${{ secrets.import-key }}
+        run: |
+          missing=''
+          if [ -z "${SITE_ORIGIN:-}" ]; then
+            missing='site-origin'
+          fi
+          if [ -z "${CATALOG_IMPORT_KEY:-}" ]; then
+            missing="${missing:+$missing }import-key"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::notice::Catalog import skipped: set the SITE_ORIGIN repository variable and the CATALOG_IMPORT_KEY secret to run it"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the site
+        if: steps.settings.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No dependency cache, so nothing another workflow saved is restored into a job that holds the key.
+      - name: Set up Node
+        if: steps.settings.outputs.run == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      # The site's npm policy, which covers the importer package, holds before anything is installed.
+      - name: Check the npm install policy
+        if: steps.settings.outputs.run == 'true'
+        run: |
+          node scripts/check-npm-policy.mjs
+
+      # Scripts stay off whatever the site's .npmrc says. The image library ships prebuilt and needs none.
+      - name: Install the importer
+        if: steps.settings.outputs.run == 'true'
+        run: |
+          npm ci --prefix importer --ignore-scripts
+
+      - name: Run the import
+        if: steps.settings.outputs.run == 'true'
+        env:
+          SITE_ORIGIN: ${{ inputs.site-origin }}
+          CATALOG_IMPORT_KEY: ${{ secrets.import-key }}
+        run: |
+          node importer/run.mjs
